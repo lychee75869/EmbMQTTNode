@@ -18,6 +18,9 @@ int mqtt_init(const char *host, int port,
 /* 发布 JSON 格式传感器数据 */
 int mqtt_publish(const struct node_config *cfg, const struct sensor_data *data);
 
+/* 发布自定义 payload 到指定 topic（用于 Modbus 等扩展模块） */
+int mqtt_publish_raw(const char *topic, const char *payload, int qos);
+
 /* 发布设备状态（online / offline / heartbeat） */
 int mqtt_publish_status(const struct node_config *cfg,
                         const struct device_info *dev,

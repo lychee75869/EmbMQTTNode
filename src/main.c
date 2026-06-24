@@ -16,6 +16,7 @@
 #include "sensor.h"
 #include "storage.h"
 #include "mqtt_client.h"
+#include "modbus_master.h"
 #include "daemon.h"
 
 static volatile int g_running = 1;
@@ -178,6 +179,52 @@ static void *sample_thread(void *arg)
     return NULL;
 }
 
+/* ─── Modbus 轮询线程 ──────────────────────────────────── */
+
+static void *modbus_thread(void *arg)
+{
+    (void)arg;
+    struct sensor_data data[MODBUS_REG_MAX];
+
+    while (g_running) {
+        int n = modbus_master_poll(data, MODBUS_REG_MAX);
+
+        for (int i = 0; i < n; i++) {
+            LOG_INFO("modbus: slave data temp=%.2f hum=%.2f pres=%.2f",
+                     data[i].temperature, data[i].humidity,
+                     data[i].pressure);
+
+            if (mqtt_is_connected()) {
+                /* Modbus 数据发布到 topic/modbus */
+                char modbus_topic[256];
+                snprintf(modbus_topic, sizeof(modbus_topic),
+                         "%s/modbus", g_cfg.topic);
+
+                char payload[512];
+                snprintf(payload, sizeof(payload),
+                         "{\"client_id\":\"%s\","
+                         "\"timestamp\":%lld,"
+                         "\"temperature\":%.2f,"
+                         "\"humidity\":%.2f,"
+                         "\"pressure\":%.2f}",
+                         g_cfg.client_id,
+                         (long long)data[i].timestamp_ms,
+                         data[i].temperature,
+                         data[i].humidity,
+                         data[i].pressure);
+
+                mqtt_publish_raw(modbus_topic, payload, 1);
+            } else {
+                /* MQTT 离线，缓存到本地 */
+                storage_save(&data[i], g_cfg.client_id);
+            }
+        }
+
+        usleep(g_cfg.modbus.poll_interval_ms * 1000);
+    }
+    return NULL;
+}
+
 /* ─── 上报线程（断网续传）───────────────────────────────── */
 
 static void *upload_thread(void *arg)
@@ -286,26 +333,37 @@ int main(int argc, char *argv[])
         mqtt_subscribe_ota(g_cfg.client_id);
     }
 
-    /* 6. 守护进程化 */
+    /* 6. 初始化 Modbus（可选模块） */
+    if (modbus_master_init(&g_cfg.modbus) != E_OK) {
+        LOG_WARN("modbus init failed, modbus module disabled");
+    }
+
+    /* 7. 守护进程化 */
     if (daemon_mode) {
         daemonize();
     }
 
-    /* 7. 注册信号 */
+    /* 8. 注册信号 */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* 8. 启动工作线程 */
+    /* 9. 启动工作线程 */
     LOG_INFO("EmbMQTTNode v%s starting...", EMBMQTTNODE_VERSION);
 
-    pthread_t tid_sample, tid_upload;
+    pthread_t tid_sample, tid_upload, tid_modbus = 0;
     pthread_create(&tid_sample, NULL, sample_thread, NULL);
     pthread_create(&tid_upload, NULL, upload_thread, NULL);
+    /* Modbus 线程仅在 enabled 时启动 */
+    if (g_cfg.modbus.enabled) {
+        pthread_create(&tid_modbus, NULL, modbus_thread, NULL);
+        LOG_INFO("modbus polling thread started");
+    }
 
     pthread_join(tid_sample, NULL);
     pthread_join(tid_upload, NULL);
+    if (tid_modbus) pthread_join(tid_modbus, NULL);
 
-    /* 9. 优雅退出 */
+    /* 10. 优雅退出 */
     LOG_INFO("shutting down...");
 
     /* 发布离线状态（best-effort，遗嘱消息是兜底） */
@@ -313,6 +371,7 @@ int main(int argc, char *argv[])
     usleep(200000); /* 给网络线程一点时间发出 */
 
     mqtt_close();
+    modbus_master_close();
     storage_close();
     sensor_close();
 

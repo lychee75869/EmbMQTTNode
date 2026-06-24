@@ -1,13 +1,11 @@
-EmbMQTTNode - 嵌入式 MQTT 环境监测节点
+EmbMQTTNode - 嵌入式 MQTT 边缘网关
 ======================================
 
-项目简介
---------
-基于 Linux 的嵌入式 MQTT 环境监测节点，使用 C 语言开发。
-支持环境数据采集、MQTT 上报、断网本地缓存续传、配置文件化、守护进程运行。
+基于 Linux 的嵌入式 MQTT 边缘计算网关，使用 C 语言开发。
+支持多协议传感器数据采集（I²C + Modbus）、MQTT over TLS 加密上报、
+断网本地缓存续传、设备身份管理、配置文件化、守护进程运行。
 
-当前版本为软件模拟传感器版本，无需硬件即可编译运行。
-后续可在 sensor.c 中接入 BMP280/SHT30 等真实 I²C 传感器。
+当前版本 v1.0.0（阶段二）
 
 快速开始
 --------
@@ -17,10 +15,14 @@ EmbMQTTNode - 嵌入式 MQTT 环境监测节点
     sudo apt update
     sudo apt install build-essential libmosquitto-dev libsqlite3-dev
 
+    # Modbus 模块（可选）
+    sudo apt install libmodbus-dev
+
 2. 编译主程序
 
     cd src
-    make
+    make                              # 默认启用 Modbus
+    make BUILD_WITH_MODBUS=0          # 禁用 Modbus 模块
 
 3. 启动 MQTT Broker（本地测试）
 
@@ -30,41 +32,73 @@ EmbMQTTNode - 嵌入式 MQTT 环境监测节点
     或使用 Docker：
     docker run -it -p 1883:1883 eclipse-mosquitto
 
-4. 运行程序
+4. 启动 Modbus 模拟器（可选，测试 Modbus 模块用）
+
+    pip install pymodbus
+    python ../tools/modbus_slave_sim.py
+
+5. 运行程序
 
     ./embmqttnode -c ../config/node.conf
 
-5. 订阅查看数据
+6. 订阅查看数据
 
+    # 传感器数据
     mosquitto_sub -h 127.0.0.1 -t "embmqttnode/data"
 
-6. 运行单元测试
+    # Modbus 数据（如已启用）
+    mosquitto_sub -h 127.0.0.1 -t "embmqttnode/data/modbus"
+
+    # 设备状态
+    mosquitto_sub -h 127.0.0.1 -t "embmqttnode/data/status"
+
+7. 运行单元测试
 
     cd ../tests
     make
     ./test_sensor
     ./test_storage
+    ./test_modbus_config
 
 项目结构
 --------
 
 EmbMQTTNode/
-├── docs/          # 项目文档
-├── src/           # 源代码
-├── tests/         # 单元测试
-└── config/        # 示例配置
+├── docs/              # 项目文档（需求、设计、硬件选型、实施计划）
+├── src/               # 源代码
+│   ├── main.c         # 程序入口
+│   ├── config.c/h     # 配置文件解析
+│   ├── sensor.c/h     # 传感器抽象层（I²C BMP280/SHT30/mock）
+│   ├── modbus_master.c/h  # Modbus 主站模块（RTU + TCP）
+│   ├── storage.c/h    # SQLite 本地缓存（断网续传）
+│   ├── mqtt_client.c/h    # MQTT 客户端封装（TLS + 遗嘱）
+│   ├── daemon.c/h     # 守护进程化
+│   └── Makefile       # 构建（支持交叉编译 + 条件编译）
+├── tests/             # 单元测试
+├── tools/             # 开发工具
+│   └── modbus_slave_sim.py   # Modbus TCP 从站模拟器
+└── config/            # 示例配置
 
 配置文件
 --------
 
-config/node.conf 示例：
+config/node.conf 主要配置项：
 
+    # MQTT 连接
     broker_host = 127.0.0.1
     broker_port = 1883
     topic = embmqttnode/data
-    client_id = emb-node-01
-    sample_interval_ms = 5000
-    sensor_type = mock
+
+    # TLS 安全（可选）
+    tls_enabled = 0         # 0=关闭 1=单向认证 2=双向认证
+    tls_ca_file = /etc/embmqttnode/tls/ca.crt
+
+    # Modbus 工业协议（可选）
+    modbus_enabled = 1
+    modbus_mode = tcp
+    modbus_tcp_host = 127.0.0.1
+    modbus_tcp_port = 502
+    modbus_reg_1 = 1,40001,1,3,int16,temperature,0.1,0
 
 命令行参数
 ----------
@@ -73,27 +107,43 @@ config/node.conf 示例：
     ./embmqttnode -d             以守护进程运行
     ./embmqttnode -h             显示帮助
 
+编译选项
+--------
+
+    # 默认编译（含 Modbus）
+    make
+
+    # 禁用 Modbus 模块
+    make BUILD_WITH_MODBUS=0
+
+    # 交叉编译 ARM64
+    make CROSS_COMPILE=aarch64-linux-gnu-
+
+    # 安装到目标根文件系统
+    make install DESTDIR=/path/to/rootfs
+
 模块说明
 --------
 
 | 模块 | 文件 | 说明 |
 |------|------|------|
-| config | config.c/h | 配置文件解析 |
-| sensor | sensor.c/h | 传感器抽象层（模拟/真实） |
-| storage | storage.c/h | SQLite 本地缓存 |
-| mqtt_client | mqtt_client.c/h | MQTT 客户端封装 |
-| daemon | daemon.c/h | 守护进程化 |
-| main | main.c | 程序入口 |
+| config | config.c/h | INI 风格配置文件解析，含 TLS + Modbus 配置段 |
+| sensor | sensor.c/h | 传感器抽象层，支持 BMP280/SHT30/Mock |
+| modbus_master | modbus_master.c/h | Modbus RTU/TCP 主站，寄存器映射 + 类型转换 |
+| storage | storage.c/h | SQLite 本地缓存，线程安全 |
+| mqtt_client | mqtt_client.c/h | MQTT client，TLS 1.2+、遗嘱消息、设备状态上报 |
+| daemon | daemon.c/h | 标准双重 fork 守护进程化 |
+| main | main.c | 多线程编排（采集 + Modbus + 上报） |
 
 后续计划
 --------
 
-1. 采购香橙派/树莓派 + BMP280 传感器
-2. 实现真实 I²C 传感器读取
-3. 增加 GPIO LED 状态指示灯
-4. 交叉编译到 ARM 开发板
-5. 编写 systemd 自启动服务
-6. 长时间稳定性测试与简历条目整理
+1. ~~MQTT over TLS + 设备身份~~ ✅ 阶段一完成
+2. ~~Modbus 工业协议接入~~ ✅ 阶段二完成
+3. 规则引擎 + 本地告警 + GPIO 联动
+4. A/B 分区 OTA 远程升级
+5. 本地 Web Dashboard
+6. 边缘 AI 异常检测（方向 B）
 
 作者
 ----

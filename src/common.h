@@ -32,6 +32,47 @@ struct sensor_data {
     int64_t   timestamp_ms;  /* 毫秒时间戳 */
 };
 
+/* ─── Modbus 协议配置 ─────────────────────────────────────── */
+
+#define MODBUS_DEVICE_MAX   8      /* 最多接入 8 个从站 */
+#define MODBUS_REG_MAX      32     /* 每个从站最多 32 个寄存器映射 */
+
+/* 单条寄存器映射 */
+struct modbus_reg_map {
+    int     slave_id;             /* 从站地址 1-247 */
+    int     reg_addr;             /* 寄存器起始地址 */
+    int     reg_count;            /* 连续寄存器数量 */
+    int     func_code;            /* 功能码 3=读保持 4=读输入 */
+    char    data_type[16];        /* int16 / uint16 / float32 / int32 */
+    char    field_name[32];       /* 映射到 sensor_data 的字段名 */
+    double  scale;                /* 比例因子 */
+    double  offset;               /* 偏移量 */
+};
+
+/* Modbus 总配置 */
+struct modbus_config {
+    int     enabled;              /* 0=关闭 1=启用 */
+    char    mode[8];              /* "rtu" 或 "tcp" */
+
+    /* RTU 参数 */
+    char    serial_port[64];
+    int     baudrate;
+    char    parity[2];
+    int     data_bits;
+    int     stop_bits;
+
+    /* TCP 参数 */
+    char    tcp_host[128];
+    int     tcp_port;
+
+    /* 轮询与映射 */
+    int     poll_interval_ms;
+    int     reg_count;
+    struct  modbus_reg_map regs[MODBUS_REG_MAX];
+};
+
+/* ─── TLS 配置 ────────────────────────────────────────────── */
+
 /* TLS 配置 */
 struct tls_config {
     int     enabled;              /* 0=关闭, 1=单向认证, 2=双向认证 */
@@ -63,6 +104,9 @@ struct node_config {
 
     /* 阶段一新增：TLS + 安全 */
     struct tls_config tls;
+
+    /* 阶段二新增：Modbus 工业协议 */
+    struct modbus_config modbus;
 };
 
 /* 简单日志宏 */

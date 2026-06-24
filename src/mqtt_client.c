@@ -281,6 +281,23 @@ int mqtt_subscribe_ota(const char *client_id)
     return E_OK;
 }
 
+/* ─── 原始发布（自定义 topic + payload）──────────────────── */
+
+int mqtt_publish_raw(const char *topic, const char *payload, int qos)
+{
+    if (!g_mosq || !g_connected || !topic || !payload)
+        return E_INVAL;
+
+    int rc = mosquitto_publish(g_mosq, NULL, topic,
+                               (int)strlen(payload), payload, qos, 0);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        LOG_ERROR("mqtt_publish_raw failed: %s", mosquitto_strerror(rc));
+        g_connected = 0;
+        return E_NET;
+    }
+    return E_OK;
+}
+
 /* ─── 工具函数 ────────────────────────────────────────────── */
 
 int mqtt_is_connected(void)

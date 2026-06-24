@@ -1,0 +1,132 @@
+================================================================================
+阶段2：系统架构与概要设计
+项目名称：EmbMQTTNode 嵌入式 MQTT 环境监测节点
+================================================================================
+
+一、系统总体架构
+--------------------------
+
+    +---------------------------------------------------------+
+    |                      应用层 (main.c)                      |
+    |     初始化 -> 加载配置 -> 启动采集线程 -> 启动上报线程    |
+    +---------------------------------------------------------+
+                              |
+        +---------------------+---------------------+
+        |                     |                     |
+        v                     v                     v
++----------------+   +----------------+   +----------------+
+|   sensor 模块   |   | mqtt_client 模块 |   |  storage 模块  |
+|  传感器数据采集 |   |  MQTT 网络通信   |   |  SQLite 缓存   |
++----------------+   +----------------+   +----------------+
+        |                     |                     |
+        v                     v                     v
+   /dev/i2c-X            TCP socket           SQLite DB
+   /dev/gpiochip0                              (data.db)
+
+二、模块划分
+--------------------------
+
+【sensor 模块】
+- 文件：sensor.c / sensor.h
+- 职责：读取环境传感器数据
+- 抽象接口：
+    sensor_init()       // 初始化传感器
+    sensor_read()       // 读取一次数据
+    sensor_close()      // 关闭传感器
+- 实现方式：
+    - 模拟版本：生成随机温湿度数据
+    - 真实版本：通过 I²C 读取 BMP280/SHT30
+
+【mqtt_client 模块】
+- 文件：mqtt_client.c / mqtt_client.h
+- 职责：连接 MQTT Broker，发布数据
+- 抽象接口：
+    mqtt_init()         // 初始化连接
+    mqtt_publish()      // 发布 JSON 数据
+    mqtt_is_connected() // 检查连接状态
+    mqtt_close()        // 关闭连接
+- 实现：基于 libmosquitto
+
+【storage 模块】
+- 文件：storage.c / storage.h
+- 职责：本地数据缓存，断网续传
+- 抽象接口：
+    storage_init()      // 初始化数据库
+    storage_save()      // 保存一条数据
+    storage_get_pending() // 取出待发送数据
+    storage_delete()    // 删除已确认数据
+- 实现：基于 SQLite3
+
+【config 模块】
+- 文件：config.c / config.h
+- 职责：解析配置文件
+- 支持参数：
+    broker_host         // MQTT 服务器地址
+    broker_port         // MQTT 端口
+    topic               // 发布主题
+    client_id           // MQTT 客户端 ID
+    sample_interval_ms  // 采样间隔
+    sensor_type         // 传感器类型：mock / bmp280 / sht30
+
+【daemon 模块】
+- 文件：daemon.c / daemon.h
+- 职责：守护进程化、信号处理
+
+【led 模块】（硬件阶段实现）
+- 文件：led.c / led.h
+- 职责：通过 GPIO 控制 LED 状态
+- 状态：
+    LED_NORMAL_FAST     // 正常运行，快闪
+    LED_ERROR_SLOW      // 异常，慢闪
+
+三、数据流
+--------------------------
+
+1. main 线程读取 config.ini，初始化 sensor、storage、mqtt_client。
+2. 采集线程每隔 sample_interval_ms 调用 sensor_read() 获取数据。
+3. 采集线程将数据封装为 JSON，判断 mqtt 是否连接：
+   - 已连接：调用 mqtt_publish() 直接上报。
+   - 未连接：调用 storage_save() 写入 SQLite。
+4. 上报线程定期检查 storage_get_pending()，有缓存数据且网络恢复时补发。
+5. 补发成功后调用 storage_delete() 删除已发送记录。
+
+四、关键数据结构
+--------------------------
+
+/* 传感器数据 */
+struct sensor_data {
+    double temperature;     // 温度，单位摄氏度
+    double humidity;        // 湿度，单位 %RH
+    double pressure;        // 气压，单位 hPa
+    long long timestamp_ms; // 时间戳
+};
+
+/* 配置 */
+struct node_config {
+    char broker_host[128];
+    int  broker_port;
+    char topic[128];
+    char client_id[64];
+    int  sample_interval_ms;
+    char sensor_type[32];
+};
+
+五、接口约定
+--------------------------
+- 所有模块返回 0 表示成功，负数表示错误码。
+- 错误码统一定义在 common.h 中。
+- JSON 格式示例：
+    {
+        "client_id": "emb-node-01",
+        "timestamp": 1719200000000,
+        "temperature": 25.30,
+        "humidity": 60.20,
+        "pressure": 1013.25
+    }
+
+六、部署方式
+--------------------------
+1. 在开发板上编译或交叉编译。
+2. 配置文件放置于 /etc/embmqttnode/node.conf。
+3. 使用 systemd 服务管理自启动。
+4. 日志通过 syslog 输出到 /var/log/embmqttnode.log。

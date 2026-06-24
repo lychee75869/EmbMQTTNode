@@ -1,0 +1,39 @@
+# 编译产物
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+*.dll
+
+# 可执行文件
+src/embmqttnode
+tests/test_sensor
+tests/test_storage
+
+# 数据库文件
+*.db
+*.db-journal
+*.db-wal
+
+# 编辑器
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.code-workspace
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 编译输出目录
+build/
+bin/
+dist/
+
+# 临时文件
+*.tmp
+*.log

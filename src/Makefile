@@ -3,7 +3,7 @@
 # 阶段二：条件编译 Modbus 支持
 
 CC       ?= gcc
-CFLAGS   ?= -std=c11 -Wall -Wextra -O2 -g -pthread
+CFLAGS   ?= -std=c11 -Wall -Wextra -O2 -g -pthread -D_DEFAULT_SOURCE
 LDFLAGS  ?= -pthread -lmosquitto -lsqlite3 -lm
 
 # Modbus 可选模块（默认启用）
@@ -12,14 +12,11 @@ BUILD_WITH_MODBUS ?= 1
 ifeq ($(BUILD_WITH_MODBUS),1)
     CFLAGS  += -DBUILD_WITH_MODBUS
     LDFLAGS += -lmodbus
-    MODBUS_SRC = modbus_master.c
-else
-    MODBUS_SRC =
 endif
 
 TARGET   = embmqttnode
 SRCS     = main.c config.c sensor.c storage.c mqtt_client.c daemon.c \
-           $(MODBUS_SRC)
+           modbus_master.c
 OBJS     = $(SRCS:.c=.o)
 
 .PHONY: all clean strip install

@@ -92,9 +92,13 @@ static void collect_device_info(struct device_info *dev)
 
     /* 内核版本 (uname) */
     struct utsname ubuf;
-    if (uname(&ubuf) == 0)
-        snprintf(dev->kernel_ver, sizeof(dev->kernel_ver),
-                 "%s %s", ubuf.sysname, ubuf.release);
+    if (uname(&ubuf) == 0) {
+        int n = snprintf(dev->kernel_ver, sizeof(dev->kernel_ver),
+                         "%s %s", ubuf.sysname, ubuf.release);
+        /* 如果截断，保证 null 结尾 */
+        if (n < 0 || (size_t)n >= sizeof(dev->kernel_ver))
+            dev->kernel_ver[sizeof(dev->kernel_ver) - 1] = '\0';
+    }
 
     /* CPU 型号：读取 /proc/cpuinfo 第一行 model name */
     FILE *fp = fopen("/proc/cpuinfo", "r");

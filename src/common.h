@@ -5,6 +5,14 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+/* 启用 POSIX 扩展（gethostname, usleep 等）*/
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

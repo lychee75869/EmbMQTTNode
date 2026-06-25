@@ -2,6 +2,11 @@
 #include <mosquitto.h>
 #include <stdio.h>
 
+/* OpenSSL 常量（避免引入 libssl-dev 依赖） */
+#ifndef SSL_VERIFY_PEER
+#define SSL_VERIFY_PEER  1
+#endif
+
 static struct mosquitto *g_mosq = NULL;
 static volatile int g_connected = 0;
 

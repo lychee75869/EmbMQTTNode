@@ -35,7 +35,8 @@ static void set_default_config(struct node_config *cfg)
     cfg->modbus.tcp_port = 502;
     strncpy(cfg->modbus.serial_port, "/dev/ttyUSB0", sizeof(cfg->modbus.serial_port) - 1);
     cfg->modbus.baudrate = 9600;
-    strncpy(cfg->modbus.parity, "N", sizeof(cfg->modbus.parity) - 1);
+    cfg->modbus.parity[0] = 'N';
+    cfg->modbus.parity[1] = '\0';
     cfg->modbus.data_bits = 8;
     cfg->modbus.stop_bits = 1;
     cfg->modbus.poll_interval_ms = 2000;

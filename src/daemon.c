@@ -1,4 +1,6 @@
 #include "daemon.h"
+#include <stdlib.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -18,7 +20,7 @@ int daemonize(void)
     if (pid < 0) return -1;
     if (pid > 0) exit(0); /* 再次脱离终端 */
 
-    chdir("/");
+    if (chdir("/") < 0) return -1;
 
     /* 关闭标准文件描述符 */
     int fd = open("/dev/null", O_RDWR);

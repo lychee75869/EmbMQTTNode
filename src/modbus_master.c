@@ -11,7 +11,7 @@
 #include "modbus_master.h"
 
 #ifdef BUILD_WITH_MODBUS
-#include <modbus.h>
+#include <modbus/modbus.h>
 #endif
 
 /* ─── 内部状态 ─────────────────────────────────────────── */
@@ -41,6 +41,8 @@ static void set_field(struct sensor_data *data,
     else
         LOG_WARN("modbus: unknown field '%s'", field_name);
 }
+
+#ifdef BUILD_WITH_MODBUS
 
 /*
  * 将两个 uint16 寄存器拼接为 float32（IEEE 754）
@@ -111,6 +113,8 @@ static double convert_register(const uint16_t *regs, int reg_count,
         return (double)regs[0];
     }
 }
+
+#endif /* BUILD_WITH_MODBUS */
 
 /* ─── Mock 模式 ─────────────────────────────────────────── */
 

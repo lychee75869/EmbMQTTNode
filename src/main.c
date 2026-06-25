@@ -18,6 +18,9 @@
 #include "mqtt_client.h"
 #include "modbus_master.h"
 #include "daemon.h"
+#include "rule_engine.h"
+#include "gpio_hal.h"
+#include "ota.h"
 
 static volatile int g_running = 1;
 static struct node_config g_cfg;
@@ -171,6 +174,28 @@ static void *sample_thread(void *arg)
         LOG_INFO("sample: temp=%.2f hum=%.2f pres=%.2f",
                  data.temperature, data.humidity, data.pressure);
 
+        /* ── 规则引擎评估（阶段三）── */
+        char alert_msg[256] = {0};
+        uint8_t actions = rule_engine_evaluate(&data, alert_msg,
+                                               sizeof(alert_msg));
+        if (actions) {
+            LOG_INFO("rule actions triggered: 0x%02x", actions);
+
+            /* MQTT 告警上报 */
+            if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
+                char alert_topic[256];
+                snprintf(alert_topic, sizeof(alert_topic),
+                         "%s/alert", g_cfg.topic);
+                mqtt_publish_raw(alert_topic, alert_msg, 1);
+            }
+
+            /* GPIO 输出 */
+            if (actions & ACTION_GPIO_1)
+                gpio_hal_set(1, 1);
+            if (actions & ACTION_GPIO_2)
+                gpio_hal_set(2, 1);
+        }
+
         if (mqtt_is_connected()) {
             mqtt_publish(&g_cfg, &data);
         } else {
@@ -197,6 +222,26 @@ static void *modbus_thread(void *arg)
             LOG_INFO("modbus: slave data temp=%.2f hum=%.2f pres=%.2f",
                      data[i].temperature, data[i].humidity,
                      data[i].pressure);
+
+            /* ── 规则引擎评估（阶段三）── */
+            char alert_msg[256] = {0};
+            uint8_t actions = rule_engine_evaluate(&data[i], alert_msg,
+                                                   sizeof(alert_msg));
+            if (actions) {
+                LOG_INFO("modbus rule actions triggered: 0x%02x", actions);
+
+                if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
+                    char alert_topic[256];
+                    snprintf(alert_topic, sizeof(alert_topic),
+                             "%s/alert", g_cfg.topic);
+                    mqtt_publish_raw(alert_topic, alert_msg, 1);
+                }
+
+                if (actions & ACTION_GPIO_1)
+                    gpio_hal_set(1, 1);
+                if (actions & ACTION_GPIO_2)
+                    gpio_hal_set(2, 1);
+            }
 
             if (mqtt_is_connected()) {
                 /* Modbus 数据发布到 topic/modbus */
@@ -237,6 +282,10 @@ static void *upload_thread(void *arg)
     struct sensor_data pending[16];
 
     while (g_running) {
+        /* OTA 状态机驱动（阶段四） */
+        if (g_cfg.ota.enabled)
+            ota_check_and_handle();
+
         if (mqtt_is_connected()) {
             int n = storage_get_pending(pending, 16);
             if (n > 0) {
@@ -335,11 +384,38 @@ int main(int argc, char *argv[])
 
         /* 5d. 订阅 OTA 升级指令 */
         mqtt_subscribe_ota(g_cfg.client_id);
+
+        /* 5e. OTA 启动后检查（阶段四） */
+        ota_post_boot_check();
     }
 
     /* 6. 初始化 Modbus（可选模块） */
     if (modbus_master_init(&g_cfg.modbus) != E_OK) {
         LOG_WARN("modbus init failed, modbus module disabled");
+    }
+
+    /* 6b. 初始化规则引擎（阶段三） */
+    if (g_cfg.rule_count > 0) {
+        if (rule_engine_init(&g_cfg) != E_OK) {
+            LOG_WARN("rule_engine_init failed");
+        }
+    } else {
+        LOG_INFO("no rules configured, rule engine skipped");
+    }
+
+    /* 6c. 初始化 GPIO 告警输出 */
+    gpio_hal_init();
+
+    /* 6d. 初始化 OTA 远程升级（阶段四） */
+    if (g_cfg.ota.enabled) {
+        ota_init(&g_cfg.ota, g_cfg.client_id, EMBMQTTNODE_VERSION);
+        /* 注入 MQTT 发布回调（用于 OTA 状态上报） */
+        ota_set_mqtt_publish(mqtt_publish_raw);
+        /* 注册 OTA 消息回调（来自 MQTT 的升级指令） */
+        mqtt_set_ota_callback(ota_handle_message);
+        LOG_INFO("ota module initialized");
+    } else {
+        LOG_INFO("ota disabled by config");
     }
 
     /* 7. 守护进程化 */
@@ -376,6 +452,9 @@ int main(int argc, char *argv[])
 
     mqtt_close();
     modbus_master_close();
+    rule_engine_close();
+    gpio_hal_close();
+    ota_close();
     storage_close();
     sensor_close();
 

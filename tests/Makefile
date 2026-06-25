@@ -5,7 +5,7 @@ CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -g -pthread -I../src
 LDFLAGS ?= -pthread -lsqlite3 -lm
 
-TESTS   = test_sensor test_storage test_modbus_config
+TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota
 
 .PHONY: all clean
 
@@ -19,6 +19,12 @@ test_storage: test_storage.c ../src/storage.c
 
 test_modbus_config: test_modbus_config.c ../src/config.c
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_rule_engine: test_rule_engine.c ../src/rule_engine.c ../src/config.c
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_ota: test_ota.c ../src/ota.c ../src/config.c
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lcrypto
 
 clean:
 	rm -f $(TESTS) test_data.db test_modbus_tmp.conf

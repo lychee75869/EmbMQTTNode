@@ -9,6 +9,7 @@
 
 static struct mosquitto *g_mosq = NULL;
 static volatile int g_connected = 0;
+static mqtt_ota_callback g_ota_cb = NULL;
 
 /* ─── 回调 ─────────────────────────────────────────────────── */
 
@@ -49,9 +50,16 @@ static void on_message(struct mosquitto *mosq, void *obj,
 {
     (void)mosq;
     (void)obj;
-    /* 收到 OTA 升级指令，记录日志，实际处理在 ota.c 中实现 */
+
     LOG_INFO("mqtt message received on topic '%s': %d bytes",
              msg->topic, msg->payloadlen);
+
+    /* 如果是 OTA 升级指令，交给 ota 回调处理 */
+    if (g_ota_cb && msg->topic && msg->payload) {
+        if (strstr(msg->topic, "/ota/cmd")) {
+            g_ota_cb((const char *)msg->payload, msg->payloadlen);
+        }
+    }
 }
 
 /* ─── 初始化（含 TLS）────────────────────────────────────────── */
@@ -284,6 +292,14 @@ int mqtt_subscribe_ota(const char *client_id)
 
     LOG_INFO("ota topic subscribed: %s", ota_topic);
     return E_OK;
+}
+
+/* ─── OTA 回调注册 ───────────────────────────────────────── */
+
+void mqtt_set_ota_callback(mqtt_ota_callback cb)
+{
+    g_ota_cb = cb;
+    LOG_INFO("mqtt ota callback %s", cb ? "registered" : "cleared");
 }
 
 /* ─── 原始发布（自定义 topic + payload）──────────────────── */

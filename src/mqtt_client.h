@@ -29,6 +29,18 @@ int mqtt_publish_status(const struct node_config *cfg,
 /* 订阅 OTA 升级指令主题 */
 int mqtt_subscribe_ota(const char *client_id);
 
+/*
+ * OTA 消息回调类型
+ * payload:     消息体
+ * payload_len: 消息长度
+ */
+typedef void (*mqtt_ota_callback)(const char *payload, int payload_len);
+
+/*
+ * 注册 OTA 消息回调（收到 ota/cmd 消息时调用）
+ */
+void mqtt_set_ota_callback(mqtt_ota_callback cb);
+
 /* 检查当前是否连接 */
 int mqtt_is_connected(void);
 

@@ -11,6 +11,9 @@
 src/embmqttnode
 tests/test_sensor
 tests/test_storage
+tests/test_modbus_config
+tests/test_rule_engine
+tests/test_ota
 
 # 数据库文件
 *.db

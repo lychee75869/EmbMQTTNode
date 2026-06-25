@@ -5,7 +5,7 @@ EmbMQTTNode - 嵌入式 MQTT 边缘网关
 支持多协议传感器数据采集（I²C + Modbus）、MQTT over TLS 加密上报、
 断网本地缓存续传、设备身份管理、配置文件化、守护进程运行。
 
-当前版本 v1.0.0（阶段二）
+当前版本 v1.0.0（阶段四）
 
 快速开始
 --------
@@ -72,6 +72,9 @@ EmbMQTTNode/
 │   ├── modbus_master.c/h  # Modbus 主站模块（RTU + TCP）
 │   ├── storage.c/h    # SQLite 本地缓存（断网续传）
 │   ├── mqtt_client.c/h    # MQTT 客户端封装（TLS + 遗嘱）
+│   ├── rule_engine.c/h  # 规则引擎 + 本地告警
+│   ├── gpio_hal.c/h     # GPIO 硬件抽象层
+│   ├── ota.c/h        # A/B 分区 OTA 远程升级
 │   ├── daemon.c/h     # 守护进程化
 │   └── Makefile       # 构建（支持交叉编译 + 条件编译）
 ├── tests/             # 单元测试
@@ -133,15 +136,19 @@ config/node.conf 主要配置项：
 | storage | storage.c/h | SQLite 本地缓存，线程安全 |
 | mqtt_client | mqtt_client.c/h | MQTT client，TLS 1.2+、遗嘱消息、设备状态上报 |
 | daemon | daemon.c/h | 标准双重 fork 守护进程化 |
-| main | main.c | 多线程编排（采集 + Modbus + 上报） |
+| rule_engine | rule_engine.c/h | 规则引擎，支持 gt/lt/eq/ne/between/rate 运算符 + 冷却防抖 |
+| gpio_hal | gpio_hal.c/h | GPIO 抽象层，mock 模式（开发）/ libgpiod（真实硬件）|
+| ota | ota.c/h | A/B 分区 OTA 远程升级：HTTP 下载→SHA256 校验→安装→重启→回滚 |
+| main | main.c | 多线程编排（采集 + Modbus + 规则引擎 + 上报） |
 
 后续计划
 --------
 
 1. ~~MQTT over TLS + 设备身份~~ ✅ 阶段一完成
 2. ~~Modbus 工业协议接入~~ ✅ 阶段二完成
-3. 规则引擎 + 本地告警 + GPIO 联动
-4. A/B 分区 OTA 远程升级
+3. ~~规则引擎 + 本地告警 + GPIO 联动~~ ✅ 阶段三完成
+4. ~~A/B 分区 OTA 远程升级~~ ✅ 阶段四完成
+5. 本地 Web Dashboard  ← 下一步
 5. 本地 Web Dashboard
 6. 边缘 AI 异常检测（方向 B）
 

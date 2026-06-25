@@ -1,15 +1,15 @@
 # EmbMQTTNode - 嵌入式 MQTT 边缘网关
 
-基于 C11 的嵌入式 Linux IoT 边缘网关。当前版本 **v0.2**。
+基于 C11 的嵌入式 Linux IoT 边缘网关。当前版本 **v0.4**。
 
 ## 项目状态
 
 ```
-已发布: v0.2 (2026-06-25)
+已发布: v0.4 (2026-06-25)
 ├── 阶段一 ✅ MQTT over TLS + 设备身份
 ├── 阶段二 ✅ Modbus RTU/TCP 工业协议
-├── 阶段三 ⏳ 规则引擎 + 本地告警（任务清单已确认，待编码）
-├── 阶段四 ❌ A/B 分区 OTA 远程升级
+├── 阶段三 ✅ 规则引擎 + 本地告警
+├── 阶段四 ✅ A/B 分区 OTA 远程升级（v0.4 当前）
 ├── 阶段五 ❌ 本地 Web Dashboard
 ├── 阶段六 ❌ 构建系统 + 交叉编译 + CI
 └── 方向 B ❌ 边缘 AI 异常检测（后续）
@@ -20,27 +20,24 @@
 
 ## 下一步
 
-实施 **阶段三：规则引擎 + 本地告警**。任务清单见 docs/09_方案A_编码实施计划.md 阶段三部分。
-涉及文件：
-- 新增: src/rule_engine.c/h, src/gpio_hal.c/h, tests/test_rule_engine.c
-- 修改: src/common.h, src/config.c, src/main.c, src/Makefile, config/node.conf, README.txt
+实施 **阶段五：本地 Web Dashboard**。任务清单见 docs/09_方案A_编码实施计划.md 阶段五部分。
 
 ## 构建
 
 ```bash
-# 在 WSL Ubuntu 中
+# 在 WSL Ubuntu-26.04 中（已安装全部依赖）
 cd /mnt/d/testcode/EmbMQTTNode/src
 make                          # 含 Modbus
 make BUILD_WITH_MODBUS=0      # 不含 Modbus
 
 # 测试
-cd ../tests && make && ./test_sensor && ./test_storage && ./test_modbus_config
+cd ../tests && make && ./test_sensor && ./test_storage && ./test_modbus_config && ./test_rule_engine && ./test_ota
 ```
 
 ## 依赖
 
 ```bash
-sudo apt install build-essential libmosquitto-dev libsqlite3-dev libmodbus-dev
+sudo apt install build-essential libmosquitto-dev libsqlite3-dev libmodbus-dev libssl-dev
 ```
 
 ## 架构
@@ -53,10 +50,11 @@ src/
 ├── sensor.c/h       # I2C 传感器抽象（mock/BMP280/SHT30）
 ├── modbus_master.c/h # Modbus RTU/TCP（libmodbus，编译期可选）
 ├── storage.c/h      # SQLite 离线缓存
-├── mqtt_client.c/h  # MQTT + TLS + 遗嘱 + 状态上报
+├── mqtt_client.c/h  # MQTT + TLS + 遗嘱 + OTA 回调 + 状态上报
 ├── daemon.c/h       # 双重 fork 守护进程
-├── rule_engine.c/h  # （待实现）规则引擎
-└── gpio_hal.c/h     # （待实现）GPIO 抽象层
+├── rule_engine.c/h  # 规则引擎 + 本地告警（v0.3）
+├── gpio_hal.c/h     # GPIO 硬件抽象层（v0.3）
+├── ota.c/h          # A/B 分区 OTA 远程升级（v0.4）
 ```
 
 ## 关键约束

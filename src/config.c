@@ -41,6 +41,14 @@ static void set_default_config(struct node_config *cfg)
     cfg->modbus.stop_bits = 1;
     cfg->modbus.poll_interval_ms = 2000;
     cfg->modbus.reg_count = 0;
+
+    /* 规则引擎默认：无规则 */
+    cfg->rule_count = 0;
+
+    /* OTA 默认：关闭 */
+    cfg->ota.enabled = 0;
+    strncpy(cfg->ota.slot_dir, OTA_SLOT_DIR_DEFAULT, sizeof(cfg->ota.slot_dir) - 1);
+    cfg->ota.boot_attempt_max = OTA_BOOT_ATTEMPT_MAX;
 }
 
 int config_load(const char *path, struct node_config *cfg)
@@ -146,6 +154,127 @@ int config_load(const char *path, struct node_config *cfg)
                 LOG_WARN("config: invalid modbus_reg_%d format", idx);
             }
         }
+
+        /* ── 规则引擎: rule_N = field,operator,threshold,action ── */
+        else if (strncmp(k, "rule_", 5) == 0) {
+            int idx = cfg->rule_count;
+            if (idx >= RULE_MAX) {
+                LOG_WARN("config: too many rules, max=%d", RULE_MAX);
+                continue;
+            }
+
+            struct rule *r = &cfg->rules[idx];
+            memset(r, 0, sizeof(*r));
+
+            /* 规则名称 = key 本身 (e.g. "rule_1") */
+            strncpy(r->name, k, RULE_NAME_LEN - 1);
+            r->name[RULE_NAME_LEN - 1] = '\0';
+
+            /* 解析: field,operator,threshold[,action] */
+            char field[32]    = {0};
+            char op_str[16]   = {0};
+            char th_str[32]   = {0};
+            char act_str[64]  = {0};
+
+            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]",
+                                 field, op_str, th_str, act_str);
+            if (matched < 3) {
+                LOG_WARN("config: invalid %s format, need at least field,op,th", k);
+                continue;
+            }
+
+            /* 字段名 */
+            strncpy(r->field, field, sizeof(r->field));
+            r->field[sizeof(r->field) - 1] = '\0';
+
+            /* 运算符 */
+            if (strcmp(op_str, "gt") == 0)
+                r->op = OP_GT;
+            else if (strcmp(op_str, "lt") == 0)
+                r->op = OP_LT;
+            else if (strcmp(op_str, "eq") == 0)
+                r->op = OP_EQ;
+            else if (strcmp(op_str, "ne") == 0)
+                r->op = OP_NE;
+            else if (strcmp(op_str, "between") == 0)
+                r->op = OP_BETWEEN;
+            else if (strcmp(op_str, "rate") == 0)
+                r->op = OP_RATE;
+            else {
+                LOG_WARN("config: %s unknown operator '%s'", k, op_str);
+                continue;
+            }
+
+            /* 阈值 */
+            if (r->op == OP_BETWEEN) {
+                /* 格式: lo_hi, e.g. 950.0_1050.0 */
+                if (sscanf(th_str, "%lf_%lf",
+                           &r->threshold_lo, &r->threshold_hi) != 2) {
+                    LOG_WARN("config: %s invalid between range '%s'", k, th_str);
+                    continue;
+                }
+            } else if (r->op == OP_RATE) {
+                /* 格式: rate_window, e.g. 5.0_60s or 5.0_60 */
+                char unit[4] = {0};
+                if (sscanf(th_str, "%lf_%lf%3s",
+                           &r->threshold, &r->rate_window_s, unit) >= 2) {
+                    /* window parsed; unit is optional and ignored */
+                } else {
+                    LOG_WARN("config: %s invalid rate '%s'", k, th_str);
+                    continue;
+                }
+            } else {
+                r->threshold = atof(th_str);
+            }
+
+            /* 动作（可选，默认 log_only）*/
+            if (matched >= 4) {
+                /* 解析逗号或加号分隔的动作列表 */
+                char *saveptr = NULL;
+                char *token = strtok_r(act_str, ",+", &saveptr);
+                while (token) {
+                    /* trim token */
+                    while (*token == ' ' || *token == '\t') token++;
+                    char *end = token + strlen(token) - 1;
+                    while (end > token && (*end == ' ' || *end == '\t')) end--;
+                    *(end + 1) = '\0';
+
+                    if (strcmp(token, "all") == 0)
+                        r->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT
+                                           | ACTION_GPIO_1 | ACTION_GPIO_2);
+                    else if (strcmp(token, "alert_mqtt") == 0)
+                        r->action_mask |= ACTION_ALERT_MQTT;
+                    else if (strcmp(token, "gpio_1") == 0)
+                        r->action_mask |= ACTION_GPIO_1;
+                    else if (strcmp(token, "gpio_2") == 0)
+                        r->action_mask |= ACTION_GPIO_2;
+                    else if (strcmp(token, "log_only") == 0)
+                        r->action_mask |= ACTION_LOG_ONLY;
+                    else
+                        LOG_WARN("config: %s unknown action '%s'", k, token);
+
+                    token = strtok_r(NULL, ",+", &saveptr);
+                }
+            }
+            if (r->action_mask == 0)
+                r->action_mask = ACTION_LOG_ONLY;  /* 默认 */
+
+            /* 默认冷却时间 60s */
+            r->cooldown_ms = 60000;
+
+            cfg->rule_count++;
+            LOG_INFO("config: %s field=%s op=%d th=%.2f act=0x%02x",
+                     r->name, r->field, r->op,
+                     r->threshold, r->action_mask);
+        }
+
+        /* ── OTA: ota_* 配置项 ── */
+        else if (strcmp(k, "ota_enabled") == 0)
+            cfg->ota.enabled = atoi(v);
+        else if (strcmp(k, "ota_slot_dir") == 0)
+            strncpy(cfg->ota.slot_dir, v, sizeof(cfg->ota.slot_dir) - 1);
+        else if (strcmp(k, "ota_boot_attempt_max") == 0)
+            cfg->ota.boot_attempt_max = atoi(v);
     }
 
     fclose(fp);
@@ -195,4 +324,39 @@ void config_dump(const struct node_config *cfg)
                      r->scale, r->offset);
         }
     }
+
+    LOG_INFO("--- Rules ---");
+    LOG_INFO("rule_count         = %d", cfg->rule_count);
+    for (int i = 0; i < cfg->rule_count; i++) {
+        const struct rule *r = &cfg->rules[i];
+        const char *op_name = "?";
+        switch (r->op) {
+        case OP_GT:      op_name = "gt";      break;
+        case OP_LT:      op_name = "lt";      break;
+        case OP_EQ:      op_name = "eq";      break;
+        case OP_NE:      op_name = "ne";      break;
+        case OP_BETWEEN: op_name = "between"; break;
+        case OP_RATE:    op_name = "rate";    break;
+        }
+        if (r->op == OP_BETWEEN) {
+            LOG_INFO("  %s: %s %s [%.2f,%.2f] act=0x%02x",
+                     r->name, r->field, op_name,
+                     r->threshold_lo, r->threshold_hi,
+                     r->action_mask);
+        } else if (r->op == OP_RATE) {
+            LOG_INFO("  %s: %s %s %.2f/%.0fs act=0x%02x",
+                     r->name, r->field, op_name,
+                     r->threshold, r->rate_window_s,
+                     r->action_mask);
+        } else {
+            LOG_INFO("  %s: %s %s %.2f act=0x%02x",
+                     r->name, r->field, op_name,
+                     r->threshold, r->action_mask);
+        }
+    }
+
+    LOG_INFO("--- OTA ---");
+    LOG_INFO("ota_enabled        = %d", cfg->ota.enabled);
+    LOG_INFO("ota_slot_dir       = %s", cfg->ota.slot_dir);
+    LOG_INFO("ota_boot_attempt_max= %d", cfg->ota.boot_attempt_max);
 }

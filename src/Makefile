@@ -4,7 +4,7 @@
 
 CC       ?= gcc
 CFLAGS   ?= -std=c11 -Wall -Wextra -O2 -g -pthread -D_DEFAULT_SOURCE
-LDFLAGS  ?= -pthread -lmosquitto -lsqlite3 -lm
+LDFLAGS  ?= -pthread -lmosquitto -lsqlite3 -lm -lcrypto
 
 # Modbus 可选模块（默认启用）
 BUILD_WITH_MODBUS ?= 1
@@ -16,7 +16,7 @@ endif
 
 TARGET   = embmqttnode
 SRCS     = main.c config.c sensor.c storage.c mqtt_client.c daemon.c \
-           modbus_master.c
+           modbus_master.c rule_engine.c gpio_hal.c ota.c
 OBJS     = $(SRCS:.c=.o)
 
 .PHONY: all clean strip install

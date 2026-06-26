@@ -1,0 +1,76 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            cross_compile: ""
+            packages: build-essential libmosquitto-dev libsqlite3-dev libmodbus-dev libssl-dev
+
+          - arch: aarch64
+            cross_compile: aarch64-linux-gnu-
+            packages: build-essential gcc-aarch64-linux-gnu
+
+          - arch: armhf
+            cross_compile: arm-linux-gnueabihf-
+            packages: build-essential gcc-arm-linux-gnueabihf
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: "Build with Modbus (native: full, cross: obj only)"
+        if: matrix.cross_compile == ''
+        run: make -C src BUILD_WITH_MODBUS=1
+
+      - name: "Build with Modbus (cross: obj only)"
+        if: matrix.cross_compile != ''
+        run: make -C src CROSS_COMPILE=${{ matrix.cross_compile }} BUILD_WITH_MODBUS=1 obj
+
+      - name: Clean
+        run: make -C src clean
+
+      - name: "Build without Modbus (native: full)"
+        if: matrix.cross_compile == ''
+        run: make -C src BUILD_WITH_MODBUS=0
+
+      - name: "Build without Modbus (cross: obj only)"
+        if: matrix.cross_compile != ''
+        run: make -C src CROSS_COMPILE=${{ matrix.cross_compile }} BUILD_WITH_MODBUS=0 obj
+
+      - name: Build and run tests (native only)
+        if: matrix.cross_compile == ''
+        run: |
+          make -C tests
+          cd tests
+          ./test_sensor
+          ./test_storage
+          ./test_modbus_config
+          ./test_rule_engine
+          ./test_ota
+
+      - name: Strip binary
+        if: matrix.cross_compile == ''
+        run: make -C src strip
+
+      - name: Upload artifact
+        if: matrix.cross_compile == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: embmqttnode-${{ matrix.arch }}
+          path: src/embmqttnode

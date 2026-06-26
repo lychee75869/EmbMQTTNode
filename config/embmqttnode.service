@@ -1,0 +1,52 @@
+# EmbMQTTNode systemd service file
+# 安装: sudo cp config/embmqttnode.service /etc/systemd/system/
+# 启用: sudo systemctl enable embmqttnode
+# 启动: sudo systemctl start embmqttnode
+#
+# 部署前请修改:
+#   1. ExecStart 中的 -c 配置文件路径
+#   2. ReadWritePaths 中的目录路径（匹配 OTA slot_dir）
+#   3. User/Group 按需调整
+
+[Unit]
+Description=EmbMQTTNode Edge Gateway
+Documentation=https://github.com/lychee75869/EmbMQTTNode
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/embmqttnode -c /etc/embmqttnode/node.conf
+ExecReload=/bin/kill -HUP $MAINPID
+
+# 自动重启策略
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=120
+# OTA 升级完成后以 exit(42) 触发 systemd 重启（加载新固件）
+RestartForceExitStatus=42
+
+User=root
+Group=root
+
+# 日志输出到 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=embmqttnode
+
+# 可选环境变量覆盖
+EnvironmentFile=-/etc/default/embmqttnode
+
+# 安全加固（按需调整）
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/embmqttnode /tmp/embmqttnode /var/lib/embmqttnode
+PrivateTmp=yes
+
+# 资源限制
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

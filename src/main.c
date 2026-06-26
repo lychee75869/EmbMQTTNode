@@ -21,6 +21,7 @@
 #include "rule_engine.h"
 #include "gpio_hal.h"
 #include "ota.h"
+#include "http_server.h"
 
 static volatile int g_running = 1;
 static struct node_config g_cfg;
@@ -174,6 +175,9 @@ static void *sample_thread(void *arg)
         LOG_INFO("sample: temp=%.2f hum=%.2f pres=%.2f",
                  data.temperature, data.humidity, data.pressure);
 
+        /* ── Dashboard 数据更新（阶段五）── */
+        http_server_update_data(&data);
+
         /* ── 规则引擎评估（阶段三）── */
         char alert_msg[256] = {0};
         uint8_t actions = rule_engine_evaluate(&data, alert_msg,
@@ -222,6 +226,9 @@ static void *modbus_thread(void *arg)
             LOG_INFO("modbus: slave data temp=%.2f hum=%.2f pres=%.2f",
                      data[i].temperature, data[i].humidity,
                      data[i].pressure);
+
+            /* ── Dashboard 数据更新（阶段五）── */
+            http_server_update_data(&data[i]);
 
             /* ── 规则引擎评估（阶段三）── */
             char alert_msg[256] = {0};
@@ -301,6 +308,21 @@ static void *upload_thread(void *arg)
         }
         sleep(5);
     }
+    return NULL;
+}
+
+/* ─── HTTP Dashboard 线程 ─────────────────────────────── */
+
+struct http_thread_arg {
+    int port;
+    const struct device_info *dev;
+    const struct node_config *cfg;
+};
+
+static void *http_thread(void *arg)
+{
+    struct http_thread_arg *a = (struct http_thread_arg *)arg;
+    http_server_start(a->port, "0.0.0.0", a->dev, a->cfg);
     return NULL;
 }
 
@@ -430,7 +452,7 @@ int main(int argc, char *argv[])
     /* 9. 启动工作线程 */
     LOG_INFO("EmbMQTTNode v%s starting...", EMBMQTTNODE_VERSION);
 
-    pthread_t tid_sample, tid_upload, tid_modbus = 0;
+    pthread_t tid_sample, tid_upload, tid_modbus = 0, tid_http = 0;
     pthread_create(&tid_sample, NULL, sample_thread, NULL);
     pthread_create(&tid_upload, NULL, upload_thread, NULL);
     /* Modbus 线程仅在 enabled 时启动 */
@@ -438,10 +460,23 @@ int main(int argc, char *argv[])
         pthread_create(&tid_modbus, NULL, modbus_thread, NULL);
         LOG_INFO("modbus polling thread started");
     }
+    /* HTTP Dashboard 线程（阶段五） */
+    {
+        struct http_thread_arg http_arg;
+        http_arg.port = 8080;
+        http_arg.dev  = &g_dev;
+        http_arg.cfg  = &g_cfg;
+        pthread_create(&tid_http, NULL, http_thread, &http_arg);
+        LOG_INFO("http dashboard thread started on port 8080");
+    }
 
     pthread_join(tid_sample, NULL);
     pthread_join(tid_upload, NULL);
     if (tid_modbus) pthread_join(tid_modbus, NULL);
+    if (tid_http) {
+        http_server_stop();
+        pthread_join(tid_http, NULL);
+    }
 
     /* 10. 优雅退出 */
     LOG_INFO("shutting down...");

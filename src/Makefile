@@ -1,8 +1,10 @@
 # EmbMQTTNode Makefile
 # 构建嵌入式 MQTT 边缘网关
-# 阶段二：条件编译 Modbus 支持
+# 阶段六：交叉编译 + 自动依赖 + CI
 
-CC       ?= gcc
+CROSS_COMPILE ?=
+CC       ?= $(CROSS_COMPILE)gcc
+STRIP    ?= $(CROSS_COMPILE)strip
 CFLAGS   ?= -std=c11 -Wall -Wextra -O2 -g -pthread -D_DEFAULT_SOURCE
 LDFLAGS  ?= -pthread -lmosquitto -lsqlite3 -lm -lcrypto
 
@@ -16,21 +18,24 @@ endif
 
 TARGET   = embmqttnode
 SRCS     = main.c config.c sensor.c storage.c mqtt_client.c daemon.c \
-           modbus_master.c rule_engine.c gpio_hal.c ota.c
+           modbus_master.c rule_engine.c gpio_hal.c ota.c http_server.c
 OBJS     = $(SRCS:.c=.o)
+DEPS     = $(OBJS:.o=.d)
 
-.PHONY: all clean strip install
+.PHONY: all obj clean strip install distclean
 
 all: $(TARGET)
+
+obj: $(OBJS)
 
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 strip: $(TARGET)
-	strip --strip-unneeded $(TARGET)
+	$(STRIP) --strip-unneeded $(TARGET)
 
 install: $(TARGET)
 	install -d $(DESTDIR)/usr/bin
@@ -40,3 +45,8 @@ install: $(TARGET)
 
 clean:
 	rm -f $(OBJS) $(TARGET)
+
+distclean: clean
+	rm -f $(DEPS)
+
+-include $(DEPS)

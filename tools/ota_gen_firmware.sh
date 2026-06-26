@@ -29,19 +29,15 @@ echo ""
 # 1. 编译
 echo "[1/4] Building..."
 cd "$PROJECT_ROOT/src"
-make clean > /dev/null 2>&1
-if [ -n "$CROSS_COMPILE" ]; then
-    make CROSS_COMPILE="$CROSS_COMPILE" BUILD_WITH_MODBUS=1
-else
-    make BUILD_WITH_MODBUS=1
-fi
+make clean CROSS_COMPILE="$CROSS_COMPILE" > /dev/null 2>&1
+make CROSS_COMPILE="$CROSS_COMPILE" BUILD_WITH_MODBUS=1
 echo "  Build OK"
 
 # 2. Strip + 准备输出目录
 echo "[2/4] Preparing firmware binary..."
 mkdir -p "$DIST_DIR"
 cp embmqttnode "$DIST_DIR/embmqttnode_${VERSION}.bin"
-strip --strip-unneeded "$DIST_DIR/embmqttnode_${VERSION}.bin" 2>/dev/null || true
+${CROSS_COMPILE}strip --strip-unneeded "$DIST_DIR/embmqttnode_${VERSION}.bin" 2>/dev/null || true
 SIZE=$(stat -c%s "$DIST_DIR/embmqttnode_${VERSION}.bin")
 echo "  Firmware size: $SIZE bytes"
 

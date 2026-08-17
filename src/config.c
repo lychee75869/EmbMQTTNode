@@ -1,3 +1,9 @@
+/*
+ * config.c
+ * 配置文件解析模块实现
+ * 支持 INI 风格键值对，格式：key = value
+ * 覆盖 MQTT / TLS / Modbus / 规则引擎 / OTA / 异常检测 六大配置段
+ */
 #include "config.h"
 
 static char *trim(char *str)
@@ -49,6 +55,10 @@ static void set_default_config(struct node_config *cfg)
     cfg->ota.enabled = 0;
     strncpy(cfg->ota.slot_dir, OTA_SLOT_DIR_DEFAULT, sizeof(cfg->ota.slot_dir) - 1);
     cfg->ota.boot_attempt_max = OTA_BOOT_ATTEMPT_MAX;
+
+    /* 异常检测引擎默认：关闭 */
+    cfg->anomaly_enabled = 0;
+    cfg->anomaly_count = 0;
 }
 
 int config_load(const char *path, struct node_config *cfg)
@@ -275,6 +285,99 @@ int config_load(const char *path, struct node_config *cfg)
             strncpy(cfg->ota.slot_dir, v, sizeof(cfg->ota.slot_dir) - 1);
         else if (strcmp(k, "ota_boot_attempt_max") == 0)
             cfg->ota.boot_attempt_max = atoi(v);
+
+        /* ── 异常检测引擎: anomaly_enabled / anomaly_N ── */
+        else if (strcmp(k, "anomaly_enabled") == 0)
+            cfg->anomaly_enabled = atoi(v);
+
+        else if (strncmp(k, "anomaly_", 8) == 0) {
+            int idx = cfg->anomaly_count;
+            if (idx >= ANOMALY_MAX) {
+                LOG_WARN("config: too many anomaly rules, max=%d",
+                         ANOMALY_MAX);
+                continue;
+            }
+
+            struct anomaly_config *a = &cfg->anoms[idx];
+            memset(a, 0, sizeof(*a));
+
+            /* 名称 = key 本身 (e.g. "anomaly_1") */
+            strncpy(a->name, k, ANOMALY_NAME_LEN - 1);
+            a->name[ANOMALY_NAME_LEN - 1] = '\0';
+
+            /* 解析: field,algo,threshold,action */
+            char field[32]    = {0};
+            char algo_str[16] = {0};
+            char th_str[32]   = {0};
+            char act_str[64]  = {0};
+
+            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]",
+                                 field, algo_str, th_str, act_str);
+            if (matched < 3) {
+                LOG_WARN("config: invalid %s format, "
+                         "need field,algo,threshold", k);
+                continue;
+            }
+
+            /* 字段名 */
+            strncpy(a->field, field, sizeof(a->field) - 1);
+            a->field[sizeof(a->field) - 1] = '\0';
+
+            /* 算法 */
+            if (strcmp(algo_str, "zscore") == 0)
+                a->algo = ANOMALY_ZSCORE;
+            else if (strcmp(algo_str, "iforest") == 0) {
+                a->algo = ANOMALY_IFOREST;
+                a->iforest_enabled = 1;
+            } else {
+                LOG_WARN("config: %s unknown algo '%s'", k, algo_str);
+                continue;
+            }
+
+            /* 阈值 */
+            a->zscore_threshold = atof(th_str);
+
+            /* 动作（可选，默认 log_only） */
+            if (matched >= 4) {
+                char *saveptr = NULL;
+                char *token = strtok_r(act_str, ",+", &saveptr);
+                while (token) {
+                    while (*token == ' ' || *token == '\t') token++;
+                    char *end = token + strlen(token) - 1;
+                    while (end > token && (*end == ' ' || *end == '\t'))
+                        end--;
+                    *(end + 1) = '\0';
+
+                    if (strcmp(token, "all") == 0)
+                        a->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT
+                                          | ACTION_GPIO_1 | ACTION_GPIO_2);
+                    else if (strcmp(token, "alert_mqtt") == 0)
+                        a->action_mask |= ACTION_ALERT_MQTT;
+                    else if (strcmp(token, "gpio_1") == 0)
+                        a->action_mask |= ACTION_GPIO_1;
+                    else if (strcmp(token, "gpio_2") == 0)
+                        a->action_mask |= ACTION_GPIO_2;
+                    else if (strcmp(token, "log_only") == 0)
+                        a->action_mask |= ACTION_LOG_ONLY;
+                    else
+                        LOG_WARN("config: %s unknown action '%s'", k, token);
+
+                    token = strtok_r(NULL, ",+", &saveptr);
+                }
+            }
+            if (a->action_mask == 0)
+                a->action_mask = ACTION_LOG_ONLY;
+
+            /* 默认参数 */
+            a->cooldown_ms = 60000;
+            a->window_size = ANOMALY_WINDOW_SIZE;
+
+            cfg->anomaly_count++;
+            LOG_INFO("config: %s field=%s algo=%s th=%.2f act=0x%02x",
+                     a->name, a->field,
+                     a->algo == ANOMALY_ZSCORE ? "zscore" : "iforest",
+                     a->zscore_threshold, a->action_mask);
+        }
     }
 
     fclose(fp);
@@ -359,4 +462,18 @@ void config_dump(const struct node_config *cfg)
     LOG_INFO("ota_enabled        = %d", cfg->ota.enabled);
     LOG_INFO("ota_slot_dir       = %s", cfg->ota.slot_dir);
     LOG_INFO("ota_boot_attempt_max= %d", cfg->ota.boot_attempt_max);
+
+    LOG_INFO("--- Anomaly Engine ---");
+    LOG_INFO("anomaly_enabled    = %d", cfg->anomaly_enabled);
+    LOG_INFO("anomaly_count      = %d", cfg->anomaly_count);
+    for (int i = 0; i < cfg->anomaly_count; i++) {
+        const struct anomaly_config *a = &cfg->anoms[i];
+        const char *algo_name =
+            (a->algo == ANOMALY_ZSCORE)  ? "zscore" :
+            (a->algo == ANOMALY_IFOREST) ? "iforest" : "?";
+        LOG_INFO("  %s: %s %s th=%.2f act=0x%02x cd=%dms win=%d",
+                 a->name, a->field, algo_name,
+                 a->zscore_threshold, a->action_mask,
+                 a->cooldown_ms, a->window_size);
+    }
 }

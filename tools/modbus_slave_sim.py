@@ -2,23 +2,21 @@
 """
 Modbus TCP Slave Simulator
 ==========================
-用于 EmbMQTTNode 开发调试，模拟一个 Modbus TCP 从设备。
-无需真实 PLC/传感器硬件即可验证 Modbus 模块。
+Simulates a Modbus TCP slave device for EmbMQTTNode development.
+No real PLC/sensor hardware needed to validate the Modbus module.
 
-启动后监听 127.0.0.1:502，提供 4 个保持寄存器：
-  40001 - 温度 × 10  (int16, 例 256 → 25.6℃)
-  40002 - 湿度 × 10  (int16, 例 523 → 52.3%)
-  40003 - 气压高字    (float32 高 16 位)
-  40004 - 气压低字    (float32 低 16 位, 例 {40003,40004} → 1013.25 hPa)
+Listens on 127.0.0.1:502 by default with 4 holding registers:
+  40001 - Temperature × 10  (int16, e.g. 256 → 25.6°C)
+  40002 - Humidity × 10     (int16, e.g. 523 → 52.3%)
+  40003 - Pressure high word (float32 upper 16 bits)
+  40004 - Pressure low word  (float32 lower 16 bits)
 
-安装依赖:
+Dependencies:
   pip install pymodbus
 
-使用:
+Usage:
   python tools/modbus_slave_sim.py
-  默认监听 127.0.0.1:502
-
-  python tools/modbus_slave_sim.py --port 1502  # 自定义端口
+  python tools/modbus_slave_sim.py --port 1502
 """
 
 import struct
@@ -31,20 +29,20 @@ from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
 
 
 class SimSensor:
-    """模拟传感器数据，带缓慢随机漂移"""
+    """Simulated sensor with slow random drift."""
 
     def __init__(self):
-        self.temp = 25.0   # ℃
-        self.humid = 55.0  # %
+        self.temp = 25.0    # Celsius
+        self.humid = 55.0   # %RH
         self.press = 1013.25  # hPa
 
     def drift(self):
-        """每次调用时数据小幅随机波动，模拟真实传感器漂移"""
-        self.temp  += random.gauss(0, 0.05)       # 标准差 0.05℃
-        self.humid += random.gauss(0, 0.10)       # 标准差 0.10%
-        self.press += random.gauss(0, 0.15)       # 标准差 0.15hPa
+        """Apply small random fluctuations to simulate real sensor drift."""
+        self.temp  += random.gauss(0, 0.05)   # σ = 0.05°C
+        self.humid += random.gauss(0, 0.10)   # σ = 0.10%
+        self.press += random.gauss(0, 0.15)   # σ = 0.15 hPa
 
-        # 边界约束
+        # Boundary constraints
         self.temp  = max(10.0, min(45.0, self.temp))
         self.humid = max(20.0, min(95.0, self.humid))
         self.press = max(980.0, min(1050.0, self.press))
@@ -52,18 +50,18 @@ class SimSensor:
         return self.temp, self.humid, self.press
 
     def to_registers(self):
-        """转为 Modbus 寄存器格式"""
-        # 温度: int16 × 10
+        """Convert sensor values to Modbus register format."""
+        # Temperature: int16 × 10
         temp_reg = int(self.temp * 10)
         if temp_reg < 0:
-            temp_reg = temp_reg & 0xFFFF  # 补码
+            temp_reg = temp_reg & 0xFFFF  # two's complement
 
-        # 湿度: int16 × 10
+        # Humidity: int16 × 10
         humid_reg = int(self.humid * 10)
         if humid_reg < 0:
             humid_reg = humid_reg & 0xFFFF
 
-        # 气压: float32 → 2 个 uint16（大端）
+        # Pressure: float32 → 2× uint16 (big-endian)
         press_bytes = struct.pack('>f', self.press)
         press_hi = (press_bytes[0] << 8) | press_bytes[1]
         press_lo = (press_bytes[2] << 8) | press_bytes[3]
@@ -72,17 +70,17 @@ class SimSensor:
 
 
 class UpdatingDataBlock(ModbusSequentialDataBlock):
-    """自定义 DataBlock：每次读取时自动更新传感器数据"""
+    """Custom DataBlock: auto-updates sensor values on every read."""
 
     def __init__(self, sim):
         self.sim = sim
         super().__init__(0, [0] * 4)
 
     def getValues(self, address, count=1):
-        """读取寄存器时自动生成最新数据"""
+        """Generate latest sensor data when registers are read."""
         self.sim.drift()
         regs = self.sim.to_registers()
-        self.values = regs  # 更新内部值
+        self.values = regs
         return super().getValues(address, count)
 
 

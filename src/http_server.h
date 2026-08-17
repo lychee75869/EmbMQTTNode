@@ -9,6 +9,7 @@
  *   - GET  /api/data/latest  最新传感器读数
  *   - GET  /api/data/history?n=N  最近 N 条记录（from SQLite）
  *   - GET  /api/rules     规则引擎统计
+ *   - GET  /api/anomaly   异常检测引擎统计
  *   - GET  /api/ota/status    OTA 升级状态
  *   - POST /api/reboot    触发重启（需 token 认证）
  */

@@ -1,21 +1,22 @@
 # EmbMQTTNode - 嵌入式 MQTT 边缘网关
 
-基于 C11 的嵌入式 Linux IoT 边缘网关。当前版本 **v1.0.0**。
+基于 C11 的嵌入式 Linux IoT 边缘网关。当前版本 **v1.1.0**。
 
 ## 项目状态
 
 ```
-已发布: v1.0.0 (2026-06-26)
+已发布: v1.1.0
 ├── 阶段一 ✅ MQTT over TLS + 设备身份
 ├── 阶段二 ✅ Modbus RTU/TCP 工业协议
 ├── 阶段三 ✅ 规则引擎 + 本地告警
 ├── 阶段四 ✅ A/B 分区 OTA 远程升级
 ├── 阶段五 ✅ 本地 Web Dashboard（v1.0.0 当前）
 ├── 阶段六 ✅ 构建系统 + 交叉编译 + CI
-└── 方向 B ❌ 边缘 AI 异常检测（后续）
+├── 方向 B ✅ 边缘 AI 异常检测（Z-score + iForest）
+└── 后续    接入真实传感器（BMP280/SHT30）
 
-当前分支: main (领先 origin/main 2 commits)
-最后提交: 0288b91 v0.2: Build compatibility fixes
+当前分支: main
+最后提交: v1.1.0 方向 B 边缘 AI 异常检测
 ```
 
 ## 下一步
@@ -31,7 +32,7 @@ cd /mnt/d/testcode/EmbMQTTNode
 # 顶层 Makefile（推荐）
 make                          # 编译（含 Modbus）
 make BUILD_WITH_MODBUS=0      # 编译（不含 Modbus）
-make test                     # 编译并运行全部 5 个测试
+make test                     # 编译并运行全部 6 个测试
 make strip                    # 去除调试符号
 make install DESTDIR=/path    # 安装到目标根文件系统
 make dist                     # 生成发布 tarball
@@ -48,7 +49,7 @@ make BUILD_WITH_MODBUS=0      # 不含 Modbus
 make obj                      # 仅编译 .o（不链接，用于交叉编译检查）
 
 # 测试
-cd ../tests && make && ./test_sensor && ./test_storage && ./test_modbus_config && ./test_rule_engine && ./test_ota
+cd ../tests && make && ./test_sensor && ./test_storage && ./test_modbus_config && ./test_rule_engine && ./test_ota && ./test_anomaly_engine
 ```
 
 ## 依赖
@@ -73,6 +74,7 @@ src/
 ├── gpio_hal.c/h     # GPIO 硬件抽象层（v0.3）
 ├── ota.c/h          # A/B 分区 OTA 远程升级（v0.4）
 ├── http_server.c/h  # 本地 Web Dashboard（v1.0.0）
+├── anomaly_engine.c/h # 异常检测引擎：Z-score + iForest（方向 B）
 ```
 
 ## Web Dashboard（阶段五）
@@ -99,7 +101,7 @@ REST API:
 ## CI
 
 GitHub Actions (`.github/workflows/build.yml`)：push/PR 触发，3 架构矩阵构建：
-- **x86_64**: 完整编译 + 链接 + 运行全部 5 个测试 + 上传 artifact
+- **x86_64**: 完整编译 + 链接 + 运行全部 6 个测试 + 上传 artifact
 - **aarch64 / armhf**: 交叉编译 `.o` 文件检查（obj 目标，不链接）
 
 ## 关键约束

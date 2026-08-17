@@ -2,7 +2,11 @@
  * tests/test_modbus_config.c
  * Modbus 配置解析单元测试
  *
- * 验证 config_load 能正确解析 modbus_* 配置项和寄存器映射。
+ * 覆盖:
+ *   - modbus_enabled / modbus_mode / modbus_tcp_host 解析
+ *   - 寄存器映射 modbus_reg_N 解析（slave_id/addr/type/field/scale/offset）
+ *   - int16 / float32 数据类型
+ *   - 基础配置（broker_host/port）保留
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +14,8 @@
 #include <assert.h>
 #include "../src/common.h"
 #include "../src/config.h"
+
+/* ═══════════════════════════════════════════════════════════ */
 
 static const char *test_config_content =
     "broker_host = 192.168.1.100\n"

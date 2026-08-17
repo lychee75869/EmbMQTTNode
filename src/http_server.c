@@ -18,6 +18,7 @@
 #include "storage.h"
 #include "mqtt_client.h"
 #include "rule_engine.h"
+#include "anomaly_engine.h"
 #include "ota.h"
 
 #include <sys/socket.h>
@@ -249,7 +250,9 @@ static void handle_api_status(int fd)
              "\"modbus_enabled\":%s,"
              "\"ota_enabled\":%s,"
              "\"ota_state\":\"%s\","
-             "\"rule_count\":%d"
+             "\"rule_count\":%d,"
+             "\"anomaly_enabled\":%s,"
+             "\"anomaly_count\":%d"
              "}",
              g_cfg ? g_cfg->client_id : "unknown",
              EMBMQTTNODE_VERSION,
@@ -259,7 +262,9 @@ static void handle_api_status(int fd)
              (g_cfg && g_cfg->modbus.enabled) ? "true" : "false",
              (g_cfg && g_cfg->ota.enabled) ? "true" : "false",
              ota_state_string(),
-             g_cfg ? g_cfg->rule_count : 0);
+             g_cfg ? g_cfg->rule_count : 0,
+             (g_cfg && g_cfg->anomaly_enabled) ? "true" : "false",
+             g_cfg ? g_cfg->anomaly_count : 0);
 
     http_send_json(fd, 200, buf);
 }
@@ -361,6 +366,45 @@ static void handle_api_rules(int fd)
                         stats[i].name,
                         stats[i].trigger_count,
                         (long long)stats[i].last_triggered,
+                        (i < n - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, 4, "]");
+
+    http_send_json(fd, 200, buf);
+    free(buf);
+}
+
+/* GET /api/anomaly */
+static void handle_api_anomaly(int fd)
+{
+    struct anomaly_stats stats[ANOMALY_MAX];
+    int n = anomaly_engine_get_stats(stats, ANOMALY_MAX);
+
+    if (n <= 0) {
+        http_send_json(fd, 200, "[]");
+        return;
+    }
+
+    char *buf = malloc(n * 320 + 32);
+    if (!buf) {
+        http_send_error(fd, 500, "malloc failed");
+        return;
+    }
+
+    int pos = 0;
+    pos += snprintf(buf + pos, 4, "[\n");
+    for (int i = 0; i < n; i++) {
+        pos += snprintf(buf + pos, 320,
+                        "  {\"name\":\"%s\","
+                        "\"trigger_count\":%d,"
+                        "\"last_triggered_ms\":%lld,"
+                        "\"zscore\":%.4f,"
+                        "\"score\":%.4f}%s\n",
+                        stats[i].name,
+                        stats[i].trigger_count,
+                        (long long)stats[i].last_triggered,
+                        stats[i].current_zscore,
+                        stats[i].current_score,
                         (i < n - 1) ? "," : "");
     }
     pos += snprintf(buf + pos, 4, "]");
@@ -533,6 +577,12 @@ static const char DASHBOARD_HTML[] =
 "    <div class=\"value-row\"><span class=\"label\">最后更新</span><span class=\"val\" id=\"updated\">--</span></div>\n"
 "  </div>\n"
 "\n"
+"  <!-- 异常检测引擎 -->\n"
+"  <div class=\"card\">\n"
+"    <h2>⚠ 异常检测</h2>\n"
+"    <div id=\"anomalies\"><span style=\"color:#778ca3\">未启用或未配置</span></div>\n"
+"  </div>\n"
+"\n"
 "  <!-- 规则引擎 -->\n"
 "  <div class=\"card\">\n"
 "    <h2>🔔 规则引擎</h2>\n"
@@ -644,10 +694,33 @@ static const char DASHBOARD_HTML[] =
 "  } catch(e) { /* silent */ }\n"
 "}\n"
 "\n"
+"// ── 轮询 /api/anomaly ───────────────────────────────\n"
+"async function pollAnomalies() {\n"
+"  try {\n"
+"    var r = await fetch('/api/anomaly');\n"
+"    var arr = await r.json();\n"
+"    if (!arr || arr.length === 0) {\n"
+"      $('anomalies').innerHTML = '<span style=\"color:#778ca3\">无异常规则或未触发</span>';\n"
+"      return;\n"
+"    }\n"
+"    var html = '<table><tr><th>规则</th><th>触发</th><th>Z-Score</th><th>分数</th><th>状态</th></tr>';\n"
+"    arr.forEach(function(a) {\n"
+"      var active = a.trigger_count > 0 ? 'active':'idle';\n"
+"      var label  = a.trigger_count > 0 ? '⚠ 异常':'✓ 正常';\n"
+"      html += '<tr><td>'+escHtml(a.name)+'</td><td>'+a.trigger_count+'</td>'\n"
+"           + '<td>'+a.zscore.toFixed(2)+'</td><td>'+a.score.toFixed(3)+'</td>'\n"
+"           + '<td><span class=\"alert-tag '+active+'\">'+label+'</span></td></tr>';\n"
+"    });\n"
+"    html += '</table>';\n"
+"    $('anomalies').innerHTML = html;\n"
+"  } catch(e) {}\n"
+"}\n"
+"\n"
 "// ── 定时轮询 ─────────────────────────────────────────\n"
-"pollStatus(); pollLatest(); pollRules(); pollTrend();\n"
+"pollStatus(); pollLatest(); pollAnomalies(); pollRules(); pollTrend();\n"
 "setInterval(pollStatus, 5000);\n"
 "setInterval(pollLatest, 2000);\n"
+"setInterval(pollAnomalies, 5000);\n"
 "setInterval(pollRules, 5000);\n"
 "setInterval(pollTrend, 10000);\n"
 "</script>\n"
@@ -691,6 +764,13 @@ static void http_dispatch(int fd, const char *method, const char *path,
     /* GET /api/rules */
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/rules") == 0) {
         handle_api_rules(fd);
+        return;
+    }
+
+    /* GET /api/anomaly */
+    if (strcmp(method, "GET") == 0 &&
+        strcmp(path, "/api/anomaly") == 0) {
+        handle_api_anomaly(fd);
         return;
     }
 

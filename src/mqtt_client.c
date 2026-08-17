@@ -1,3 +1,9 @@
+/*
+ * mqtt_client.c
+ * MQTT 客户端实现，基于 libmosquitto
+ * 支持 TLS 1.2+ 加密、Last Will 遗嘱消息、设备状态上报、
+ * OTA 升级指令订阅
+ */
 #include "mqtt_client.h"
 #include <mosquitto.h>
 #include <stdio.h>

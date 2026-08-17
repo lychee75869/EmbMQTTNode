@@ -21,6 +21,7 @@
 #include "rule_engine.h"
 #include "gpio_hal.h"
 #include "ota.h"
+#include "anomaly_engine.h"
 #include "http_server.h"
 
 static volatile int g_running = 1;
@@ -179,7 +180,7 @@ static void *sample_thread(void *arg)
         http_server_update_data(&data);
 
         /* ── 规则引擎评估（阶段三）── */
-        char alert_msg[256] = {0};
+        char alert_msg[256] = {0};// 告警消息缓冲区
         uint8_t actions = rule_engine_evaluate(&data, alert_msg,
                                                sizeof(alert_msg));
         if (actions) {
@@ -198,6 +199,31 @@ static void *sample_thread(void *arg)
                 gpio_hal_set(1, 1);
             if (actions & ACTION_GPIO_2)
                 gpio_hal_set(2, 1);
+        }
+
+        /* ── 异常检测引擎评估（方向 B）── */
+        {
+            char anomaly_msg[256] = {0};
+            uint8_t a_actions = anomaly_engine_evaluate(
+                                    &data, anomaly_msg,
+                                    sizeof(anomaly_msg));
+            if (a_actions) {
+                LOG_INFO("anomaly actions triggered: 0x%02x",
+                         a_actions);
+
+                if ((a_actions & ACTION_ALERT_MQTT) &&
+                    mqtt_is_connected()) {
+                    char alert_topic[256];
+                    snprintf(alert_topic, sizeof(alert_topic),
+                             "%s/alert", g_cfg.topic);
+                    mqtt_publish_raw(alert_topic, anomaly_msg, 1);
+                }
+
+                if (a_actions & ACTION_GPIO_1)
+                    gpio_hal_set(1, 1);
+                if (a_actions & ACTION_GPIO_2)
+                    gpio_hal_set(2, 1);
+            }
         }
 
         if (mqtt_is_connected()) {
@@ -248,6 +274,31 @@ static void *modbus_thread(void *arg)
                     gpio_hal_set(1, 1);
                 if (actions & ACTION_GPIO_2)
                     gpio_hal_set(2, 1);
+            }
+
+            /* ── 异常检测引擎评估（方向 B）── */
+            {
+                char anomaly_msg[256] = {0};
+                uint8_t a_actions = anomaly_engine_evaluate(
+                                        &data[i], anomaly_msg,
+                                        sizeof(anomaly_msg));
+                if (a_actions) {
+                    LOG_INFO("modbus anomaly actions: 0x%02x",
+                             a_actions);
+
+                    if ((a_actions & ACTION_ALERT_MQTT) &&
+                        mqtt_is_connected()) {
+                        char alert_topic[256];
+                        snprintf(alert_topic, sizeof(alert_topic),
+                                 "%s/alert", g_cfg.topic);
+                        mqtt_publish_raw(alert_topic, anomaly_msg, 1);
+                    }
+
+                    if (a_actions & ACTION_GPIO_1)
+                        gpio_hal_set(1, 1);
+                    if (a_actions & ACTION_GPIO_2)
+                        gpio_hal_set(2, 1);
+                }
             }
 
             if (mqtt_is_connected()) {
@@ -425,6 +476,15 @@ int main(int argc, char *argv[])
         LOG_INFO("no rules configured, rule engine skipped");
     }
 
+    /* 6e. 初始化异常检测引擎（方向 B） */
+    if (g_cfg.anomaly_enabled && g_cfg.anomaly_count > 0) {
+        if (anomaly_engine_init(&g_cfg) != E_OK) {
+            LOG_WARN("anomaly_engine_init failed");
+        }
+    } else {
+        LOG_INFO("anomaly engine disabled or no anomaly rules");
+    }
+
     /* 6c. 初始化 GPIO 告警输出 */
     gpio_hal_init();
 
@@ -481,13 +541,14 @@ int main(int argc, char *argv[])
     /* 10. 优雅退出 */
     LOG_INFO("shutting down...");
 
-    /* 发布离线状态（best-effort，遗嘱消息是兜底） */
+    /* 发布离线状态（best-effort，遗嘱消息兜底） */
     mqtt_publish_status(&g_cfg, &g_dev, "offline");
     usleep(200000); /* 给网络线程一点时间发出 */
 
     mqtt_close();
     modbus_master_close();
     rule_engine_close();
+    anomaly_engine_close();
     gpio_hal_close();
     ota_close();
     storage_close();

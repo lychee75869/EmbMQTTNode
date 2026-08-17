@@ -1,3 +1,8 @@
+/*
+ * daemon.c
+ * 守护进程化实现
+ * 标准 UNIX 双重 fork 模式：脱离终端 + 新建会话 + 关闭标准文件描述符
+ */
 #include "daemon.h"
 #include <stdlib.h>
 #include <unistd.h>

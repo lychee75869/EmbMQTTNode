@@ -1,3 +1,9 @@
+/*
+ * storage.c
+ * 本地 SQLite 缓存模块实现
+ * 支持断网续传：离线时缓存传感器数据，网络恢复后自动补发
+ * 线程安全（pthread_mutex）
+ */
 #include "storage.h"
 #include <sqlite3.h>
 #include <pthread.h>

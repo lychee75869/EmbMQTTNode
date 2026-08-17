@@ -29,8 +29,9 @@ test:
 		./test_storage && \
 		./test_modbus_config && \
 		./test_rule_engine && \
-		./test_ota
-	@echo "=== All 5 tests passed ==="
+		./test_ota && \
+		./test_anomaly_engine
+	@echo "=== All 6 tests passed ==="
 
 clean:
 	$(MAKE) -C src clean

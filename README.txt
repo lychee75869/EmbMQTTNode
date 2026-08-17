@@ -5,7 +5,7 @@ EmbMQTTNode - 嵌入式 MQTT 边缘网关
 支持多协议传感器数据采集（I²C + Modbus）、MQTT over TLS 加密上报、
 断网本地缓存续传、设备身份管理、配置文件化、守护进程运行。
 
-当前版本 v1.0.0（阶段四）
+当前版本 v1.1.0（方向 B）
 
 快速开始
 --------
@@ -59,6 +59,9 @@ EmbMQTTNode - 嵌入式 MQTT 边缘网关
     ./test_sensor
     ./test_storage
     ./test_modbus_config
+    ./test_rule_engine
+    ./test_ota
+    ./test_anomaly_engine
 
 项目结构
 --------
@@ -73,13 +76,17 @@ EmbMQTTNode/
 │   ├── storage.c/h    # SQLite 本地缓存（断网续传）
 │   ├── mqtt_client.c/h    # MQTT 客户端封装（TLS + 遗嘱）
 │   ├── rule_engine.c/h  # 规则引擎 + 本地告警
+│   ├── http_server.c/h  # 本地 Web Dashboard
+│   ├── anomaly_engine.c/h  # 异常检测引擎（Z-score + Isolation Forest）
 │   ├── gpio_hal.c/h     # GPIO 硬件抽象层
 │   ├── ota.c/h        # A/B 分区 OTA 远程升级
 │   ├── daemon.c/h     # 守护进程化
 │   └── Makefile       # 构建（支持交叉编译 + 条件编译）
 ├── tests/             # 单元测试
 ├── tools/             # 开发工具
-│   └── modbus_slave_sim.py   # Modbus TCP 从站模拟器
+│   ├── modbus_slave_sim.py   # Modbus TCP 从站模拟器
+│   ├── anomaly_train.py    # iForest 模型训练 + C 导出
+│   └── ota_gen_firmware.sh   # OTA 固件打包脚本
 └── config/            # 示例配置
 
 配置文件
@@ -137,6 +144,8 @@ config/node.conf 主要配置项：
 | mqtt_client | mqtt_client.c/h | MQTT client，TLS 1.2+、遗嘱消息、设备状态上报 |
 | daemon | daemon.c/h | 标准双重 fork 守护进程化 |
 | rule_engine | rule_engine.c/h | 规则引擎，支持 gt/lt/eq/ne/between/rate 运算符 + 冷却防抖 |
+| anomaly_engine | anomaly_engine.c/h | 异常检测引擎：Z-score 统计 + Isolation Forest 推理 |
+| http_server | http_server.c/h | 内嵌 HTTP 服务器 + Web Dashboard（暗色主题单页应用）|
 | gpio_hal | gpio_hal.c/h | GPIO 抽象层，mock 模式（开发）/ libgpiod（真实硬件）|
 | ota | ota.c/h | A/B 分区 OTA 远程升级：HTTP 下载→SHA256 校验→安装→重启→回滚 |
 | main | main.c | 多线程编排（采集 + Modbus + 规则引擎 + 上报） |
@@ -148,9 +157,9 @@ config/node.conf 主要配置项：
 2. ~~Modbus 工业协议接入~~ ✅ 阶段二完成
 3. ~~规则引擎 + 本地告警 + GPIO 联动~~ ✅ 阶段三完成
 4. ~~A/B 分区 OTA 远程升级~~ ✅ 阶段四完成
-5. 本地 Web Dashboard  ← 下一步
-5. 本地 Web Dashboard
-6. 边缘 AI 异常检测（方向 B）
+5. ~~本地 Web Dashboard~~ ✅ 阶段五完成
+6. ~~构建系统 + 交叉编译 + CI~~ ✅ 阶段六完成
+7. 边缘 AI 异常检测 ← 方向 B 进行中（Z-score + iForest）
 
 作者
 ----

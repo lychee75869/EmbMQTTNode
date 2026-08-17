@@ -63,6 +63,7 @@ jobs:
           ./test_modbus_config
           ./test_rule_engine
           ./test_ota
+          ./test_anomaly_engine
 
       - name: Strip binary
         if: matrix.cross_compile == ''

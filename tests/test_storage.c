@@ -1,11 +1,20 @@
 /*
  * tests/test_storage.c
  * 存储模块单元测试
+ *
+ * 覆盖:
+ *   - SQLite 数据库初始化
+ *   - 传感器数据保存
+ *   - 待发送数据查询（ORDER BY timestamp ASC）
+ *   - 已发送数据删除
+ *   - 数据库关闭
  */
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
 #include "../src/storage.h"
+
+/* ═══════════════════════════════════════════════════════════ */
 
 int main(void)
 {

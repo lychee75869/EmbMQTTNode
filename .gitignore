@@ -15,6 +15,7 @@ tests/test_storage
 tests/test_modbus_config
 tests/test_rule_engine
 tests/test_ota
+tests/test_anomaly_engine
 
 # 数据库文件
 *.db
@@ -41,3 +42,6 @@ dist/
 # 临时文件
 *.tmp
 *.log
+学习计划/
+练习/
+docs/

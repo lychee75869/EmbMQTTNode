@@ -11,6 +11,7 @@
 #define SENSOR_TYPE_MOCK    "mock"
 #define SENSOR_TYPE_BMP280  "bmp280"
 #define SENSOR_TYPE_SHT30   "sht30"
+#define SENSOR_TYPE_EX      "extreme"
 
 /* 初始化传感器，type 由配置指定 */
 int sensor_init(const char *type);

@@ -418,7 +418,7 @@ int main(int argc, char *argv[])
     config_dump(&g_cfg);
 
     /* 3. 初始化传感器 */
-    if (sensor_init(g_cfg.sensor_type) != E_OK) {
+    if (sensor_init(g_cfg.sensor_type, g_cfg.sensor_i2c_dev) != E_OK) {
         fprintf(stderr, "FATAL: sensor_init failed\n");
         return 1;
     }

@@ -71,7 +71,7 @@ EmbMQTTNode/
 ├── src/               # 源代码
 │   ├── main.c         # 程序入口
 │   ├── config.c/h     # 配置文件解析
-│   ├── sensor.c/h     # 传感器抽象层（I²C BMP280/SHT30/mock）
+│   ├── sensor.c/h     # 传感器抽象层（I²C SHT30/ADS1115/mock）
 │   ├── modbus_master.c/h  # Modbus 主站模块（RTU + TCP）
 │   ├── storage.c/h    # SQLite 本地缓存（断网续传）
 │   ├── mqtt_client.c/h    # MQTT 客户端封装（TLS + 遗嘱）
@@ -138,7 +138,7 @@ config/node.conf 主要配置项：
 | 模块 | 文件 | 说明 |
 |------|------|------|
 | config | config.c/h | INI 风格配置文件解析，含 TLS + Modbus 配置段 |
-| sensor | sensor.c/h | 传感器抽象层，支持 BMP280/SHT30/Mock |
+| sensor | sensor.c/h | 传感器抽象层，支持 SHT30/ADS1115/Mock |
 | modbus_master | modbus_master.c/h | Modbus RTU/TCP 主站，寄存器映射 + 类型转换 |
 | storage | storage.c/h | SQLite 本地缓存，线程安全 |
 | mqtt_client | mqtt_client.c/h | MQTT client，TLS 1.2+、遗嘱消息、设备状态上报 |

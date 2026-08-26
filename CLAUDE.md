@@ -13,7 +13,8 @@
 ├── 阶段五 ✅ 本地 Web Dashboard（v1.0.0 当前）
 ├── 阶段六 ✅ 构建系统 + 交叉编译 + CI
 ├── 方向 B ✅ 边缘 AI 异常检测（Z-score + iForest）
-└── 后续    接入真实传感器（BMP280/SHT30）
+└── 后续    硬件接入验证：ADS1115（板载）/ SHT30 驱动已实现，
+           待在 Orange Pi Zero 2W 上实测（sensor_i2c_dev 配置 I2C 总线）
 
 当前分支: main
 最后提交: v1.1.0 方向 B 边缘 AI 异常检测
@@ -65,7 +66,7 @@ src/
 ├── main.c           # 入口，4 线程（采集 + Modbus + 上报 + HTTP Dashboard）
 ├── common.h         # 全局类型、配置结构体
 ├── config.c/h       # INI 解析
-├── sensor.c/h       # I2C 传感器抽象（mock/BMP280/SHT30）
+├── sensor.c/h       # I2C 传感器抽象（mock/SHT30/ADS1115）
 ├── modbus_master.c/h # Modbus RTU/TCP（libmodbus，编译期可选）
 ├── storage.c/h      # SQLite 离线缓存
 ├── mqtt_client.c/h  # MQTT + TLS + 遗嘱 + OTA 回调 + 状态上报

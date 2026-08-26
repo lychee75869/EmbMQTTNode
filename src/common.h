@@ -229,6 +229,8 @@ struct node_config {
     char    client_id[64];
     int     sample_interval_ms;
     char    sensor_type[32];
+    char    sensor_i2c_dev[64];     /* I2C 适配器路径，如 /dev/i2c-1 */
+    int     debug_level;
 
     /* 阶段一新增：TLS + 安全 */
     struct tls_config tls;

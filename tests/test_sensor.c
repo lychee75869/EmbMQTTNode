@@ -18,7 +18,7 @@ int main(void)
 {
     struct sensor_data data;
 
-    assert(sensor_init(SENSOR_TYPE_MOCK) == E_OK);
+    assert(sensor_init(SENSOR_TYPE_MOCK, NULL) == E_OK);
 
     /*
      * mock 传感器每 4 次采样注入一次异常（模拟传感器故障）。

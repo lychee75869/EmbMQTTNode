@@ -150,18 +150,6 @@ config/node.conf 主要配置项：
 | ota | ota.c/h | A/B 分区 OTA 远程升级：HTTP 下载→SHA256 校验→安装→重启→回滚 |
 | main | main.c | 多线程编排（采集 + Modbus + 规则引擎 + 上报） |
 
-后续计划
---------
-
-1. ~~MQTT over TLS + 设备身份~~ ✅ 阶段一完成
-2. ~~Modbus 工业协议接入~~ ✅ 阶段二完成
-3. ~~规则引擎 + 本地告警 + GPIO 联动~~ ✅ 阶段三完成
-4. ~~A/B 分区 OTA 远程升级~~ ✅ 阶段四完成
-5. ~~本地 Web Dashboard~~ ✅ 阶段五完成
-6. ~~构建系统 + 交叉编译 + CI~~ ✅ 阶段六完成
-7. ~~边缘 AI 异常检测~~ ✅ 方向 B 完成（Z-score + iForest）
-8. 硬件上板实测：ADS1115 / SHT30 真实采集（Orange Pi Zero 2W）
-
 作者
 ----
 lychee75869

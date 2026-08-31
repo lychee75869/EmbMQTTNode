@@ -3,7 +3,7 @@
  * 规则引擎核心实现（阶段三）
  *
  * 功能：
- *   - 从 node_config 加载规则（gt / lt / eq / ne / between / rate）
+ *   - 从 node_config 加载规则（gt / lt / eq / ne / outside / rate）
  *   - 对传感器数据逐条评估
  *   - 冷却时间（cooldown）防重复告警
  *   - 变化率（rate）使用滑动窗口 + 环形缓冲区
@@ -55,35 +55,26 @@ static void rate_history_push(struct rule *r, double value, int64_t ts)
 }
 
 /*
- * 计算当前值相对于滑动窗口内最老值的绝对变化量。
- * 返回 fabs(current_val - oldest_val_in_window)。
+ * 计算当前值相对上一个采样点的瞬时绝对变化率（单位/秒）。
+ * 变化率 = |当前值 - 上一个采样值| / 实际采样间隔。
  */
 static double rate_calculate(const struct rule *r,
                               double current_val, int64_t now)
 {
-    double  window_s = r->rate_window_s;
-    int64_t cutoff   = now - (int64_t)(window_s * 1000.0);
+    if (r->rate_count < 2)
+        return 0.0;   /* 至少两个采样点才能算差分 */
 
-    double oldest_val = current_val;
-    int    found      = 0;
+    int     prev_idx = (r->rate_head - 2 + 16) % 16;
+    double  prev_val = r->rate_history[prev_idx];
+    int64_t prev_ts  = r->rate_timestamps[prev_idx];
 
-    /* 遍历环形缓冲区，找到窗口内最老的一条记录 */
-    for (int i = 0; i < r->rate_count; i++) {
-        int idx = (r->rate_head - 1 - i + 16) % 16;
-        if (r->rate_timestamps[idx] >= cutoff) {
-            oldest_val = r->rate_history[idx];
-            found      = 1;
-        }
-        /* 时间戳在窗口外的直接停止（越往前越老）*/
-        /* 注意：环形缓冲区按插入顺序排列，head-1 是最新的 */
-    }
-
-    /* 没有任何数据在窗口内也没关系，返回 0（变化量 = 0） */
-    if (!found)
+    double time_diff = (now - prev_ts) / 1000.0;
+    if (time_diff <= 0.0)
         return 0.0;
 
-    return fabs(current_val - oldest_val);
+    return fabs(current_val - prev_val) / time_diff;   /* 绝对变化率，单位/秒 */
 }
+
 
 /* ─── 单规则匹配 ────────────────────────────────────────── */
 
@@ -108,7 +99,7 @@ static int rule_match(const struct rule *r,
     case OP_NE:
         return fabs(val - r->threshold) >= 0.001;
 
-    case OP_BETWEEN:
+    case OP_OUT:
         /* 值在 [lo, hi] 区间外 即触发 */
         return (val < r->threshold_lo || val > r->threshold_hi);
 
@@ -138,20 +129,19 @@ static void gen_alert_msg(const struct rule *r,
     case OP_LT:      op_str = "<";       break;
     case OP_EQ:      op_str = "==";      break;
     case OP_NE:      op_str = "!=";      break;
-    case OP_BETWEEN: op_str = "outside"; break;
+    case OP_OUT:     op_str = "outside"; break;
     case OP_RATE:    op_str = "rate>";   break;
     }
 
-    if (r->op == OP_BETWEEN) {
+    if (r->op == OP_OUT) {
         snprintf(msg, msg_len,
                  "ALERT [%s] %s=%.2f %s [%.2f,%.2f]",
                  r->name, r->field, val,
                  op_str, r->threshold_lo, r->threshold_hi);
     } else if (r->op == OP_RATE) {
         snprintf(msg, msg_len,
-                 "ALERT [%s] %s change-rate > %.2f / %.0fs",
-                 r->name, r->field,
-                 r->threshold, r->rate_window_s);
+                 "ALERT [%s] %s change-rate > %.3f /s",
+                 r->name, r->field, r->threshold);
     } else {
         snprintf(msg, msg_len,
                  "ALERT [%s] %s=%.2f %s %.2f",
@@ -199,7 +189,7 @@ int rule_engine_init(const struct node_config *cfg)
         case OP_LT:      op_name = "lt";      break;
         case OP_EQ:      op_name = "eq";      break;
         case OP_NE:      op_name = "ne";      break;
-        case OP_BETWEEN: op_name = "between"; break;
+        case OP_OUT:     op_name = "outside"; break;
         case OP_RATE:    op_name = "rate";    break;
         }
         LOG_INFO("  rule[%d] '%s': %s %s th=%.2f act=0x%02x cd=%dms",

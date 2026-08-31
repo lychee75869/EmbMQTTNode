@@ -1,11 +1,11 @@
 # EmbMQTTNode - 嵌入式 MQTT 边缘网关
 
-基于 C11 的嵌入式 Linux IoT 边缘网关。当前版本 **v1.1.0**。
+基于 C11 的嵌入式 Linux IoT 边缘网关。当前版本 **v1.2.1**。
 
 ## 项目状态
 
 ```
-已发布: v1.1.0
+已发布: v1.2.1
 ├── 阶段一 ✅ MQTT over TLS + 设备身份
 ├── 阶段二 ✅ Modbus RTU/TCP 工业协议
 ├── 阶段三 ✅ 规则引擎 + 本地告警
@@ -17,12 +17,12 @@
            待在 Orange Pi Zero 2W 上实测（sensor_i2c_dev 配置 I2C 总线）
 
 当前分支: main
-最后提交: v1.1.0 方向 B 边缘 AI 异常检测
+最后提交: v1.2.1 重构 main.c + 版本号同步
 ```
 
 ## 下一步
 
-启动 **方向 B：边缘 AI 异常检测**。
+硬件上板实测：在 Orange Pi Zero 2W 上验证 ADS1115 / SHT30 真实采集（配置 `sensor_type` 为 `sht30`/`ads1115` + `sensor_i2c_dev`）。
 
 ## 构建
 

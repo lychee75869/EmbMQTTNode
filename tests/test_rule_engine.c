@@ -3,7 +3,7 @@
  * 规则引擎单元测试（阶段三）
  *
  * 覆盖:
- *   - 六种运算符: gt / lt / eq / ne / between / rate
+ *   - 六种运算符: gt / lt / eq / ne / outside / rate
  *   - 动作掩码组合
  *   - 冷却时间防抖
  *   - 多规则并行评估
@@ -134,17 +134,17 @@ static void test_basic_operators(void)
         struct node_config cfg;
         memset(&cfg, 0, sizeof(cfg));
         cfg.rule_count = 1;
-        make_rule(&cfg.rules[0], "r_bet", "temperature", OP_BETWEEN,
+        make_rule(&cfg.rules[0], "r_bet", "temperature", OP_OUT,
                   0, 20.0, 30.0, ACTION_LOG_ONLY, 0);
         assert(rule_engine_init(&cfg) == E_OK);
 
         struct sensor_data d = make_data(35.0, 50.0, 1013.0);
         assert(rule_engine_evaluate(&d, NULL, 0) & ACTION_LOG_ONLY);
-        printf("  between(35 outside [20,30]) triggered: PASS\n");
+        printf("  outside(35 outside [20,30]) triggered: PASS\n");
 
         struct sensor_data d2 = make_data(25.0, 50.0, 1013.0);
         assert(rule_engine_evaluate(&d2, NULL, 0) == 0);
-        printf("  between(25 inside [20,30]) not triggered: PASS\n");
+        printf("  outside(25 inside [20,30]) not triggered: PASS\n");
 
         rule_engine_close();
     }
@@ -155,7 +155,6 @@ static void test_basic_operators(void)
         cfg.rule_count = 1;
         make_rule(&cfg.rules[0], "r_rate", "temperature", OP_RATE, 5.0, 0, 0,
                   ACTION_LOG_ONLY, 0);
-        cfg.rules[0].rate_window_s = 10.0;
         assert(rule_engine_init(&cfg) == E_OK);
 
         /* 第一次：变化率=0（无历史），不触发 */
@@ -328,8 +327,8 @@ static void test_config_parsing(void)
         "broker_port = 1883\n"
         "rule_1 = temperature,gt,80.0,alert_mqtt+gpio_1\n"
         "rule_2 = humidity,lt,15.0,alert_mqtt\n"
-        "rule_3 = pressure,between,950.0_1050.0,log_only\n"
-        "rule_4 = temperature,rate,5.0_60s,alert_mqtt\n";
+        "rule_3 = pressure,outside,950.0_1050.0,log_only\n"
+        "rule_4 = temperature,rate,5.0,alert_mqtt\n";
 
     FILE *fp = fopen(tmp_path, "w");
     assert(fp);
@@ -355,8 +354,8 @@ static void test_config_parsing(void)
     assert(cfg.rules[1].threshold == 15.0);
     assert(cfg.rules[1].action_mask == ACTION_ALERT_MQTT);
 
-    /* rule_3 — between */
-    assert(cfg.rules[2].op == OP_BETWEEN);
+    /* rule_3 — outside */
+    assert(cfg.rules[2].op == OP_OUT);
     assert(cfg.rules[2].threshold_lo == 950.0);
     assert(cfg.rules[2].threshold_hi == 1050.0);
     assert(cfg.rules[2].action_mask == ACTION_LOG_ONLY);
@@ -364,7 +363,6 @@ static void test_config_parsing(void)
     /* rule_4 — rate */
     assert(cfg.rules[3].op == OP_RATE);
     assert(cfg.rules[3].threshold == 5.0);
-    assert(cfg.rules[3].rate_window_s == 60.0);
     assert(cfg.rules[3].action_mask == ACTION_ALERT_MQTT);
 
     printf("  parsed 4 rules via config_load: PASS\n");

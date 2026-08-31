@@ -21,7 +21,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#define EMBMQTTNODE_VERSION "1.0.0"
+#define EMBMQTTNODE_VERSION "1.2.1"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败
@@ -114,8 +114,8 @@ enum rule_op {
     OP_LT,       /* <  小于 */
     OP_EQ,       /* == 等于 */
     OP_NE,       /* != 不等于 */
-    OP_BETWEEN,  /* 区间外 (值 < lo 或 值 > hi) */
-    OP_RATE,     /* 变化率超过阈值 */
+    OP_OUT,  /* 区间外 (值 < lo 或 值 > hi) */
+    OP_RATE,     /* 瞬时变化率超过阈值（单位/秒） */
 };
 
 /* 告警动作位掩码 */
@@ -130,9 +130,8 @@ struct rule {
     char        field[RULE_FIELD_LEN];    /* temperature/humidity/pressure */
     enum rule_op op;
     double      threshold;                /* gt/lt/eq/ne/rate 的阈值 */
-    double      threshold_lo;             /* between 下界 */
-    double      threshold_hi;             /* between 上界 */
-    double      rate_window_s;            /* rate 操作的滑动窗口（秒） */
+    double      threshold_lo;             /* outside 下界 */
+    double      threshold_hi;             /* outside 上界 */
     uint8_t     action_mask;              /* 触发时执行的动作 */
     int         cooldown_ms;              /* 冷却时间（防重复告警） */
     /* ── 运行时状态（内部使用）── */
@@ -232,20 +231,20 @@ struct node_config {
     char    sensor_i2c_dev[64];     /* I2C 适配器路径，如 /dev/i2c-1 */
     int     debug_level;
 
-    /* 阶段一新增：TLS + 安全 */
+    /* TLS + 安全 */
     struct tls_config tls;
 
-    /* 阶段二新增：Modbus 工业协议 */
+    /* Modbus 工业协议 */
     struct modbus_config modbus;
 
-    /* 阶段三新增：规则引擎 */
+    /* 规则引擎 */
     int         rule_count;
     struct rule rules[RULE_MAX];
 
-    /* 阶段四新增：OTA 远程升级 */
+    /* OTA 远程升级 */
     struct ota_config ota;
 
-    /* 方向 B 新增：异常检测引擎 */
+    /* 异常检测引擎 */
     int         anomaly_enabled;
     int         anomaly_count;
     struct      anomaly_config anoms[ANOMALY_MAX];

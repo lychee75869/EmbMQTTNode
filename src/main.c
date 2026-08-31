@@ -1,37 +1,42 @@
 /*
  * main.c
  * 程序入口：初始化、启动采集线程、启动上报线程
- * 阶段一：TLS 安全连接、设备身份、MQTT 遗嘱、启动状态上报
+ * TLS 安全连接、设备身份、MQTT 遗嘱、启动状态上报
  */
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <signal.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
+#include "anomaly_engine.h"
 #include "common.h"
 #include "config.h"
+#include "daemon.h"
+#include "gpio_hal.h"
+#include "http_server.h"
+#include "modbus_master.h"
+#include "mqtt_client.h"
+#include "ota.h"
+#include "rule_engine.h"
 #include "sensor.h"
 #include "storage.h"
-#include "mqtt_client.h"
-#include "modbus_master.h"
-#include "daemon.h"
-#include "rule_engine.h"
-#include "gpio_hal.h"
-#include "ota.h"
-#include "anomaly_engine.h"
-#include "http_server.h"
 
 static volatile int g_running = 1;
 static struct node_config g_cfg;
 static struct device_info g_dev;
 
+/* 传感器数据来源类型 */
+typedef enum {
+    SOURCE_LOCAL, /* 本地板载传感器 */
+    SOURCE_MODBUS /* Modbus 从站数据 */
+} sensor_source_t;
+
 /* ─── 信号处理 ──────────────────────────────────────────── */
 
-static void signal_handler(int sig)
-{
+static void signal_handler(int sig) {
     (void)sig;
     g_running = 0;
 }
@@ -42,16 +47,14 @@ static void signal_handler(int sig)
  * 读取网卡 MAC 地址
  * 优先 eth0 → wlan0 → wlp2s0 → lo（兜底）
  */
-static int get_mac_address(char *mac, int mac_len)
-{
+static int get_mac_address(char *mac, int mac_len) {
     FILE *fp;
     char path[64];
-    const char *ifaces[] = { "eth0", "wlan0", "wlp2s0",
-                             "enp0s3", "enp1s0", "lo", NULL };
+    const char *ifaces[] = {"eth0",   "wlan0", "wlp2s0", "enp0s3",
+                            "enp1s0", "lo",    NULL};
 
     for (int i = 0; ifaces[i]; i++) {
-        snprintf(path, sizeof(path),
-                 "/sys/class/net/%s/address", ifaces[i]);
+        snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifaces[i]);
         fp = fopen(path, "r");
         if (fp) {
             if (fgets(mac, mac_len, fp)) {
@@ -73,8 +76,7 @@ static int get_mac_address(char *mac, int mac_len)
 }
 
 /* 提取 MAC 后 6 位（去掉冒号），用于生成 client_id */
-static void mac_to_short(const char *mac, char *out, int out_len)
-{
+static void mac_to_short(const char *mac, char *out, int out_len) {
     int j = 0;
     for (int i = 0; mac[i] && j < out_len - 1; i++) {
         if (mac[i] != ':')
@@ -84,8 +86,7 @@ static void mac_to_short(const char *mac, char *out, int out_len)
 }
 
 /* 收集设备信息 */
-static void collect_device_info(struct device_info *dev)
-{
+static void collect_device_info(struct device_info *dev) {
     memset(dev, 0, sizeof(*dev));
 
     /* 主机名 */
@@ -98,8 +99,8 @@ static void collect_device_info(struct device_info *dev)
     /* 内核版本 (uname) */
     struct utsname ubuf;
     if (uname(&ubuf) == 0) {
-        int n = snprintf(dev->kernel_ver, sizeof(dev->kernel_ver),
-                         "%s %s", ubuf.sysname, ubuf.release);
+        int n = snprintf(dev->kernel_ver, sizeof(dev->kernel_ver), "%s %s",
+                         ubuf.sysname, ubuf.release);
         /* 如果截断，保证 null 结尾 */
         if (n < 0 || (size_t)n >= sizeof(dev->kernel_ver))
             dev->kernel_ver[sizeof(dev->kernel_ver) - 1] = '\0';
@@ -117,8 +118,7 @@ static void collect_device_info(struct device_info *dev)
                     size_t len = strlen(model);
                     if (len > 0 && model[len - 1] == '\n')
                         model[len - 1] = '\0';
-                    strncpy(dev->cpu_model, model,
-                            sizeof(dev->cpu_model) - 1);
+                    strncpy(dev->cpu_model, model, sizeof(dev->cpu_model) - 1);
                 }
                 break;
             }
@@ -141,27 +141,101 @@ static void collect_device_info(struct device_info *dev)
     }
 
     LOG_INFO("device: host=%s mac=%s cpu=%s kernel=%s mem=%lldKB",
-             dev->hostname, dev->mac_addr,
-             dev->cpu_model, dev->kernel_ver,
+             dev->hostname, dev->mac_addr, dev->cpu_model, dev->kernel_ver,
              (long long)dev->total_mem_kb);
 }
 
 /* 根据 MAC 地址自动生成 client_id */
 static void auto_client_id(struct node_config *cfg,
-                           const struct device_info *dev)
-{
+                           const struct device_info *dev) {
     if (cfg->client_id[0] == '\0' ||
         strcmp(cfg->client_id, "emb-node-01") == 0) {
-        snprintf(cfg->client_id, sizeof(cfg->client_id),
-                 "emb-node-%s", dev->mac_short);
+        snprintf(cfg->client_id, sizeof(cfg->client_id), "emb-node-%s",
+                 dev->mac_short);
         LOG_INFO("auto client_id: %s", cfg->client_id);
     }
 }
 
+/* ─── 传感器数据处理 ────────────────────────────────────── */
+static void process_sensor_data(const struct sensor_data *data, sensor_source_t source) {
+    const char *src = (source == SOURCE_LOCAL) ? "local" : "modbus";
+
+    /* ── Dashboard 数据更新 ── */
+    http_server_update_data(data);
+
+    /* ── 规则引擎评估 ── */
+    char alert_msg[256] = {0}; // 告警消息缓冲区
+    uint8_t actions = rule_engine_evaluate(data, alert_msg, sizeof(alert_msg));
+    if (actions) {
+        LOG_INFO("%s: rule actions triggered: 0x%02x", src, actions);
+
+        /* MQTT 告警上报 */
+        if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
+            char alert_topic[256];
+            snprintf(alert_topic, sizeof(alert_topic), "%s/alert", g_cfg.topic);
+            mqtt_publish_raw(alert_topic, alert_msg, 1);
+        }
+
+        /* GPIO 输出 */
+        if (actions & ACTION_GPIO_1)
+            gpio_hal_set(1, 1);
+        if (actions & ACTION_GPIO_2)
+            gpio_hal_set(2, 1);
+    }
+
+    /* ── 异常检测引擎评估  ── */
+    char anomaly_msg[256] = {0};
+    uint8_t a_actions =
+        anomaly_engine_evaluate(data, anomaly_msg, sizeof(anomaly_msg));
+    if (a_actions) {
+        LOG_INFO("%s: anomaly actions triggered: 0x%02x", src, a_actions);
+
+        if ((a_actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
+            char alert_topic[256];
+            snprintf(alert_topic, sizeof(alert_topic), "%s/alert", g_cfg.topic);
+            mqtt_publish_raw(alert_topic, anomaly_msg, 1);
+        }
+
+        if (a_actions & ACTION_GPIO_1)
+            gpio_hal_set(1, 1);
+        if (a_actions & ACTION_GPIO_2)
+            gpio_hal_set(2, 1);
+    }
+
+    if (mqtt_is_connected()) {
+        if (source == SOURCE_LOCAL) {
+            /* 本地传感器：使用原有 mqtt_publish，发布到默认主题 */
+            mqtt_publish(&g_cfg, data);
+        } else {
+            /* Modbus 数据：发布到 topic/modbus，以 JSON 格式发送 */
+            char modbus_topic[256];
+            snprintf(modbus_topic, sizeof(modbus_topic), "%s/modbus", g_cfg.topic);
+
+            char payload[512];
+            snprintf(payload, sizeof(payload),
+                     "{\"client_id\":\"%s\","
+                     "\"timestamp\":%lld,"
+                     "\"temperature\":%.2f,"
+                     "\"humidity\":%.2f,"
+                     "\"pressure\":%.2f}",
+                     g_cfg.client_id,
+                     (long long)data->timestamp_ms,
+                     data->temperature,
+                     data->humidity,
+                     data->pressure);
+            mqtt_publish_raw(modbus_topic, payload, 1);
+        }
+    } else {
+        /* MQTT 离线：保存到本地缓存（断网续传） */
+        storage_save(data, g_cfg.client_id);
+    }
+
+
+}
+
 /* ─── 采集线程 ────────────────────────────────────────── */
 
-static void *sample_thread(void *arg)
-{
+static void *sample_thread(void *arg) {
     (void)arg;
     struct sensor_data data;
 
@@ -173,65 +247,10 @@ static void *sample_thread(void *arg)
             continue;
         }
 
-        LOG_INFO("sample: temp=%.2f hum=%.2f pres=%.2f",
-                 data.temperature, data.humidity, data.pressure);
+        LOG_INFO("sample: temp=%.2f hum=%.2f pres=%.2f", data.temperature,
+                 data.humidity, data.pressure);
 
-        /* ── Dashboard 数据更新（阶段五）── */
-        http_server_update_data(&data);
-
-        /* ── 规则引擎评估（阶段三）── */
-        char alert_msg[256] = {0};// 告警消息缓冲区
-        uint8_t actions = rule_engine_evaluate(&data, alert_msg,
-                                               sizeof(alert_msg));
-        if (actions) {
-            LOG_INFO("rule actions triggered: 0x%02x", actions);
-
-            /* MQTT 告警上报 */
-            if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
-                char alert_topic[256];
-                snprintf(alert_topic, sizeof(alert_topic),
-                         "%s/alert", g_cfg.topic);
-                mqtt_publish_raw(alert_topic, alert_msg, 1);
-            }
-
-            /* GPIO 输出 */
-            if (actions & ACTION_GPIO_1)
-                gpio_hal_set(1, 1);
-            if (actions & ACTION_GPIO_2)
-                gpio_hal_set(2, 1);
-        }
-
-        /* ── 异常检测引擎评估（方向 B）── */
-        {
-            char anomaly_msg[256] = {0};
-            uint8_t a_actions = anomaly_engine_evaluate(
-                                    &data, anomaly_msg,
-                                    sizeof(anomaly_msg));
-            if (a_actions) {
-                LOG_INFO("anomaly actions triggered: 0x%02x",
-                         a_actions);
-
-                if ((a_actions & ACTION_ALERT_MQTT) &&
-                    mqtt_is_connected()) {
-                    char alert_topic[256];
-                    snprintf(alert_topic, sizeof(alert_topic),
-                             "%s/alert", g_cfg.topic);
-                    mqtt_publish_raw(alert_topic, anomaly_msg, 1);
-                }
-
-                if (a_actions & ACTION_GPIO_1)
-                    gpio_hal_set(1, 1);
-                if (a_actions & ACTION_GPIO_2)
-                    gpio_hal_set(2, 1);
-            }
-        }
-
-        if (mqtt_is_connected()) {
-            mqtt_publish(&g_cfg, &data);
-        } else {
-            LOG_INFO("mqtt offline, save to local storage");
-            storage_save(&data, g_cfg.client_id);
-        }
+        process_sensor_data(&data, SOURCE_LOCAL);
 
         usleep(g_cfg.sample_interval_ms * 1000);
     }
@@ -240,8 +259,7 @@ static void *sample_thread(void *arg)
 
 /* ─── Modbus 轮询线程 ──────────────────────────────────── */
 
-static void *modbus_thread(void *arg)
-{
+static void *modbus_thread(void *arg) {
     (void)arg;
     struct sensor_data data[MODBUS_REG_MAX];
 
@@ -250,81 +268,10 @@ static void *modbus_thread(void *arg)
 
         for (int i = 0; i < n; i++) {
             LOG_INFO("modbus: slave data temp=%.2f hum=%.2f pres=%.2f",
-                     data[i].temperature, data[i].humidity,
-                     data[i].pressure);
+                     data[i].temperature, data[i].humidity, data[i].pressure);
 
-            /* ── Dashboard 数据更新（阶段五）── */
-            http_server_update_data(&data[i]);
+            process_sensor_data(&data[i], SOURCE_MODBUS);
 
-            /* ── 规则引擎评估（阶段三）── */
-            char alert_msg[256] = {0};
-            uint8_t actions = rule_engine_evaluate(&data[i], alert_msg,
-                                                   sizeof(alert_msg));
-            if (actions) {
-                LOG_INFO("modbus rule actions triggered: 0x%02x", actions);
-
-                if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
-                    char alert_topic[256];
-                    snprintf(alert_topic, sizeof(alert_topic),
-                             "%s/alert", g_cfg.topic);
-                    mqtt_publish_raw(alert_topic, alert_msg, 1);
-                }
-
-                if (actions & ACTION_GPIO_1)
-                    gpio_hal_set(1, 1);
-                if (actions & ACTION_GPIO_2)
-                    gpio_hal_set(2, 1);
-            }
-
-            /* ── 异常检测引擎评估（方向 B）── */
-            {
-                char anomaly_msg[256] = {0};
-                uint8_t a_actions = anomaly_engine_evaluate(
-                                        &data[i], anomaly_msg,
-                                        sizeof(anomaly_msg));
-                if (a_actions) {
-                    LOG_INFO("modbus anomaly actions: 0x%02x",
-                             a_actions);
-
-                    if ((a_actions & ACTION_ALERT_MQTT) &&
-                        mqtt_is_connected()) {
-                        char alert_topic[256];
-                        snprintf(alert_topic, sizeof(alert_topic),
-                                 "%s/alert", g_cfg.topic);
-                        mqtt_publish_raw(alert_topic, anomaly_msg, 1);
-                    }
-
-                    if (a_actions & ACTION_GPIO_1)
-                        gpio_hal_set(1, 1);
-                    if (a_actions & ACTION_GPIO_2)
-                        gpio_hal_set(2, 1);
-                }
-            }
-
-            if (mqtt_is_connected()) {
-                /* Modbus 数据发布到 topic/modbus */
-                char modbus_topic[256];
-                snprintf(modbus_topic, sizeof(modbus_topic),
-                         "%s/modbus", g_cfg.topic);
-
-                char payload[512];
-                snprintf(payload, sizeof(payload),
-                         "{\"client_id\":\"%s\","
-                         "\"timestamp\":%lld,"
-                         "\"temperature\":%.2f,"
-                         "\"humidity\":%.2f,"
-                         "\"pressure\":%.2f}",
-                         g_cfg.client_id,
-                         (long long)data[i].timestamp_ms,
-                         data[i].temperature,
-                         data[i].humidity,
-                         data[i].pressure);
-
-                mqtt_publish_raw(modbus_topic, payload, 1);
-            } else {
-                /* MQTT 离线，缓存到本地 */
-                storage_save(&data[i], g_cfg.client_id);
-            }
         }
 
         usleep(g_cfg.modbus.poll_interval_ms * 1000);
@@ -334,13 +281,12 @@ static void *modbus_thread(void *arg)
 
 /* ─── 上报线程（断网续传）───────────────────────────────── */
 
-static void *upload_thread(void *arg)
-{
+static void *upload_thread(void *arg) {
     (void)arg;
     struct sensor_data pending[16];
 
     while (g_running) {
-        /* OTA 状态机驱动（阶段四） */
+        /* OTA 状态机驱动 */
         if (g_cfg.ota.enabled)
             ota_check_and_handle();
 
@@ -370,8 +316,7 @@ struct http_thread_arg {
     const struct node_config *cfg;
 };
 
-static void *http_thread(void *arg)
-{
+static void *http_thread(void *arg) {
     struct http_thread_arg *a = (struct http_thread_arg *)arg;
     http_server_start(a->port, "0.0.0.0", a->dev, a->cfg);
     return NULL;
@@ -379,10 +324,8 @@ static void *http_thread(void *arg)
 
 /* ─── 命令行帮助 ──────────────────────────────────────── */
 
-static void usage(const char *prog)
-{
-    printf("EmbMQTTNode v%s - Embedded MQTT Edge Node\n",
-           EMBMQTTNODE_VERSION);
+static void usage(const char *prog) {
+    printf("EmbMQTTNode v%s - Embedded MQTT Edge Node\n", EMBMQTTNODE_VERSION);
     printf("Usage: %s [-c config] [-d]\n", prog);
     printf("  -c config   指定配置文件路径\n");
     printf("  -d          以守护进程方式运行\n");
@@ -391,18 +334,23 @@ static void usage(const char *prog)
 
 /* ─── 入口 ────────────────────────────────────────────── */
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
     const char *cfg_path = "config/node.conf";
     int daemon_mode = 0;
 
     int opt;
     while ((opt = getopt(argc, argv, "c:dh")) != -1) {
         switch (opt) {
-        case 'c': cfg_path = optarg; break;
-        case 'd': daemon_mode = 1; break;
+        case 'c':
+            cfg_path = optarg;
+            break;
+        case 'd':
+            daemon_mode = 1;
+            break;
         case 'h':
-        default:  usage(argv[0]); return 0;
+        default:
+            usage(argv[0]);
+            return 0;
         }
     }
 
@@ -439,16 +387,11 @@ int main(int argc, char *argv[])
              g_cfg.client_id, (long long)time(NULL) * 1000LL);
 
     char will_topic[256];
-    snprintf(will_topic, sizeof(will_topic),
-             "%s/status", g_cfg.topic);
+    snprintf(will_topic, sizeof(will_topic), "%s/status", g_cfg.topic);
 
     /* 5b. MQTT 连接（传入遗嘱 topic + payload） */
-    if (mqtt_init(g_cfg.broker_host,
-                  g_cfg.broker_port,
-                  g_cfg.client_id,
-                  &g_cfg.tls,
-                  will_topic,
-                  will_payload) != E_OK) {
+    if (mqtt_init(g_cfg.broker_host, g_cfg.broker_port, g_cfg.client_id,
+                  &g_cfg.tls, will_topic, will_payload) != E_OK) {
         LOG_WARN("mqtt_init failed, running in offline mode");
     } else {
         /* 5c. 等待连接建立后发布在线状态 */
@@ -524,15 +467,16 @@ int main(int argc, char *argv[])
     {
         struct http_thread_arg http_arg;
         http_arg.port = 8080;
-        http_arg.dev  = &g_dev;
-        http_arg.cfg  = &g_cfg;
+        http_arg.dev = &g_dev;
+        http_arg.cfg = &g_cfg;
         pthread_create(&tid_http, NULL, http_thread, &http_arg);
         LOG_INFO("http dashboard thread started on port 8080");
     }
 
     pthread_join(tid_sample, NULL);
     pthread_join(tid_upload, NULL);
-    if (tid_modbus) pthread_join(tid_modbus, NULL);
+    if (tid_modbus)
+        pthread_join(tid_modbus, NULL);
     if (tid_http) {
         http_server_stop();
         pthread_join(tid_http, NULL);

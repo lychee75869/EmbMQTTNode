@@ -212,8 +212,8 @@ int config_load(const char *path, struct node_config *cfg)
                 r->op = OP_EQ;
             else if (strcmp(op_str, "ne") == 0)
                 r->op = OP_NE;
-            else if (strcmp(op_str, "between") == 0)
-                r->op = OP_BETWEEN;
+            else if (strcmp(op_str, "outside") == 0)
+                r->op = OP_OUT;
             else if (strcmp(op_str, "rate") == 0)
                 r->op = OP_RATE;
             else {
@@ -222,24 +222,15 @@ int config_load(const char *path, struct node_config *cfg)
             }
 
             /* 阈值 */
-            if (r->op == OP_BETWEEN) {
+            if (r->op == OP_OUT) {
                 /* 格式: lo_hi, e.g. 950.0_1050.0 */
                 if (sscanf(th_str, "%lf_%lf",
                            &r->threshold_lo, &r->threshold_hi) != 2) {
-                    LOG_WARN("config: %s invalid between range '%s'", k, th_str);
-                    continue;
-                }
-            } else if (r->op == OP_RATE) {
-                /* 格式: rate_window, e.g. 5.0_60s or 5.0_60 */
-                char unit[4] = {0};
-                if (sscanf(th_str, "%lf_%lf%3s",
-                           &r->threshold, &r->rate_window_s, unit) >= 2) {
-                    /* window parsed; unit is optional and ignored */
-                } else {
-                    LOG_WARN("config: %s invalid rate '%s'", k, th_str);
+                    LOG_WARN("config: %s invalid outside range '%s'", k, th_str);
                     continue;
                 }
             } else {
+                /* 单值阈值（gt/lt/eq/ne/rate），rate 为瞬时变化率阈值（单位/秒） */
                 r->threshold = atof(th_str);
             }
 
@@ -446,18 +437,13 @@ void config_dump(const struct node_config *cfg)
         case OP_LT:      op_name = "lt";      break;
         case OP_EQ:      op_name = "eq";      break;
         case OP_NE:      op_name = "ne";      break;
-        case OP_BETWEEN: op_name = "between"; break;
+        case OP_OUT:     op_name = "outside"; break;
         case OP_RATE:    op_name = "rate";    break;
         }
-        if (r->op == OP_BETWEEN) {
+        if (r->op == OP_OUT) {
             LOG_INFO("  %s: %s %s [%.2f,%.2f] act=0x%02x",
                      r->name, r->field, op_name,
                      r->threshold_lo, r->threshold_hi,
-                     r->action_mask);
-        } else if (r->op == OP_RATE) {
-            LOG_INFO("  %s: %s %s %.2f/%.0fs act=0x%02x",
-                     r->name, r->field, op_name,
-                     r->threshold, r->rate_window_s,
                      r->action_mask);
         } else {
             LOG_INFO("  %s: %s %s %.2f act=0x%02x",

@@ -180,17 +180,55 @@ static void http_send_error(int fd, int code, const char *msg)
 /*
  * 从请求行解析 HTTP 方法和路径
  * 请求行格式: GET /path HTTP/1.0
+ * P0-1 fix: 手动 token 切分，避免 sscanf %31s 在超长 method 下的
+ * 边界行为（sscanf 满长时可能写出溢出 1 字节的中间状态）。
+ * 规范要求 method/path 不含空白，遇空白或行尾停止；HTTP 版本等
+ * 剩余内容丢弃不写。
  */
 static int http_parse_request_line(const char *line,
                                    char *method, int mlen,
                                    char *path, int plen)
 {
-    /* sscanf 安全解析 */
-    (void)mlen;
-    (void)plen;
-    int n = 0;
-    if (sscanf(line, "%31s %255s %*s%n", method, path, &n) < 2)
+    if (!line || !method || mlen <= 1 || !path || plen <= 1)
         return -1;
+
+    const char *p = line;
+
+    /* 1. 跳前导空白 */
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    /* 2. 切 method */
+    int i = 0;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+        if (i < mlen - 1)
+            method[i] = *p;
+        i++;
+        p++;
+    }
+    method[i < mlen ? i : mlen - 1] = '\0';
+    if (i == 0)
+        return -1;
+
+    /* 3. 跳 method/path 间空白 */
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p == '\0' || *p == '\r' || *p == '\n')
+        return -1;
+
+    /* 4. 切 path */
+    int j = 0;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+        if (j < plen - 1)
+            path[j] = *p;
+        j++;
+        p++;
+    }
+    path[j < plen ? j : plen - 1] = '\0';
+    if (j == 0)
+        return -1;
+
+    /* 5. HTTP 版本等剩余内容丢弃不写 */
     return 0;
 }
 

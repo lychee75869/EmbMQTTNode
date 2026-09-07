@@ -29,12 +29,6 @@ static volatile int g_running = 1;
 static struct node_config g_cfg;
 static struct device_info g_dev;
 
-/* 传感器数据来源类型 */
-typedef enum {
-    SOURCE_LOCAL, /* 本地板载传感器 */
-    SOURCE_MODBUS /* Modbus 从站数据 */
-} sensor_source_t;
-
 /* ─── 信号处理 ──────────────────────────────────────────── */
 
 static void signal_handler(int sig) {
@@ -158,6 +152,39 @@ static void auto_client_id(struct node_config *cfg,
 }
 
 /* ─── 传感器数据处理 ────────────────────────────────────── */
+
+/*
+ * 按数据来源发布到对应 topic：
+ *   - local  → mqtt_publish（默认主题）
+ *   - modbus → topic/modbus（JSON，QoS 1）
+ * 在线直发与断网补发（upload_thread）共用，保证补发时 topic 一致。
+ */
+static int publish_by_source(const struct sensor_data *data,
+                             sensor_source_t source) {
+    if (source == SOURCE_LOCAL) {
+        /* 本地传感器：使用原有 mqtt_publish，发布到默认主题 */
+        return mqtt_publish(&g_cfg, data);
+    }
+
+    /* Modbus 数据：发布到 topic/modbus，以 JSON 格式发送 */
+    char modbus_topic[256];
+    snprintf(modbus_topic, sizeof(modbus_topic), "%s/modbus", g_cfg.topic);
+
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+             "{\"client_id\":\"%s\","
+             "\"timestamp\":%lld,"
+             "\"temperature\":%.2f,"
+             "\"humidity\":%.2f,"
+             "\"pressure\":%.2f}",
+             g_cfg.client_id,
+             (long long)data->timestamp_ms,
+             data->temperature,
+             data->humidity,
+             data->pressure);
+    return mqtt_publish_raw(modbus_topic, payload, 1);
+}
+
 static void process_sensor_data(const struct sensor_data *data, sensor_source_t source) {
     const char *src = (source == SOURCE_LOCAL) ? "local" : "modbus";
 
@@ -204,31 +231,10 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
     }
 
     if (mqtt_is_connected()) {
-        if (source == SOURCE_LOCAL) {
-            /* 本地传感器：使用原有 mqtt_publish，发布到默认主题 */
-            mqtt_publish(&g_cfg, data);
-        } else {
-            /* Modbus 数据：发布到 topic/modbus，以 JSON 格式发送 */
-            char modbus_topic[256];
-            snprintf(modbus_topic, sizeof(modbus_topic), "%s/modbus", g_cfg.topic);
-
-            char payload[512];
-            snprintf(payload, sizeof(payload),
-                     "{\"client_id\":\"%s\","
-                     "\"timestamp\":%lld,"
-                     "\"temperature\":%.2f,"
-                     "\"humidity\":%.2f,"
-                     "\"pressure\":%.2f}",
-                     g_cfg.client_id,
-                     (long long)data->timestamp_ms,
-                     data->temperature,
-                     data->humidity,
-                     data->pressure);
-            mqtt_publish_raw(modbus_topic, payload, 1);
-        }
+        publish_by_source(data, source);
     } else {
-        /* MQTT 离线：保存到本地缓存（断网续传） */
-        storage_save(data, g_cfg.client_id);
+        /* MQTT 离线：按来源入队（断网续传），补发时走各自 topic */
+        storage_save(data, source, g_cfg.client_id);
     }
 
 
@@ -282,6 +288,12 @@ static void *modbus_thread(void *arg) {
 
 /* ─── 上报线程（断网续传）───────────────────────────────── */
 
+/*
+ * v1.2.4（P0-4 修复）：逐条 publish + 逐条删成功条目。
+ * 旧逻辑循环后无条件 storage_delete_sent(max_ts)，发布失败的条目
+ * 也会被一并删除导致数据永久丢失；现在仅删除确认发布成功（E_OK）
+ * 的条目，失败条目保留在库中，下轮循环自动重试。
+ */
 static void *upload_thread(void *arg) {
     (void)arg;
     struct sensor_data pending[16];
@@ -293,16 +305,16 @@ static void *upload_thread(void *arg) {
 
         if (mqtt_is_connected()) {
             int n = storage_get_pending(pending, 16);
-            if (n > 0) {
-                int64_t max_ts = 0;
-                for (int i = 0; i < n; i++) {
-                    mqtt_publish(&g_cfg, &pending[i]);
-                    if (pending[i].timestamp_ms > max_ts)
-                        max_ts = pending[i].timestamp_ms;
+            int sent = 0;
+            for (int i = 0; i < n; i++) {
+                /* 按来源补发到对应 topic，发布成功才按主键删除 */
+                if (publish_by_source(&pending[i], pending[i].source) == E_OK) {
+                    storage_delete_by_id(pending[i].id);
+                    sent++;
                 }
-                storage_delete_sent(max_ts);
-                LOG_INFO("uploaded %d pending records", n);
             }
+            if (sent > 0)
+                LOG_INFO("uploaded %d/%d pending records", sent, n);
         }
         sleep(5);
     }

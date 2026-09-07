@@ -21,7 +21,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#define EMBMQTTNODE_VERSION "1.2.3"
+#define EMBMQTTNODE_VERSION "1.2.4"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败
@@ -32,12 +32,20 @@
 #define E_TIMEOUT      -5 //超时
 #define E_NOT_FOUND    -6 // 未找到
 
+/* 传感器数据来源（集中定义：local 板载传感器 / modbus 从站） */
+typedef enum sensor_source {
+    SOURCE_LOCAL  = 0, /* 本地板载传感器 */
+    SOURCE_MODBUS = 1, /* Modbus 从站数据 */
+} sensor_source_t;
+
 /* 传感器数据结构 */
 struct sensor_data {
     double    temperature;   /* 摄氏度 */
     double    humidity;      /* %RH，无传感器时为 -1 */
     double    pressure;      /* hPa，无传感器时为 -1 */
     int64_t   timestamp_ms;  /* 毫秒时间戳 */
+    int64_t   id;            /* SQLite 自增主键，0 表示未持久化（storage_save 成功后回填） */
+    sensor_source_t source;  /* 数据来源（storage_get_pending 读出，供补发时选择 topic） */
 };
 
 /* ─── Modbus 协议配置 ─────────────────────────────────────── */

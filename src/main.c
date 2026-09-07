@@ -8,13 +8,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "anomaly_engine.h"
 #include "common.h"
 #include "config.h"
-#include "daemon.h"
 #include "gpio_hal.h"
 #include "http_server.h"
 #include "modbus_master.h"
@@ -326,9 +327,8 @@ static void *http_thread(void *arg) {
 
 static void usage(const char *prog) {
     printf("EmbMQTTNode v%s - Embedded MQTT Edge Node\n", EMBMQTTNODE_VERSION);
-    printf("Usage: %s [-c config] [-d]\n", prog);
+    printf("Usage: %s [-c config]\n", prog);
     printf("  -c config   指定配置文件路径\n");
-    printf("  -d          以守护进程方式运行\n");
     printf("  -h          显示帮助\n");
 }
 
@@ -336,16 +336,12 @@ static void usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
     const char *cfg_path = "config/node.conf";
-    int daemon_mode = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:dh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:h")) != -1) {
         switch (opt) {
         case 'c':
             cfg_path = optarg;
-            break;
-        case 'd':
-            daemon_mode = 1;
             break;
         case 'h':
         default:
@@ -371,8 +367,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* 4. 初始化本地存储 */
-    if (storage_init("data.db") != E_OK) {
+    /* 4. 初始化本地存储（使用绝对路径 /var/lib/embmqttnode/data.db） */
+    /* systemd 已配置 WorkingDirectory=/var/lib/embmqttnode，目录通常已存在； */
+    /* 首次部署若不存在则尝试单层 mkdir（不递归，避免越权创建父目录）。 */
+    const char *db_dir = "/var/lib/embmqttnode";
+    const char *db_path = "/var/lib/embmqttnode/data.db";
+    if (mkdir(db_dir, 0755) < 0 && errno != EEXIST) {
+        LOG_ERROR("mkdir %s failed (%s); 请用 -c 指定其他工作目录并手工创建，或预先创建目录",
+                  db_dir, strerror(errno));
+        sensor_close();
+        return 1;
+    }
+    if (storage_init(db_path) != E_OK) {
         fprintf(stderr, "FATAL: storage_init failed\n");
         sensor_close();
         return 1;
@@ -410,7 +416,7 @@ int main(int argc, char *argv[]) {
         LOG_WARN("modbus init failed, modbus module disabled");
     }
 
-    /* 6b. 初始化规则引擎（阶段三） */
+    /* 7. 初始化规则引擎（阶段三） */
     if (g_cfg.rule_count > 0) {
         if (rule_engine_init(&g_cfg) != E_OK) {
             LOG_WARN("rule_engine_init failed");
@@ -419,7 +425,7 @@ int main(int argc, char *argv[]) {
         LOG_INFO("no rules configured, rule engine skipped");
     }
 
-    /* 6e. 初始化异常检测引擎（方向 B） */
+    /* 8. 初始化异常检测引擎（方向 B） */
     if (g_cfg.anomaly_enabled && g_cfg.anomaly_count > 0) {
         if (anomaly_engine_init(&g_cfg) != E_OK) {
             LOG_WARN("anomaly_engine_init failed");
@@ -428,10 +434,10 @@ int main(int argc, char *argv[]) {
         LOG_INFO("anomaly engine disabled or no anomaly rules");
     }
 
-    /* 6c. 初始化 GPIO 告警输出 */
+    /* 9. 初始化 GPIO 告警输出 */
     gpio_hal_init();
 
-    /* 6d. 初始化 OTA 远程升级（阶段四） */
+    /* 10. 初始化 OTA 远程升级（阶段四） */
     if (g_cfg.ota.enabled) {
         ota_init(&g_cfg.ota, g_cfg.client_id, EMBMQTTNODE_VERSION);
         /* 注入 MQTT 发布回调（用于 OTA 状态上报） */
@@ -443,16 +449,11 @@ int main(int argc, char *argv[]) {
         LOG_INFO("ota disabled by config");
     }
 
-    /* 7. 守护进程化 */
-    if (daemon_mode) {
-        daemonize();
-    }
-
-    /* 8. 注册信号 */
+    /* 11. 注册信号 */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* 9. 启动工作线程 */
+    /* 12. 启动工作线程 */
     LOG_INFO("EmbMQTTNode v%s starting...", EMBMQTTNODE_VERSION);
 
     pthread_t tid_sample, tid_upload, tid_modbus = 0, tid_http = 0;
@@ -482,7 +483,7 @@ int main(int argc, char *argv[]) {
         pthread_join(tid_http, NULL);
     }
 
-    /* 10. 优雅退出 */
+    /* 13. 优雅退出 */
     LOG_INFO("shutting down...");
 
     /* 发布离线状态（best-effort，遗嘱消息兜底） */

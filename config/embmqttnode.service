@@ -16,6 +16,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/var/lib/embmqttnode
 ExecStart=/usr/bin/embmqttnode -c /etc/embmqttnode/node.conf
 ExecReload=/bin/kill -HUP $MAINPID
 

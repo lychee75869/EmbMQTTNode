@@ -19,7 +19,7 @@ endif
 
 #源文件列表 + 自动推导
 TARGET   = embmqttnode
-SRCS     = main.c config.c sensor.c storage.c mqtt_client.c daemon.c \
+SRCS     = main.c config.c sensor.c storage.c mqtt_client.c \
             modbus_master.c rule_engine.c gpio_hal.c ota.c http_server.c \
             anomaly_engine.c
 OBJS     = $(SRCS:.c=.o)

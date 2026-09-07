@@ -21,7 +21,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#define EMBMQTTNODE_VERSION "1.2.1"
+#define EMBMQTTNODE_VERSION "1.2.2"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败

@@ -18,6 +18,7 @@
 #include "config.h"
 #include "gpio_hal.h"
 #include "http_server.h"
+#include "mac_addr.h"        /* v1.2.5 P1-5：MAC 扫描逻辑独立为可测试模块 */
 #include "modbus_master.h"
 #include "mqtt_client.h"
 #include "ota.h"
@@ -40,30 +41,25 @@ static void signal_handler(int sig) {
 
 /*
  * 读取网卡 MAC 地址
- * 优先 eth0 → wlan0 → wlp2s0 → lo（兜底）
+ * 优先物理网卡 eth0 → wlan0 → wlp2s0 → enp0s3 → enp1s0；
+ * 全部失败时以 lo 兜底（lo 仅作为最后一个候选）；
+ * 仍失败则生成基于 PID 的伪 MAC。
+ *
+ * v1.2.5（P1-5 修复）：sysfs 扫描逻辑下沉到 mac_addr.c 的 mac_scan()，
+ * 本函数退化为薄封装。旧实现把 "lo" 兜底条件硬编码为下标判断
+ * （数组曾 4 项时 lo 在末位，扩到 6 项后 i == 6 永假），导致仅有
+ * lo 可读的机器（虚拟机/容器）触发 double fclose（UB，glibc 下
+ * 通常 double free abort）。新实现由 mac_scan 收敛 fclose，并
+ * 以 ifaces[i+1] == NULL 判定"最后一个候选"，消除硬编码下标。
  */
 static int get_mac_address(char *mac, int mac_len) {
-    FILE *fp;
-    char path[64];
-    const char *ifaces[] = {"eth0",   "wlan0", "wlp2s0", "enp0s3",
-                            "enp1s0", "lo",    NULL};
+    static const char *const ifaces[] = {"eth0",   "wlan0", "wlp2s0",
+                                         "enp0s3", "enp1s0",
+                                         "lo",     NULL};
 
-    for (int i = 0; ifaces[i]; i++) {
-        snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifaces[i]);
-        fp = fopen(path, "r");
-        if (fp) {
-            if (fgets(mac, mac_len, fp)) {
-                /* 去掉末尾换行符 */
-                size_t len = strlen(mac);
-                if (len > 0 && mac[len - 1] == '\n')
-                    mac[len - 1] = '\0';
-                fclose(fp);
-                if (strcmp(ifaces[i], "lo") != 0 || i == 6)
-                    return E_OK;
-            }
-            fclose(fp);
-        }
-    }
+    if (mac_scan("/sys/class/net", ifaces, mac, mac_len) == E_OK)
+        return E_OK;
+
     /* 全部失败：生成基于 PID 的伪 MAC */
     snprintf(mac, mac_len, "00:00:%05d", (int)getpid());
     LOG_WARN("no valid mac found, using fallback: %s", mac);

@@ -30,8 +30,9 @@ test:
 		./test_modbus_config && \
 		./test_rule_engine && \
 		./test_ota && \
-		./test_anomaly_engine
-	@echo "=== All 6 tests passed ==="
+		./test_anomaly_engine && \
+		./test_mac_addr
+	@echo "=== All 7 tests passed ==="
 
 clean:
 	$(MAKE) -C src clean

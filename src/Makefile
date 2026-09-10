@@ -21,7 +21,7 @@ endif
 TARGET   = embmqttnode
 SRCS     = main.c config.c sensor.c storage.c mqtt_client.c \
             modbus_master.c rule_engine.c gpio_hal.c ota.c http_server.c \
-            anomaly_engine.c
+            anomaly_engine.c mac_addr.c
 OBJS     = $(SRCS:.c=.o)
 DEPS     = $(OBJS:.o=.d) #字符串替换语法：$(变量:旧后缀=新后缀)
 

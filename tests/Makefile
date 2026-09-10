@@ -13,7 +13,7 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine
+TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr
 
 .PHONY: all clean distclean
 
@@ -37,8 +37,12 @@ test_ota: test_ota.c ../src/ota.c ../src/config.c
 test_anomaly_engine: test_anomaly_engine.c ../src/anomaly_engine.c ../src/config.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
+test_mac_addr: test_mac_addr.c ../src/mac_addr.c
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
+
 clean:
 	rm -f $(TESTS) test_data.db test_modbus_tmp.conf
+	rm -rf test_mac_root*
 
 distclean: clean
 	rm -f $(TESTS:=.d)

@@ -54,12 +54,19 @@ void ota_handle_message(const char *payload, int payload_len);
 int ota_check_and_handle(void);
 
 /*
- * 启动后检查：验证当前槽位启动是否成功
- * 如果启动失败次数超过阈值 → 自动回滚到备用槽位
- * 如果启动成功 → 上报 running 状态并重置计数器
- * 应在 MQTT 连接建立后调用。
+ * 启动后健康检查（不依赖 MQTT/网络，本地安全机制）：
+ *   - boot_count == 0：已确认健康，正常启动
+ *   - 0 < boot_count < max：递增计数，继续试用
+ *   - boot_count >= max：试用期内反复失败 → 切回旧槽，exit(42)
+ * 必须在 ota_init() 与 ota_set_mqtt_publish() 之后、mqtt_set_ota_callback()
  */
 void ota_post_boot_check(void);
+
+/*
+ * 启动健康确认（周期驱动）：固件稳定运行 boot_confirm_sec 秒后由主循环调用，
+ * 将 boot_count 清零并上报 confirmed。已确认（count==0）或未启用时为 no-op。
+ */
+void ota_confirm_boot(void);
 
 /*
  * 返回当前 OTA 状态的字符串描述

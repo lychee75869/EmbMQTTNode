@@ -21,7 +21,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#define EMBMQTTNODE_VERSION "1.2.5"
+#define EMBMQTTNODE_VERSION "1.2.6"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败
@@ -205,11 +205,12 @@ struct anomaly_stats {
 
 /* ─── OTA 远程升级配置（阶段四）────────────────────────────── */
 
-#define OTA_SLOT_DIR_DEFAULT "/tmp/embmqttnode"
-#define OTA_URL_MAX          512
-#define OTA_CHECKSUM_MAX     256
-#define OTA_VERSION_MAX      64
-#define OTA_BOOT_ATTEMPT_MAX 3
+#define OTA_SLOT_DIR_DEFAULT          "/var/lib/embmqttnode"
+#define OTA_URL_MAX                   512
+#define OTA_CHECKSUM_MAX              256
+#define OTA_VERSION_MAX               64
+#define OTA_BOOT_ATTEMPT_MAX          3
+#define OTA_BOOT_CONFIRM_SEC_DEFAULT  300   /* 新固件稳定运行该秒数后确认本次启动健康 */
 
 /* OTA 状态机 */
 enum ota_state {
@@ -226,6 +227,7 @@ struct ota_config {
     int     enabled;                  /* 0=关闭 1=启用 */
     char    slot_dir[256];            /* 槽位根目录 */
     int     boot_attempt_max;         /* 最大启动尝试次数 */
+    int     boot_confirm_sec;         /* 稳定运行确认时间（秒），超时后确认本次启动为健康 */
 };
 
 /* 配置结构 */

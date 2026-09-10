@@ -7,13 +7,17 @@
  * 2. HTTP GET 下载固件到 download/ 目录
  * 3. SHA256 校验固件完整性
  * 4. 解压/复制到备用槽位
- * 5. 更新 current_slot 文件，切换到新槽位
- * 6. 退出程序，由 systemd 自动重启
- * 7. 启动后 post_boot_check：成功→上报 running，失败→回滚
+ * 5. 更新 current_slot 文件，切换到新槽位（写入 boot_count = 1，启用试用计数）
+ * 6. 退出程序（exit(42)），由 systemd 通过 RestartForceExitStatus=42 重启
+ * 7. 启动后 post_boot_check（不依赖网络）：
+ *    试用计数达 max → 回滚；稳定运行 boot_confirm_sec → confirm 清零
  *
  * ── 安全 ──
  * - SHA256 固件完整性校验（需 libcrypto）
- * - 启动失败自动回滚（boot attempt 计数 ≤ max_attempts）
+ * - 启动失败自动回滚（boot_attempt ≥ max_attempts 切回旧槽，max 默认 3）
+ * - 健康确认机制（稳定运行 boot_confirm_sec 后由主循环周期驱动清零试用计数）
+ * - exit(42) → systemd 检测 → 自动重启加载目标槽位
+ * - 槽位文件原子写（tmp + fsync + rename + 目录 fsync，掉电不丢切换）
  * - A/B 双槽隔离，升级失败不影响当前运行版本
  */
 
@@ -54,6 +58,7 @@ static int            g_active_slot   = 0;          /* 0=A, 1=B */
 static int            g_target_slot   = -1;
 static int            g_download_pct  = 0;
 static int            g_boot_attempt  = 0;
+static time_t         g_boot_time     = 0;          /* ota_init 时刻；用于健康确认计时 */
 static char           g_target_version[OTA_VERSION_MAX];
 static char           g_download_url[OTA_URL_MAX];
 static char           g_expected_checksum[OTA_CHECKSUM_MAX];
@@ -128,6 +133,9 @@ int ota_init(const struct ota_config *cfg,
     LOG_INFO("ota init ok: slot=%c dir=%s version=%s boot_attempt=%d",
              g_active_slot ? 'B' : 'A', g_slot_dir,
              g_current_version, g_boot_attempt);
+
+    /* 记录 ota_init 时刻，作为本次启动健康确认的起点 */
+    g_boot_time = time(NULL);
 
     if (g_cfg.enabled) {
         LOG_INFO("ota: enabled, boot_attempt_max=%d", g_cfg.boot_attempt_max);
@@ -245,8 +253,9 @@ int ota_check_and_handle(void)
             break;
         }
 
-        /* 重置启动计数（新版本从零开始） */
-        ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0");
+        /* 新版本进入试用，从 1 开始计数（首次 post_boot_check 读到 1，
+         * 0 < 1 < max → 自增到 2；稳定运行 boot_confirm_sec 后 confirm 清零） */
+        ota_write_slot_file(OTA_BOOT_COUNT_FILE, "1");
 
         /* 切换活动槽位 */
         if (ota_switch_slot(g_target_slot) != E_OK) {
@@ -267,9 +276,9 @@ int ota_check_and_handle(void)
         /* 给 MQTT 一点时间发送状态消息 */
         usleep(500000);
 
-        /* 优雅退出 → 由 systemd Restart=always 自动重启 */
+        /* 优雅退出 → 由 systemd RestartForceExitStatus=42 自动重启 */
         LOG_INFO("ota: exiting for reboot (expect systemd to restart)");
-        exit(0);
+        exit(42);
         break;
     }
 
@@ -285,6 +294,15 @@ int ota_check_and_handle(void)
     return (g_state != OTA_STATE_IDLE) ? 1 : 0;
 }
 
+/*
+ * 启动后健康检查（健康指示器模式）。
+ * 流程：
+ *   1. 读 boot_count → g_boot_attempt
+ *   2. count == 0：已确认健康（或从未升级），上报 running 后返回
+ *   3. count >= max：试用期内反复失败，切回旧槽、清零计数，exit(42)
+ *   4. 0 < count < max：递增计数后继续尝试（稳定运行后由 ota_confirm_boot 清零）
+ * 不依赖 MQTT/网络；调用方负责保证先调 ota_init。
+ */
 void ota_post_boot_check(void)
 {
     if (!g_cfg.enabled)
@@ -294,7 +312,7 @@ void ota_post_boot_check(void)
     if (max_attempts <= 0)
         max_attempts = OTA_BOOT_ATTEMPT_MAX;
 
-    /* 读取当前计数 */
+    /* 读取当前计数（ota_init 已读过，这里以文件为准再读一次，外部可能改写）*/
     char count_buf[16] = {0};
     if (ota_read_slot_file(OTA_BOOT_COUNT_FILE, count_buf, sizeof(count_buf)) > 0) {
         g_boot_attempt = atoi(count_buf);
@@ -302,51 +320,75 @@ void ota_post_boot_check(void)
         g_boot_attempt = 0;
     }
 
-    /* 首次启动（计数为 0）：正常启动，无需额外处理 */
+    /* count == 0：已确认健康（或从未升级），正常启动 */
     if (g_boot_attempt == 0) {
-        LOG_INFO("ota: fresh boot on slot %c, no rollback needed",
+        LOG_INFO("ota: confirmed boot on slot %c",
                  g_active_slot ? 'B' : 'A');
         ota_report_status("running", "\"slot\":\"%c\"",
                           g_active_slot ? 'B' : 'A');
         return;
     }
 
-    /* 启动计数 > 0：说明上次启动后崩溃了 */
-    LOG_WARN("ota: boot attempt %d/%d on slot %c",
-             g_boot_attempt, max_attempts,
-             g_active_slot ? 'B' : 'A');
-
+    /* count >= max：试用期内反复失败 → 回滚 */
     if (g_boot_attempt >= max_attempts) {
-        /* 达到最大尝试次数 → 回滚 */
-        LOG_ERROR("ota: max boot attempts reached, rolling back!");
+        LOG_ERROR("ota: max boot attempts (%d) reached, rolling back!",
+                  g_boot_attempt);
         ota_report_status("rollback",
                           "\"reason\":\"boot_failed_%d_times\"",
                           g_boot_attempt);
 
-        /* 切回备用槽位（旧版本） */
         int fallback_slot = (g_active_slot == 0) ? 1 : 0;
         ota_switch_slot(fallback_slot);
-        ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0");
+        ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0"); /* 旧固件免试用 */
 
         LOG_INFO("ota: rolled back to slot %c, rebooting...",
                  fallback_slot ? 'B' : 'A');
         usleep(500000);
-        exit(0);
-    } else {
-        /* 还没达到上限 → 递增计数，尝试继续运行 */
-        g_boot_attempt++;
-        char new_count[16];
-        snprintf(new_count, sizeof(new_count), "%d", g_boot_attempt);
-        ota_write_slot_file(OTA_BOOT_COUNT_FILE, new_count);
-
-        LOG_WARN("ota: incrementing boot attempt to %d/%d",
-                 g_boot_attempt, max_attempts);
-
-        /* 如果这次能稳定运行，后续会重置计数器 */
-        ota_report_status("running",
-                          "\"slot\":\"%c\",\"boot_attempt\":%d",
-                          g_active_slot ? 'B' : 'A', g_boot_attempt);
+        exit(42);   /* 与 RestartForceExitStatus=42 接线 */
     }
+
+    /* 0 < count < max：试用期内，递增后继续尝试 */
+    g_boot_attempt++;
+    char new_count[16];
+    snprintf(new_count, sizeof(new_count), "%d", g_boot_attempt);
+    ota_write_slot_file(OTA_BOOT_COUNT_FILE, new_count);
+
+    LOG_WARN("ota: trial boot attempt %d/%d on slot %c (confirm in %ds)",
+             g_boot_attempt, max_attempts,
+             g_active_slot ? 'B' : 'A',
+             g_cfg.boot_confirm_sec > 0 ? g_cfg.boot_confirm_sec
+                                        : OTA_BOOT_CONFIRM_SEC_DEFAULT);
+
+    ota_report_status("running",
+                      "\"slot\":\"%c\",\"boot_attempt\":%d",
+                      g_active_slot ? 'B' : 'A', g_boot_attempt);
+}
+
+/*
+ * 启动健康确认（由主循环每 5s 调一次）：
+ *   - 未启用 / 已确认（count == 0）：no-op
+ *   - 自上次 ota_init 起的运行时间 ≥ boot_confirm_sec：清零计数、上报 confirmed
+ * 稳定运行一段时间后清零，与 ota_post_boot_check 试用递增配合形成
+ * "N 次启动失败 → 回滚" 的判定。
+ */
+void ota_confirm_boot(void)
+{
+    if (!g_cfg.enabled || g_boot_attempt == 0)
+        return;   /* 已确认 / 未启用，no-op */
+
+    int confirm_sec = g_cfg.boot_confirm_sec;
+    if (confirm_sec <= 0)
+        confirm_sec = OTA_BOOT_CONFIRM_SEC_DEFAULT;
+
+    if (difftime(time(NULL), g_boot_time) < (double)confirm_sec)
+        return;   /* 还没稳定运行够久 */
+
+    ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0");
+    g_boot_attempt = 0;
+    LOG_INFO("ota: boot confirmed healthy after %ds, counter cleared",
+             confirm_sec);
+    ota_report_status("running", "\"slot\":\"%c\",\"confirmed\":true",
+                      g_active_slot ? 'B' : 'A');
 }
 
 const char *ota_state_string(void)
@@ -434,17 +476,33 @@ static int ota_read_slot_file(const char *filename, char *buf, int buflen)
 
 static int ota_write_slot_file(const char *filename, const char *content)
 {
-    char path[512];
+    char path[512], tmp[512];
     snprintf(path, sizeof(path), "%s/%s", g_slot_dir, filename);
+    snprintf(tmp,  sizeof(tmp),  "%s/.%s.tmp", g_slot_dir, filename);
 
-    FILE *fp = fopen(path, "w");
+    FILE *fp = fopen(tmp, "w");
     if (!fp) {
         LOG_ERROR("ota: write %s failed: %s", path, strerror(errno));
         return E_IO;
     }
-
     fprintf(fp, "%s\n", content);
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        unlink(tmp);
+        return E_IO;
+    }
     fclose(fp);
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return E_IO;
+    }
+
+    /* 目录 fsync：确保 rename 本身落盘（掉电不丢这次切换） */
+    int dfd = open(g_slot_dir, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) {
+        fsync(dfd);
+        close(dfd);
+    }
     return E_OK;
 }
 

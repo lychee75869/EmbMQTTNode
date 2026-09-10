@@ -11,6 +11,8 @@
 #ifndef MAC_ADDR_H
 #define MAC_ADDR_H
 
+#include "common.h"   /* E_OK / E_IO */
+
 /*
  * 在 base_dir 下按 ifaces 给出的优先级扫描 "<iface>/address" 文件，
  * 返回第一个读取成功的 MAC 地址（已去掉末尾换行符）。

@@ -1,0 +1,22 @@
+#!/bin/sh
+# EmbMQTTNode A/B slot launcher
+# systemd ExecStart 指向本脚本：读 current_slot → exec 对应槽位固件。
+# exec 保证 PID 不变（SIGTERM / kill -HUP $MAINPID 语义正确）。
+# 语法约束：POSIX sh（Armbian /bin/sh 为 dash），禁用 bashism。
+
+ROOT="${EMBMQTTNODE_ROOT:-/var/lib/embmqttnode}"
+SLOT=""
+[ -r "$ROOT/current_slot" ] && SLOT=$(cat "$ROOT/current_slot" 2>/dev/null)
+
+case "$SLOT" in
+  B|b) BIN="$ROOT/slot_b/embmqttnode" ;;
+  *)   BIN="$ROOT/slot_a/embmqttnode" ;;   # 空/损坏/非法 → 一律 A
+esac
+
+if [ ! -x "$BIN" ]; then
+    echo "embmqttnode-launcher: no bootable firmware at $BIN (slot='$SLOT')" >&2
+    exit 1    # fail-loud：配合 StartLimitBurst 硬停，该停就停
+fi
+
+echo "embmqttnode-launcher: booting $BIN (slot=${SLOT:-A})" >&2
+exec "$BIN" "$@"

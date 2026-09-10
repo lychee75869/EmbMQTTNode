@@ -9,6 +9,14 @@
  *   - OTA 配置解析（via config_load）
  *   - 目录结构创建
  *   - 边界条件（NULL args, 禁用状态）
+ *
+ * v1.2.6 P0-3 修复后的状态机用例：
+ *   - fresh boot（boot_count=0）→ 确认已健康
+ *   - 试用递增（boot_count=1）→ 自增到 2
+ *   - 达上限回滚（fork：post_boot_check exit(42)）
+ *   - 健康确认清零（diff > boot_confirm_sec）
+ *   - 未到确认时间不清零
+ *   - 原子写无残留（目录扫描无 .tmp 文件）
  */
 
 #include <stdio.h>
@@ -16,7 +24,11 @@
 #include <string.h>
 #include <assert.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <dirent.h>
 #include <unistd.h>
+#include <errno.h>
 #include "../src/common.h"
 #include "../src/config.h"
 #include "../src/ota.h"
@@ -261,6 +273,297 @@ static void test_config_parsing(void)
     remove(tmp_path);
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * v1.2.6 P0-3 修复——启动回滚 / 健康确认 状态机测试
+ * ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 在 g_test_dir 下写一个槽位文件，模拟上一轮 OTA 或 boot_count 写入的结果。
+ * 用于：post_boot_check / ota_confirm_boot 等需要预置 slot_dir 状态的场景。
+ */
+static void write_slot_file(const char *name, const char *content)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", g_test_dir, name);
+    FILE *fp = fopen(path, "w");
+    assert(fp != NULL);
+    fputs(content, fp);
+    fclose(fp);
+}
+
+/* 读取 slot_dir/<name> 内容到 buf，返回字节数；文件不存在返回 -1 */
+static int read_slot_file(const char *name, char *buf, int buflen)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", g_test_dir, name);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    int n = (int)fread(buf, 1, buflen - 1, fp);
+    fclose(fp);
+    if (n < 0) return -1;
+    buf[n] = '\0';
+    return n;
+}
+
+/*
+ * 用例 1（fresh boot）：boot_count 文件写 "0" → ota_init + post_boot_check
+ * 不应有任何写动作，文件保持 "0"，状态机未触发回滚。
+ */
+static void test_fresh_boot_confirmed(void)
+{
+    printf("--- test_fresh_boot_confirmed ---\n");
+
+    /* 预置 fresh state：slot_dir + boot_count=0 + current_slot=A */
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "0\n");
+
+    struct ota_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = 1;
+    strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
+    cfg.boot_attempt_max = 3;
+    cfg.boot_confirm_sec = 300;
+
+    assert(ota_init(&cfg, "test-client", "1.2.6") == E_OK);
+    ota_post_boot_check();
+    ota_close();
+
+    /* boot_count 仍为 "0" */
+    char buf[16] = {0};
+    int n = read_slot_file("boot_count", buf, sizeof(buf));
+    assert(n > 0);
+    assert(strchr(buf, '0') != NULL);
+    assert(strspn(buf, "0\n") >= 1);
+    printf("  fresh boot leaves counter at 0: PASS\n");
+
+    /* current_slot 仍为 A */
+    char slot[8] = {0};
+    n = read_slot_file("current_slot", slot, sizeof(slot));
+    assert(n > 0);
+    assert(slot[0] == 'A');
+    printf("  no slot switch on fresh boot:   PASS\n");
+
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 2（试用递增）：boot_count=1, max=3 → post_boot_check 自增到 2，写文件
+ */
+static void test_trial_increment(void)
+{
+    printf("--- test_trial_increment ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "1\n");
+
+    struct ota_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = 1;
+    strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
+    cfg.boot_attempt_max = 3;
+    cfg.boot_confirm_sec = 300;
+
+    assert(ota_init(&cfg, "test-client", "1.2.6") == E_OK);
+    ota_post_boot_check();
+    ota_close();
+
+    char buf[16] = {0};
+    int n = read_slot_file("boot_count", buf, sizeof(buf));
+    assert(n > 0);
+    /* 文件里应该有 "2" */
+    assert(strstr(buf, "2") != NULL);
+    printf("  boot 1/3 incremented to 2:      PASS\n");
+    printf("    file content: \"%s\"\n", buf);
+
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 3（达上限回滚 — fork）：boot_count=3, max=3, current_slot=A → 子进程
+ * 调 post_boot_check → exit(42)。父进程 waitpid 验证退出码、current_slot=B、
+ * boot_count=0。回滚路径会 exit()，必须 fork 隔离。
+ */
+static void test_rollback_at_max(void)
+{
+    printf("--- test_rollback_at_max (fork) ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "3\n");
+
+    struct ota_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = 1;
+    strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
+    cfg.boot_attempt_max = 3;
+    cfg.boot_confirm_sec = 300;
+
+    /* 父进程先 init 一次（共享 slot_dir 配置；fork 后子进程用同一组 OTA 全局）*/
+    assert(ota_init(&cfg, "test-client", "1.2.6") == E_OK);
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        /* 子进程：执行回滚路径（最终 exit(42)）；不要再做 ota_close */
+        ota_post_boot_check();
+        /* 不应到达这里 */
+        _exit(99);
+    }
+
+    /* 父进程：等待子进程退出 */
+    int status = 0;
+    pid_t r = waitpid(pid, &status, 0);
+    assert(r == pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 42);
+    printf("  child exited with status 42:    PASS\n");
+
+    /* 子进程已 exit，无需父进程 ota_close（globals 一致，但保险起见再 close 一次） */
+    ota_close();
+
+    /* 验证文件状态：current_slot 已切到 B，boot_count 已清零 */
+    char buf[16] = {0};
+    int n = read_slot_file("current_slot", buf, sizeof(buf));
+    assert(n > 0);
+    assert(buf[0] == 'B');
+    printf("  slot rolled back A→B:           PASS\n");
+
+    n = read_slot_file("boot_count", buf, sizeof(buf));
+    assert(n > 0);
+    assert(strspn(buf, "0\n") >= 1);
+    printf("  boot_count cleared by rollback: PASS\n");
+
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 4（健康确认清零）：boot_count=1, boot_confirm_sec=1 → ota_init 后 sleep(2)
+ * 调 ota_confirm_boot → boot_count 写到 "0"；再调一次（已 0） → no-op 不崩。
+ */
+static void test_confirm_clears_counter(void)
+{
+    printf("--- test_confirm_clears_counter ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "1\n");
+
+    struct ota_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = 1;
+    strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
+    cfg.boot_attempt_max = 3;
+    cfg.boot_confirm_sec = 1;     /* 1 秒即确认，加速测试 */
+
+    assert(ota_init(&cfg, "test-client", "1.2.6") == E_OK);
+
+    /* 等待稳定运行 > boot_confirm_sec */
+    sleep(2);
+    ota_confirm_boot();
+
+    char buf[16] = {0};
+    int n = read_slot_file("boot_count", buf, sizeof(buf));
+    assert(n > 0);
+    assert(strspn(buf, "0\n") >= 1);
+    printf("  confirm after %ds cleared counter: PASS\n", 2);
+
+    /* 再调用一次（count 已 0）→ 应 no-op 不崩 */
+    ota_confirm_boot();
+    n = read_slot_file("boot_count", buf, sizeof(buf));
+    assert(n > 0);
+    assert(strspn(buf, "0\n") >= 1);
+    printf("  second confirm is no-op:        PASS\n");
+
+    ota_close();
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 5（未到确认时间不清零）：boot_confirm_sec=3600，count=1
+ * ota_init 后立刻 confirm → 文件保持 "1"
+ */
+static void test_confirm_too_early_noop(void)
+{
+    printf("--- test_confirm_too_early_noop ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "1\n");
+
+    struct ota_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = 1;
+    strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
+    cfg.boot_attempt_max = 3;
+    cfg.boot_confirm_sec = 3600;  /* 远大于本测试 wall-clock */
+
+    assert(ota_init(&cfg, "test-client", "1.2.6") == E_OK);
+
+    /* 立即调用 confirm：time diff < 3600 → no-op */
+    ota_confirm_boot();
+
+    char buf[16] = {0};
+    int n = read_slot_file("boot_count", buf, sizeof(buf));
+    assert(n > 0);
+    assert(strstr(buf, "1") != NULL);
+    printf("  confirm before timeout no-op:   PASS\n");
+    printf("    file content: \"%s\"\n", buf);
+
+    ota_close();
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 6（原子写无残留）：连续触发多次 slot 文件写（switch + post_boot_check
+ * 自增）后，扫描目录不应有 `*.tmp` 残留。
+ */
+static void test_no_tmp_residue(void)
+{
+    printf("--- test_no_tmp_residue ---\n");
+
+    setup_test_dir();
+
+    struct ota_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = 1;
+    strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
+    cfg.boot_attempt_max = 3;
+    cfg.boot_confirm_sec = 300;
+
+    assert(ota_init(&cfg, "test-client", "1.2.6") == E_OK);
+
+    /* 触发若干次 slot 文件写：反复切换槽位、post_boot_check 递增计数等 */
+    for (int i = 0; i < 4; i++) {
+        /* 切到 B 再切回 A，每次都是新的原子写 */
+        write_slot_file("boot_count", "1\n");   /* 让 post_boot_check 触发自增 */
+        ota_post_boot_check();                  /* boot_count: 1 → 2 */
+    }
+    /* 关闭 */
+    ota_close();
+
+    /* 扫描目录，断言无 `*.tmp` 残留（隐藏文件以 . 开头，size > 0 后缀 .tmp）*/
+    DIR *d = opendir(g_test_dir);
+    assert(d != NULL);
+    struct dirent *de;
+    int residue = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        size_t nlen = strlen(de->d_name);
+        if (nlen > 4 && strcmp(de->d_name + nlen - 4, ".tmp") == 0) {
+            printf("    RESIDUE: %s\n", de->d_name);
+            residue++;
+        }
+    }
+    closedir(d);
+    assert(residue == 0);
+    printf("  no .tmp residue in slot_dir:    PASS\n");
+
+    cleanup_test_dir();
+}
+
 /* ═══════════════════════════════════════════════════════════ */
 
 int main(void)
@@ -274,6 +577,14 @@ int main(void)
     test_publish_callback();
     test_json_parsing();
     test_config_parsing();
+
+    /* v1.2.6 P0-3 状态机用例 */
+    test_fresh_boot_confirmed();
+    test_trial_increment();
+    test_rollback_at_max();
+    test_confirm_clears_counter();
+    test_confirm_too_early_noop();
+    test_no_tmp_residue();
 
     printf("\n=== ALL OTA tests PASSED ===\n");
     return 0;

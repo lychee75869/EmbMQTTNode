@@ -54,9 +54,15 @@ strip: $(TARGET)
 
 install: $(TARGET)
 	install -d $(DESTDIR)/usr/bin
-	install -m 755 $(TARGET) $(DESTDIR)/usr/bin/
+	install -d $(DESTDIR)/var/lib/embmqttnode/slot_a
+	install -d $(DESTDIR)/var/lib/embmqttnode/slot_b
 	install -d $(DESTDIR)/etc/embmqttnode
+	install -d $(DESTDIR)/etc/systemd/system
+	install -m 755 $(TARGET) $(DESTDIR)/var/lib/embmqttnode/slot_a/embmqttnode
+	install -m 755 ../config/embmqttnode-launcher $(DESTDIR)/usr/bin/embmqttnode-launcher
 	install -m 644 ../config/node.conf $(DESTDIR)/etc/embmqttnode/
+	install -m 644 ../config/embmqttnode.service $(DESTDIR)/etc/systemd/system/
+	printf 'A\n' > $(DESTDIR)/var/lib/embmqttnode/current_slot
 
 clean:
 	rm -f $(OBJS) $(TARGET)

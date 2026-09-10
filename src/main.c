@@ -299,6 +299,10 @@ static void *upload_thread(void *arg) {
         if (g_cfg.ota.enabled)
             ota_check_and_handle();
 
+        /* OTA 启动健康确认计时：稳定运行 boot_confirm_sec 后由 ota_confirm_boot
+         * 清零 boot_attempt（内含 enabled / count==0 短路，开销可忽略） */
+        ota_confirm_boot();
+
         if (mqtt_is_connected()) {
             int n = storage_get_pending(pending, 16);
             int sent = 0;
@@ -414,9 +418,6 @@ int main(int argc, char *argv[]) {
 
         /* 5d. 订阅 OTA 升级指令 */
         mqtt_subscribe_ota(g_cfg.client_id);
-
-        /* 5e. OTA 启动后检查（阶段四） */
-        ota_post_boot_check();
     }
 
     /* 6. 初始化 Modbus（可选模块） */
@@ -452,6 +453,13 @@ int main(int argc, char *argv[]) {
         ota_set_mqtt_publish(mqtt_publish_raw);
         /* 注册 OTA 消息回调（来自 MQTT 的升级指令） */
         mqtt_set_ota_callback(ota_handle_message);
+
+        /* OTA 启动后检查：本地安全机制，不依赖 MQTT 连接。
+         * 必须在 ota_init 之后调用（需要 slot_dir/配置就绪）。
+         * 注：旧实现被包在步骤 5e 的 MQTT 成功分支内，断网重启时检查被跳过，
+         *     形成 P0-3 缺陷；此处移到 ota_init 之后，与网络状态解耦。 */
+        ota_post_boot_check();
+
         LOG_INFO("ota module initialized");
     } else {
         LOG_INFO("ota disabled by config");

@@ -1,12 +1,21 @@
 # EmbMQTTNode systemd service file
 # 安装: sudo cp config/embmqttnode.service /etc/systemd/system/
-# 启用: sudo systemctl enable embmqttnode
+#       sudo cp config/embmqttnode-launcher /usr/bin/
+#       sudo chmod 755 /usr/bin/embmqttnode-launcher
+# 启用: sudo systemctl daemon-reload
+#       sudo systemctl enable embmqttnode
 # 启动: sudo systemctl start embmqttnode
 #
 # 部署前请修改:
-#   1. ExecStart 中的 -c 配置文件路径
-#   2. ReadWritePaths 中的目录路径（匹配 OTA slot_dir）
+#   1. ExecStart 中 launcher 的 -c 配置文件路径
+#   2. ReadWritePaths 中的目录路径（必须包含 slot_dir 与 /etc/embmqttnode）
 #   3. User/Group 按需调整
+#
+# ── A/B launcher 机制 ──
+# ExecStart 不再直接执行固件，而是执行 embmqttnode-launcher 脚本；
+# launcher 读取 /var/lib/embmqttnode/current_slot → slot_a/ 或 slot_b/
+# 对应固件，再 exec 之。systemd 通过 RestartForceExitStatus=42 触发
+# OTA 升级后的自动重启加载目标槽位。
 
 [Unit]
 Description=EmbMQTTNode Edge Gateway
@@ -17,13 +26,16 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/var/lib/embmqttnode
-ExecStart=/usr/bin/embmqttnode -c /etc/embmqttnode/node.conf
+ExecStart=/usr/bin/embmqttnode-launcher -c /etc/embmqttnode/node.conf
 ExecReload=/bin/kill -HUP $MAINPID
 
 # 自动重启策略
 Restart=always
 RestartSec=10
-StartLimitBurst=5
+# StartLimitBurst 从 5 → 8，为 A/B 试用预留重启预算：
+# 试用启动 + 1 次回滚重启 + 几次偶发崩溃仍在窗口内才硬停。
+# StartLimitIntervalSec 不动（保持 120s 窗口语义）。
+StartLimitBurst=8
 StartLimitIntervalSec=120
 # OTA 升级完成后以 exit(42) 触发 systemd 重启（加载新固件）
 RestartForceExitStatus=42
@@ -43,7 +55,7 @@ EnvironmentFile=-/etc/default/embmqttnode
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/etc/embmqttnode /tmp/embmqttnode /var/lib/embmqttnode
+ReadWritePaths=/etc/embmqttnode /var/lib/embmqttnode
 PrivateTmp=yes
 
 # 资源限制

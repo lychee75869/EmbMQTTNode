@@ -47,5 +47,6 @@ dist: all strip
 	ARCH=$$(uname -m); \
 	mkdir -p dist; \
 	tar czf dist/embmqttnode_$${VER}_$${ARCH}.tar.gz \
-		src/embmqttnode config/node.conf config/embmqttnode.service; \
+		src/embmqttnode config/node.conf config/embmqttnode.service \
+		config/embmqttnode-launcher; \
 	echo "=== Release: dist/embmqttnode_$${VER}_$${ARCH}.tar.gz ==="

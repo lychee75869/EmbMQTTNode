@@ -19,6 +19,11 @@
  * - exit(42) → systemd 检测 → 自动重启加载目标槽位
  * - 槽位文件原子写（tmp + fsync + rename + 目录 fsync，掉电不丢切换）
  * - A/B 双槽隔离，升级失败不影响当前运行版本
+ *
+ * v1.2.7 fail-safe 修复：健康指示器（boot_count / current_slot）的
+ * 持久化"写不成宁可不推进状态机"——所有推进动作的前置条件都是
+ * ota_write_slot_file / ota_switch_slot 持久化成功；写失败按各调用点
+ * 的 fail-safe 策略中止/重试/告警（详见各处 "v1.2.7 fail-safe" 注释）。
  */
 
 #include "ota.h"
@@ -254,8 +259,22 @@ int ota_check_and_handle(void)
         }
 
         /* 新版本进入试用，从 1 开始计数（首次 post_boot_check 读到 1，
-         * 0 < 1 < max → 自增到 2；稳定运行 boot_confirm_sec 后 confirm 清零） */
-        ota_write_slot_file(OTA_BOOT_COUNT_FILE, "1");
+         * 0 < 1 < max → 自增到 2；稳定运行 boot_confirm_sec 后 confirm 清零）
+         *
+         * v1.2.7 fail-safe（缺陷 ①）：boot_count 是回滚判定的命根子。
+         * 此刻尚未切槽、尚未 exit(42)；若写 "1" 失败（磁盘满/权限错误）
+         * 却继续推进状态机，切槽后新固件会读到旧值（通常是 0=已确认）
+         * → 直接报 confirmed → 回滚保护被静默绕过。因此写失败必须
+         * 中止安装：上报 error、state=FAILED，留在当前好固件上，
+         * 用户/运维可稍后重试升级（该路径由 tests/test_ota.c 用例 C 覆盖）。 */
+        if (ota_write_slot_file(OTA_BOOT_COUNT_FILE, "1") != E_OK) {
+            LOG_ERROR("ota: failed to persist boot_count=1 "
+                      "(disk full or permission error?), aborting install");
+            ota_report_status("error",
+                              "\"Boot count persist failed, install aborted\"");
+            g_state = OTA_STATE_FAILED;
+            break;
+        }
 
         /* 切换活动槽位 */
         if (ota_switch_slot(g_target_slot) != E_OK) {
@@ -338,8 +357,35 @@ void ota_post_boot_check(void)
                           g_boot_attempt);
 
         int fallback_slot = (g_active_slot == 0) ? 1 : 0;
-        ota_switch_slot(fallback_slot);
-        ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0"); /* 旧固件免试用 */
+
+        /* v1.2.7 fail-safe（缺陷 ②）：切槽失败时绝不能清零计数——
+         * 否则下轮重启读到 count 已被清 0，坏固件会被永久"确认"。
+         * 保留 count ≥ max，下轮重启 post_boot_check 有机会重试回滚，
+         * 反复重启最终由 systemd StartLimitBurst 兜底停止。
+         * 为什么仍然 exit(42)（与用户对齐的简单实现）：让 launcher
+         * 下一轮重新读 current_slot——即便仍是坏槽，状态机也有机会
+         * 重试切槽；与其留在已知会崩的固件里继续跑，不如把控制权
+         * 交还给 systemd 重启策略（该路径由 tests/test_ota.c 用例 B 覆盖）。 */
+        if (ota_switch_slot(fallback_slot) != E_OK) {
+            LOG_ERROR("ota: rollback slot switch to %c failed, "
+                      "boot_count kept at %d for retry after reboot",
+                      fallback_slot ? 'B' : 'A', g_boot_attempt);
+            ota_report_status("error",
+                              "\"Rollback slot switch failed\"");
+            usleep(500000);
+            exit(42);   /* 有意 exit：见上方注释，由 StartLimitBurst 兜底 */
+        }
+
+        /* v1.2.7 fail-safe（缺陷 ③）：走到这里切槽已成功，此处清零
+         * 失败只告警、不阻断（仍照常 exit(42) 重启到旧槽）。最坏情况：
+         * 下次启动 count 仍 ≥ max 会再次触发回滚（切回刚离开的槽），
+         * 形成乒乓——同样由 StartLimitBurst 兜底；这与静默绕过回滚
+         * 保护相比是更安全的失败方向（由 tests/test_ota.c 用例 B2 覆盖）。 */
+        if (ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0") != E_OK) {
+            LOG_ERROR("ota: failed to clear boot_count after rollback "
+                      "(count stays %d, may re-trigger rollback)",
+                      g_boot_attempt);
+        } /* 旧固件免试用 */
 
         LOG_INFO("ota: rolled back to slot %c, rebooting...",
                  fallback_slot ? 'B' : 'A');
@@ -351,7 +397,16 @@ void ota_post_boot_check(void)
     g_boot_attempt++;
     char new_count[16];
     snprintf(new_count, sizeof(new_count), "%d", g_boot_attempt);
-    ota_write_slot_file(OTA_BOOT_COUNT_FILE, new_count);
+
+    /* v1.2.7 fail-safe（缺陷 ④）：递增失败只告警。最坏情况 count 卡住
+     * 永远到不了 max，坏固件反复崩溃直到 StartLimitBurst 耗尽——此处
+     * 正运行在（可能已损坏的）试用固件里，除了告警无法做更多。 */
+    if (ota_write_slot_file(OTA_BOOT_COUNT_FILE, new_count) != E_OK) {
+        LOG_ERROR("ota: failed to persist boot_count=%d, rollback "
+                  "threshold may never be reached "
+                  "(StartLimitBurst is the last resort)",
+                  g_boot_attempt);
+    }
 
     LOG_WARN("ota: trial boot attempt %d/%d on slot %c (confirm in %ds)",
              g_boot_attempt, max_attempts,
@@ -383,8 +438,17 @@ void ota_confirm_boot(void)
     if (difftime(time(NULL), g_boot_time) < (double)confirm_sec)
         return;   /* 还没稳定运行够久 */
 
-    ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0");
-    g_boot_attempt = 0;
+    /* v1.2.7 fail-safe（缺陷 ⑤）：必须先确认文件清零成功，再清内存标志。
+     * 旧实现先清 g_boot_attempt：写失败后本函数入口的 count==0 短路
+     * 判定会让清零永远不被重试（文件里的 count 清不掉）。保留标志时，
+     * 主循环每 5s 调用一次 confirm 会自动重试（由 tests/test_ota.c
+     * 用例 A 覆盖）。 */
+    if (ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0") != E_OK) {
+        LOG_ERROR("ota: failed to clear boot_count, will retry in 5s");
+        return;   /* 关键：内存标志保留，5s 后主循环再调 */
+    }
+    g_boot_attempt = 0;   /* 文件清成功才清内存 */
+
     LOG_INFO("ota: boot confirmed healthy after %ds, counter cleared",
              confirm_sec);
     ota_report_status("running", "\"slot\":\"%c\",\"confirmed\":true",
@@ -487,12 +551,22 @@ static int ota_write_slot_file(const char *filename, const char *content)
     }
     fprintf(fp, "%s\n", content);
     if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        /* v1.2.7：此前静默返回 E_IO——上层忽略返回值时磁盘故障完全
+         * 不可见，这是健康指示器失效无告警的根源。补 LOG_ERROR。
+         * 注：fflush/fsync 失败在普通 tmpfs/测试环境难以稳定注入，
+         * 该分支未做单测覆盖，由日志告警兜底（见 tests/test_ota.c
+         * 用例 D 说明）。 */
+        LOG_ERROR("ota: flush/fsync %s failed: %s", tmp, strerror(errno));
         fclose(fp);
         unlink(tmp);
         return E_IO;
     }
     fclose(fp);
     if (rename(tmp, path) != 0) {
+        /* v1.2.7：rename 失败（如目标被目录占用 EISDIR、跨设备 EXDEV）
+         * 同样补告警（由 tests/test_ota.c 用例 D 覆盖）。 */
+        LOG_ERROR("ota: rename %s -> %s failed: %s",
+                  tmp, path, strerror(errno));
         unlink(tmp);
         return E_IO;
     }

@@ -1,21 +1,19 @@
 # EmbMQTTNode Bug 台账（2026-09-12 重整版）
 
 > 前史：2026-09-07 全量整合 35 项（团队双线审查 + 用户自查复核）。
-> 本版变化：删去 v1.2.2~v1.2.7 已闭环项；并入 2026-09-12 用户第二批 8 项疑点核实结果（5 项台账遗漏新发现、1 项自 P2 升级 P1）。
+> 本版变化：删去 v1.2.2~v1.2.9 已闭环项（含 v1.2.8 的 P1-13/P2-19、v1.2.9 的 P0-5/P1-14）；并入 2026-09-12 用户第二批 8 项疑点核实结果（5 项台账遗漏新发现、1 项自 P2 升级 P1）。
+> 维护约定：每次 bug 修复经用户确认 commit 后，同步删去已闭环项、移入附录闭环记录表。
 > 所有判定均对照现行源码核实（引用行号），非仅看 commit message。
 > 严重度：P0 = 崩溃/安全/核心功能失效；P1 = 功能错误/可靠性；P2 = 隐患/可维护性。
 
-## 一、P0 — 必须立即修复（1 项）
+## 一、P0 — 必须立即修复（0 项）
+
+无。全部闭环（P0-5 OTA 签名+HTTPS 已于 v1.2.9 修复）。
+
+## 二、P1 — 尽快修复（9 项）
 
 | # | 位置 | 问题 | 修复方向 |
 |---|------|------|---------|
-| P0-5 | `src/ota.c`（下载入口仍只认 `http://`） | **OTA 固件下载走明文 HTTP、无数字签名**：完整性仅靠 MQTT 下发的 SHA256，而 MQTT 通道本身可被中间人伪造指令绕过。 | HTTPS + 证书校验，或固件签名（ECDSA/RSA over SHA256）双重校验。需先定方案（见"待明确事项"）。 |
-
-## 二、P1 — 尽快修复（11 项）
-
-| # | 位置 | 问题 | 修复方向 |
-|---|------|------|---------|
-| P1-13 | `src/mqtt_client.c:83` + `main.c:420` | **OTA 订阅断网重连后永久丢失（新发现，2026-09-12）**：`mosquitto_new(client_id, true, NULL)` clean_session=true，断连时 broker 清掉订阅；`on_connect` 回调只置 `g_connected`，不重订阅。订阅仅在启动时调用一次。一次断网重连 = OTA 通道永久哑掉，静默失效。 | `on_connect` 成功分支重新订阅（topic 需提为全局或在回调内重构）；顺手让 online 状态也随重连重发。 |
 | P1-2 | `src/rule_engine.c`、`src/anomaly_engine.c`、`main.c` 评估调用点 | **规则/异常引擎共享状态数据竞争**：modbus.enabled=1 时 sample_thread 与 modbus_thread 并发调用两个 evaluate，无锁读写 `rate_history`、`window`、`last_triggered`、`g_stats`（C11 UB）。http_thread 读 g_stats 也构成读写竞争。 | 两引擎各加一把 mutex；或架构上串行化。可与"判定框架重构"一并做。 |
 | P1-3 | `src/mqtt_client.c:17`、`src/ota.c:61-69` 等 | **跨线程共享变量无同步**：`g_connected`、`g_ota_cb`、`g_mqtt_publish` 被 MQTT 后台线程与业务线程并发读写。2026-09-12 具体化：OTA 状态机组 `g_state/g_target_version/g_download_url/g_expected_checksum` 由 MQTT 网络线程（handle_message→parse 先 memset 后填充）与 upload 线程（check_and_handle 读+改写）并发访问，可读到半写状态。 | C11 `_Atomic` 或 mutex；OTA 状态机组加锁保护。 |
 | P1-4 | `src/modbus_master.c:246-255` + `src/config.c` | **Modbus 配置无输入校验**：reg_count 无 `1~32` 上限校验，`reg_buf[32]` 栈缓冲可被写穿；且 `reg_addr - 40001 / - 30001` 无下界校验，0 基地址配置得到大负数传入 libmodbus。 | config 层双重校验（reg_count 范围 + reg_addr 下界）+ 调用前防御性检查。 |
@@ -25,9 +23,8 @@
 | P1-8 | `src/ota.c` 指令解析 | **"cmd" 字段未校验值**：`strstr("cmd") && strstr("upgrade")` 双子串检查，`{"cmd":"foo","note":"upgrade"}` 也能通过。 | 真正的 JSON 解析（与 P1-7 一并解决）。 |
 | P1-9 | `src/mqtt_client.c:210/249` | **状态上报 JSON 载荷可能截断**：`payload[512]` 固定，hostname+cpu_model+kernel_ver+mac 等字段累加逼近上限，截断产生无效 JSON。 | 动态分配或拆分消息。 |
 | P1-10 | `src/main.c` upload_thread | **OTA 下载阻塞整个上传线程**：`ota_http_download` 在 upload_thread 同步执行，下载期间离线缓存堆积无法上传。 | 独立 OTA worker 线程。 |
-| P1-14 | `src/ota.c:709-734` | **OTA HTTP 头/体切分依赖单次 recv（自 P2-1 升级，2026-09-12）**：响应头跨 TCP 段则 header_done 永不置位、段内 body 字节被丢弃；状态行跨段则 status_code 恒 0 误判失败。另有加重项：recv 后 buf 未 NUL 终止即 strchr/strstr（UB，读未初始化栈内存）。 | 累积缓冲 + 逐字节找 `\r\n\r\n`；buf[n]='\0' 后再解析。 |
 
-## 三、P2 — 计划性硬化（20 项）
+## 三、P2 — 计划性硬化（19 项）
 
 | # | 位置 | 问题 |
 |---|------|------|
@@ -45,8 +42,7 @@
 | P2-14 | `src/main.c:453-454` | 工作线程未 `pthread_sigmask` 屏蔽信号 |
 | P2-16 | `src/mqtt_client.c:65` | OTA topic 子串匹配偏宽松 |
 | P2-17 | `src/mqtt_client.c:187-201` | `mqtt_set_will` 死代码；keepalive 60s 硬编码不可配置 |
-| P2-18 | `src/ota.c` | 仅 IPv4 解析；`EVP_DigestFinal_ex` 返回值未检查 |
-| P2-19 | `src/main.c:416-421`（新发现） | 启动 online 状态/OTA 订阅竞态：usleep(0.5s) 后直接调用，`g_connected` 异步置位，慢网下两者静默失败且无重试（与 P1-13 一并修） |
+| P2-18 | `src/ota.c` | 仅 IPv4 解析；`EVP_DigestFinal_ex` 返回值未检查（注：v1.2.9 重写传输层后部分情况可能已覆盖，修复时先核对） |
 | P2-20 | `src/rule_engine.c`/`src/anomaly_engine.c` vs `src/http_server.c`（新发现） | last_triggered 时钟语义不一致：引擎写 CLOCK_MONOTONIC 毫秒，HTTP 层当 Unix 时间戳输出 `last_triggered_ms`，前端显示错误（功能正确，错在展示层） |
 | P2-21 | `src/main.c:484-491`（新发现） | `http_arg` 块作用域栈变量传线程，严格 UB，当前靠 main 阻塞在 pthread_join 侥幸成立 |
 | P2-22 | `src/modbus_master.c:249-255`（新发现） | Modbus 地址约定按 40001/30001 起算，0 基地址配置下溢为大负数，无校验（并入 P1-4 一起修） |
@@ -78,19 +74,19 @@
   第一批（止血）：P0-2 → P0-1 → P0-4            [v1.2.2 / v1.2.3 / v1.2.4]
   第三批（可靠）：P0-3+P1-11 → P1-1 → P1-4*      [v1.2.6 / v1.2.5]（*P1-4 未做）
   台账外：OTA fail-safe 5 处 + confirm 顺序        [v1.2.7]
+  订阅生命周期：P1-13 + P2-19                     [v1.2.8]
+  安全批次：P0-5（签名+HTTPS 双管齐下）+ P1-14 连带 [v1.2.9] ← P0 清零
 
-下一批（优先）：
-  P1-13 订阅重连丢失 + P2-19 启动竞态（同模块一并修）
-  P1-6 reboot 认证 → P1-5 HTTP 超时（安全小改，各一 commit）
+下一批（进行中）：
+  P1-6 reboot 认证 → P1-5 HTTP 超时（同文件 http_server.c，各一 commit）
 再后：
-  P0-5 OTA HTTPS/签名（需先定方案：证书 vs 签名 vs 双管齐下）
-  P1-4+P2-22 Modbus 校验 → P1-7/P1-8 JSON 解析 → P1-14 头解析
+  P1-4+P2-22 Modbus 校验 → P1-7/P1-8 JSON 解析
   P1-2/P1-3 并发（建议与"判定框架重构"合并做，一次加锁）
 最后：
   P1-9/P1-10 + 全部 P2 + 测试缺口 + 非阻塞遗留
 ```
 
-## 附：已闭环记录（v1.2.2 ~ v1.2.7）
+## 附：已闭环记录（v1.2.2 ~ v1.2.9）
 
 | 原编号 | 内容 | commit |
 |--------|------|--------|
@@ -102,3 +98,5 @@
 | P1-11 | 关键文件无 fsync | v1.2.6 (eb30fd2) |
 | P1-12 | common.h 注释 | 现行源码已正确，判定不成立，闭环 |
 | 台账外 | OTA 健康指示器 fail-safe：5 处返回值未检查 + confirm 顺序颠倒 + 写函数内部静默失败 | v1.2.7 (d09b93a) |
+| P1-13 | OTA 订阅断网重连永久丢失（on_connect 驱动重订阅+重发 online；连带 P2-19 启动竞态，usleep 定时猜测删除） | v1.2.8 (ee8af84) |
+| P0-5 | OTA 明文 HTTP 下载 + 无签名（固件签名 + HTTPS 双管齐下，fail-closed；连带 P1-14 头/体切分累积缓冲重写） | v1.2.9 (a3e3603) |

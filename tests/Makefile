@@ -41,10 +41,15 @@ test_mac_addr: test_mac_addr.c ../src/mac_addr.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
 # P1-13/P2-19: mqtt_client 回调调度 + 主题构造单测。
-# 只测纯函数化路径（mqtt_handle_connack / mqtt_build_*_topic），
-# 不触碰真实网络；链接 -lmosquitto 仅为解析 mqtt_client.c 其余符号。
-test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c
-	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto
+# v1.2.9 P1-9/P1-6: 追加 payload 构造器（mqtt_build_*_payload）与
+# 常量时间 token 比较（http_consttime_token_equal，位于 http_server.c）
+# 的用例——链接 http_server.c 及其依赖（storage/rule_engine/
+# anomaly_engine/ota），不触碰真实网络；-lmosquitto 仅为解析
+# mqtt_client.c 其余符号。
+test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c ../src/http_server.c \
+                  ../src/storage.c ../src/rule_engine.c ../src/anomaly_engine.c \
+                  ../src/ota.c
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
 
 clean:
 	rm -f $(TESTS) test_data.db test_modbus_tmp.conf

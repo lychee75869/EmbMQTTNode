@@ -7,6 +7,7 @@
 #include "mqtt_client.h"
 #include <mosquitto.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 /* OpenSSL 常量（避免引入 libssl-dev 依赖） */
 #ifndef SSL_VERIFY_PEER
@@ -14,10 +15,21 @@
 #endif
 
 static struct mosquitto *g_mosq = NULL;
-static volatile int g_connected = 0;
-static mqtt_ota_callback g_ota_cb = NULL;
+
+/*
+ * P1-3: 跨线程同步。
+ * 这些变量在 libmosquitto 网络线程（on_connect/on_disconnect/on_message）
+ * 与业务线程（publish/subscribe/主循环）之间共享。volatile 只阻止
+ * 编译器缓存，不提供原子性、不做内存序约束—— torn read/write 与
+ * 指令重排下的陈旧值都是真实风险。C11 _Atomic 保证每次访问都是
+ * 原子操作并附带正确的同步语义。
+ */
+static _Atomic int g_connected = 0;
+/* 回调指针：注册（业务线程）与触发（网络线程）可能并发，
+ * 指针本身的读写也必须是原子的 */
+static _Atomic(mqtt_ota_callback) g_ota_cb = NULL;
 /* P1-13/P2-19: "连接成功"回调，由 on_connect 在每次 CONNACK 成功时调用 */
-static mqtt_connected_callback g_connected_cb = NULL;
+static _Atomic(mqtt_connected_callback) g_connected_cb = NULL;
 
 /* ─── 回调 ─────────────────────────────────────────────────── */
 
@@ -35,17 +47,18 @@ static mqtt_connected_callback g_connected_cb = NULL;
 int mqtt_handle_connack(int rc)
 {
     if (rc == 0) {
-        g_connected = 1;
+        atomic_store(&g_connected, 1);
         LOG_INFO("mqtt connected");
         /* 先置 g_connected 再调回调：回调内的 publish/subscribe
          * 依赖 g_connected==1 的前置检查（见各函数开头） */
-        if (g_connected_cb) {
-            g_connected_cb();
+        mqtt_connected_callback cb = atomic_load(&g_connected_cb);
+        if (cb) {
+            cb();
         }
         return E_OK;
     }
 
-    g_connected = 0;
+    atomic_store(&g_connected, 0);
     switch (rc) {
     case 1:  LOG_ERROR("mqtt connect refused: protocol version"); break;
     case 2:  LOG_ERROR("mqtt connect refused: identifier rejected"); break;
@@ -69,7 +82,7 @@ static void on_disconnect(struct mosquitto *mosq, void *obj, int rc)
 {
     (void)mosq;
     (void)obj;
-    g_connected = 0;
+    atomic_store(&g_connected, 0);
     if (rc == 0)
         LOG_INFO("mqtt disconnected (clean)");
     else
@@ -85,10 +98,12 @@ static void on_message(struct mosquitto *mosq, void *obj,
     LOG_INFO("mqtt message received on topic '%s': %d bytes",
              msg->topic, msg->payloadlen);
 
-    /* 如果是 OTA 升级指令，交给 ota 回调处理 */
-    if (g_ota_cb && msg->topic && msg->payload) {
+    /* 如果是 OTA 升级指令，交给 ota 回调处理（P1-3: 原子快照后调用，
+     * 避免触发瞬间回调被另一线程清除的竞态） */
+    mqtt_ota_callback ota_cb = atomic_load(&g_ota_cb);
+    if (ota_cb && msg->topic && msg->payload) {
         if (strstr(msg->topic, "/ota/cmd")) {
-            g_ota_cb((const char *)msg->payload, msg->payloadlen);
+            ota_cb((const char *)msg->payload, msg->payloadlen);
         }
     }
 }
@@ -230,27 +245,27 @@ int mqtt_set_will(const char *topic, const char *payload)
 int mqtt_publish(const struct node_config *cfg,
                  const struct sensor_data *data)
 {
-    if (!g_mosq || !g_connected || !cfg || !data) return E_INVAL;
+    if (!g_mosq || !atomic_load(&g_connected) || !cfg || !data)
+        return E_INVAL;
 
     char payload[512];
-    snprintf(payload, sizeof(payload),
-             "{\"client_id\":\"%s\","
-             "\"timestamp\":%lld,"
-             "\"temperature\":%.2f,"
-             "\"humidity\":%.2f,"
-             "\"pressure\":%.2f}",
-             cfg->client_id,
-             (long long)data->timestamp_ms,
-             data->temperature,
-             data->humidity,
-             data->pressure);
+    /* P1-9: payload 构造下沉到纯函数 mqtt_build_data_payload，
+     * snprintf 截断（n < 0 || n >= buf_len）时返回 E_IO，
+     * 拒绝发布被截断的半截 JSON。 */
+    int build_rc = mqtt_build_data_payload(cfg, data,
+                                           payload, (int)sizeof(payload));
+    if (build_rc != E_OK) {
+        LOG_ERROR("mqtt_build_data_payload rejected (truncated/invalid), "
+                  "topic=%s", cfg->topic);
+        return build_rc;
+    }
 
     int rc = mosquitto_publish(g_mosq, NULL, cfg->topic,
                                (int)strlen(payload), payload, 1, 0);
     if (rc != MOSQ_ERR_SUCCESS) {
         LOG_ERROR("mosquitto_publish data failed: %s",
                   mosquitto_strerror(rc));
-        g_connected = 0;
+        atomic_store(&g_connected, 0);
         return E_NET;
     }
 
@@ -264,7 +279,7 @@ int mqtt_publish_status(const struct node_config *cfg,
                         const struct device_info *dev,
                         const char *status)
 {
-    if (!g_mosq || !g_connected || !cfg || !dev || !status)
+    if (!g_mosq || !atomic_load(&g_connected) || !cfg || !dev || !status)
         return E_INVAL;
 
     char status_topic[256];
@@ -272,25 +287,15 @@ int mqtt_publish_status(const struct node_config *cfg,
     mqtt_build_status_topic(cfg->topic, status_topic, (int)sizeof(status_topic));
 
     char payload[512];
-    snprintf(payload, sizeof(payload),
-             "{\"client_id\":\"%s\","
-             "\"status\":\"%s\","
-             "\"version\":\"%s\","
-             "\"hostname\":\"%s\","
-             "\"mac\":\"%s\","
-             "\"cpu\":\"%s\","
-             "\"kernel\":\"%s\","
-             "\"mem_kb\":%lld,"
-             "\"timestamp\":%lld}",
-             cfg->client_id,
-             status,
-             EMBMQTTNODE_VERSION,
-             dev->hostname,
-             dev->mac_addr,
-             dev->cpu_model,
-             dev->kernel_ver,
-             (long long)dev->total_mem_kb,
-             (long long)time(NULL) * 1000LL);
+    /* P1-9: payload 构造下沉到纯函数 mqtt_build_status_payload，
+     * 截断时返回 E_IO，拒绝发布半截 JSON。 */
+    int build_rc = mqtt_build_status_payload(cfg, dev, status,
+                                             payload, (int)sizeof(payload));
+    if (build_rc != E_OK) {
+        LOG_ERROR("mqtt_build_status_payload rejected (truncated/invalid), "
+                  "status=%s", status);
+        return build_rc;
+    }
 
     int rc = mosquitto_publish(g_mosq, NULL, status_topic,
                                (int)strlen(payload), payload, 1, 1);
@@ -308,7 +313,7 @@ int mqtt_publish_status(const struct node_config *cfg,
 
 int mqtt_subscribe_ota(const char *client_id)
 {
-    if (!g_mosq || !g_connected || !client_id) return E_INVAL;
+    if (!g_mosq || !atomic_load(&g_connected) || !client_id) return E_INVAL;
 
     char ota_topic[256];
     /* P1-13/P2-19: 主题构造下沉到纯函数 mqtt_build_ota_topic（可单测） */
@@ -329,7 +334,7 @@ int mqtt_subscribe_ota(const char *client_id)
 
 void mqtt_set_ota_callback(mqtt_ota_callback cb)
 {
-    g_ota_cb = cb;
+    atomic_store(&g_ota_cb, cb);
     LOG_INFO("mqtt ota callback %s", cb ? "registered" : "cleared");
 }
 
@@ -337,7 +342,7 @@ void mqtt_set_ota_callback(mqtt_ota_callback cb)
 
 void mqtt_set_connected_callback(mqtt_connected_callback cb)
 {
-    g_connected_cb = cb;
+    atomic_store(&g_connected_cb, cb);
     LOG_INFO("mqtt connected callback %s", cb ? "registered" : "cleared");
 }
 
@@ -359,18 +364,78 @@ int mqtt_build_status_topic(const char *base_topic, char *buf, int buf_len)
     return E_OK;
 }
 
+/* ─── payload 构造（纯函数，P1-9 供单元测试）────────────── */
+
+int mqtt_build_data_payload(const struct node_config *cfg,
+                            const struct sensor_data *data,
+                            char *buf, int buf_len)
+{
+    if (!cfg || !data || !buf || buf_len <= 0) return E_INVAL;
+
+    int n = snprintf(buf, (size_t)buf_len,
+                     "{\"client_id\":\"%s\","
+                     "\"timestamp\":%lld,"
+                     "\"temperature\":%.2f,"
+                     "\"humidity\":%.2f,"
+                     "\"pressure\":%.2f}",
+                     cfg->client_id,
+                     (long long)data->timestamp_ms,
+                     data->temperature,
+                     data->humidity,
+                     data->pressure);
+
+    /* snprintf 返回"本应写入"的长度：n < 0 编码失败，
+     * n >= buf_len 说明缓冲不足被截断——两种情况都拒绝，
+     * 不发布半截 JSON。 */
+    if (n < 0 || n >= buf_len) return E_IO;
+
+    return E_OK;
+}
+
+int mqtt_build_status_payload(const struct node_config *cfg,
+                              const struct device_info *dev,
+                              const char *status,
+                              char *buf, int buf_len)
+{
+    if (!cfg || !dev || !status || !buf || buf_len <= 0) return E_INVAL;
+
+    int n = snprintf(buf, (size_t)buf_len,
+                     "{\"client_id\":\"%s\","
+                     "\"status\":\"%s\","
+                     "\"version\":\"%s\","
+                     "\"hostname\":\"%s\","
+                     "\"mac\":\"%s\","
+                     "\"cpu\":\"%s\","
+                     "\"kernel\":\"%s\","
+                     "\"mem_kb\":%lld,"
+                     "\"timestamp\":%lld}",
+                     cfg->client_id,
+                     status,
+                     EMBMQTTNODE_VERSION,
+                     dev->hostname,
+                     dev->mac_addr,
+                     dev->cpu_model,
+                     dev->kernel_ver,
+                     (long long)dev->total_mem_kb,
+                     (long long)time(NULL) * 1000LL);
+
+    if (n < 0 || n >= buf_len) return E_IO;
+
+    return E_OK;
+}
+
 /* ─── 原始发布（自定义 topic + payload）──────────────────── */
 
 int mqtt_publish_raw(const char *topic, const char *payload, int qos)
 {
-    if (!g_mosq || !g_connected || !topic || !payload)
+    if (!g_mosq || !atomic_load(&g_connected) || !topic || !payload)
         return E_INVAL;
 
     int rc = mosquitto_publish(g_mosq, NULL, topic,
                                (int)strlen(payload), payload, qos, 0);
     if (rc != MOSQ_ERR_SUCCESS) {
         LOG_ERROR("mqtt_publish_raw failed: %s", mosquitto_strerror(rc));
-        g_connected = 0;
+        atomic_store(&g_connected, 0);
         return E_NET;
     }
     return E_OK;
@@ -380,7 +445,7 @@ int mqtt_publish_raw(const char *topic, const char *payload, int qos)
 
 int mqtt_is_connected(void)
 {
-    return g_connected;
+    return atomic_load(&g_connected);
 }
 
 void mqtt_loop(int timeout_ms)
@@ -398,6 +463,6 @@ void mqtt_close(void)
         g_mosq = NULL;
     }
     mosquitto_lib_cleanup();
-    g_connected = 0;
+    atomic_store(&g_connected, 0);
     LOG_INFO("mqtt closed");
 }

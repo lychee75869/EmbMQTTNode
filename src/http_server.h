@@ -40,4 +40,12 @@ void http_server_stop(void);
  */
 void http_server_update_data(const struct sensor_data *data);
 
+/*
+ * P1-6（v1.2.9）: 常量时间字符串比较，供 /api/reboot token 认证。
+ * SHA256 摘要 + CRYPTO_memcmp，比较耗时与内容无关（防时序侧信道）。
+ * 返回 1 相等 / 0 不相等（任一参数 NULL、摘要失败均返回 0）。
+ * 单独导出供单元测试（tests/test_mqtt_client.c）。
+ */
+int http_consttime_token_equal(const char *a, const char *b);
+
 #endif /* HTTP_SERVER_H */

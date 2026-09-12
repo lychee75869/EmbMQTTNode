@@ -235,6 +235,37 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
     for (int i = 0; i < g_modbus_cfg.reg_count && n < max_count; i++) {
         struct modbus_reg_map *reg = &g_modbus_cfg.regs[i];
 
+        /* P1-4: 读取前防御性复查。config 层已对 modbus_reg_N 做过
+         * 校验（fail-closed 丢弃非法条目），此处再拦一次——防的是
+         * 配置结构体经其他路径（默认值、运行时改写）流入非法值：
+         *   - reg_count 超过 MODBUS_REG_MAX 会写溢出 reg_buf[32] 栈缓冲
+         *   - reg_addr 低于基址时 `reg_addr - 40001` 下溢成巨大
+         *     无符号偏移，libmodbus 会拿它读越界/随机寄存器
+         * 复查失败：跳过该映射并告警，绝不带着可疑参数出网。 */
+        if (reg->reg_count < 1 || reg->reg_count > MODBUS_REG_MAX ||
+            reg->slave_id  < 1 || reg->slave_id  > 247) {
+            LOG_ERROR("modbus: invalid reg map (slave=%d addr=%d "
+                      "count=%d), skipping",
+                      reg->slave_id, reg->reg_addr, reg->reg_count);
+            continue;
+        }
+        if (reg->func_code == 3 &&
+            (reg->reg_addr < 40001 ||
+             reg->reg_addr - 40001 + reg->reg_count > 10000)) {
+            LOG_ERROR("modbus: reg_addr %d out of holding range for "
+                      "func 3 (slave=%d), skipping",
+                      reg->reg_addr, reg->slave_id);
+            continue;
+        }
+        if (reg->func_code == 4 &&
+            (reg->reg_addr < 30001 ||
+             reg->reg_addr - 30001 + reg->reg_count > 10000)) {
+            LOG_ERROR("modbus: reg_addr %d out of input range for "
+                      "func 4 (slave=%d), skipping",
+                      reg->reg_addr, reg->slave_id);
+            continue;
+        }
+
         /* 设置从站地址 */
         if (modbus_set_slave(g_mb_ctx, reg->slave_id) < 0) {
             LOG_ERROR("modbus: set_slave %d failed: %s",

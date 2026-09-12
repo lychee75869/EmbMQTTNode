@@ -16,6 +16,8 @@ tests/test_modbus_config
 tests/test_rule_engine
 tests/test_ota
 tests/test_anomaly_engine
+tests/test_mqtt_client
+tests/test_mac_addr
 
 # 数据库文件
 *.db
@@ -45,3 +47,6 @@ dist/
 学习计划/
 练习/
 docs/
+.workbuddy/
+Agent.md
+BUG_AUDIT.md

@@ -1833,6 +1833,128 @@ static void test_https_bad_ca_rejected(void)
 
 /* ═══════════════════════════════════════════════════════════ */
 
+/*
+ * v1.2.9 P1-7/P1-8 用例：
+ *   L. json_get_string 纯函数单测（键位置/转义/截断拒绝/长度边界/
+ *      控制字符/未闭合）
+ *   M. ota_handle_message 严格解析：cmd="upgradex" 拒绝（P1-8 子串
+ *      误匹配）、url 内嵌 "upgrade" 不误匹配、payload_len 截断拒绝
+ *      （P1-7 不依赖 NUL 结尾、不越界读）、len 之后垃圾字节不影响
+ */
+static void test_p1_strict_parsing(void)
+{
+    printf("--- test_p1_strict_parsing (P1-7/P1-8) ---\n");
+
+    char out[64];
+
+    /* ── L: json_get_string 纯函数 ── */
+    assert(json_get_string("{\"a\":\"b\"}", strlen("{\"a\":\"b\"}"),
+                           "a", out, sizeof(out)) == 1);
+    assert(strcmp(out, "b") == 0);
+    printf("  basic member extraction:  PASS\n");
+
+    assert(json_get_string("{\"a\":\"x\",\"b\":\"y\"}",
+                           strlen("{\"a\":\"x\",\"b\":\"y\"}"),
+                           "b", out, sizeof(out)) == 1);
+    assert(strcmp(out, "y") == 0);
+    printf("  second member extracted:  PASS\n");
+
+    /* 键必须是完整成员名：前缀串 "myversion" 不得误命中 "version"
+     * （P1-7 键位置检查：左侧最近非空白字符须为 '{' 或 ','） */
+    assert(json_get_string("{\"myversion\":\"9\"}",
+                           strlen("{\"myversion\":\"9\"}"),
+                           "version", out, sizeof(out)) == 0);
+    printf("  key prefix not matched:   PASS\n");
+
+    /* 值超长：拒绝而非静默截断（P1-9 同源语义） */
+    assert(json_get_string("{\"k\":\"0123456789012345678901234567890\"}",
+                           strlen("{\"k\":\"0123456789012345678901234567890\"}"),
+                           "k", out, 8) == 0);
+    printf("  oversize value rejected:  PASS\n");
+
+    /* 转义支持：\" \\ \/ */
+    const char *esc = "{\"k\":\"a\\\"b\\\\c\"}";
+    assert(json_get_string(esc, strlen(esc), "k", out, sizeof(out)) == 1);
+    assert(strcmp(out, "a\"b\\c") == 0);
+    printf("  escapes decoded:          PASS\n");
+
+    /* 不支持的 \uXXXX：严格拒绝 */
+    const char *uesc = "{\"k\":\"\\u0041\"}";
+    assert(json_get_string(uesc, strlen(uesc), "k", out, sizeof(out)) == 0);
+    printf("  \\uXXXX escape rejected:   PASS\n");
+
+    /* 裸控制字符（原始换行）：拒绝 */
+    const char *ctl = "{\"k\":\"a\nb\"}";
+    assert(json_get_string(ctl, strlen(ctl), "k", out, sizeof(out)) == 0);
+    printf("  raw control char rejected: PASS\n");
+
+    /* 只在 [0, len) 扫描：len 之后有垃圾字节、且无 NUL 终止也不越界 */
+    {
+        char buf[32];
+        memcpy(buf, "{\"a\":\"ok\"}", 9);
+        memset(buf + 9, 'Z', 10);   /* 垃圾字节，故意不写 NUL */
+        assert(json_get_string(buf, 9, "a", out, sizeof(out)) == 1);
+        assert(strcmp(out, "ok") == 0);
+    }
+    printf("  bounded by len (no NUL):  PASS\n");
+
+    /* 未闭合字符串值：拒绝 */
+    const char *unclosed = "{\"a\":\"un closed";
+    assert(json_get_string(unclosed, strlen(unclosed),
+                           "a", out, sizeof(out)) == 0);
+    printf("  unterminated value reject: PASS\n");
+
+    /* ── M: ota_handle_message 严格解析 ── */
+    struct ota_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = 1;
+    strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
+    cfg.boot_attempt_max = 3;
+    set_test_pubkey(&cfg);
+    assert(ota_init(&cfg, "test-client", "1.0.0") == E_OK);
+
+    /* P1-8: cmd="upgradex" 必须拒绝（旧 strstr(json,"upgrade") 会放行） */
+    const char *cmd_prefix =
+        "{\"cmd\":\"upgradex\",\"version\":\"2.0.1\","
+        "\"url\":\"http://127.0.0.1:1/fw.bin\",\"checksum\":\"sha256:a\"}";
+    ota_handle_message(cmd_prefix, (int)strlen(cmd_prefix));
+    assert(strcmp(ota_state_string(), "idle") == 0);
+    printf("  cmd=upgradex rejected:    PASS\n");
+
+    /* P1-8: cmd 为其他值、url 内嵌 "upgrade" 字样 → 拒绝
+     * （旧实现两个 strstr 条件都命中，会被误当作升级指令） */
+    const char *url_substr =
+        "{\"cmd\":\"status\",\"version\":\"2.0.1\","
+        "\"url\":\"http://127.0.0.1/upgrade.bin\","
+        "\"checksum\":\"sha256:a\"}";
+    ota_handle_message(url_substr, (int)strlen(url_substr));
+    assert(strcmp(ota_state_string(), "idle") == 0);
+    printf("  upgrade-in-url rejected:  PASS\n");
+
+    /* P1-7: payload_len 短于实际 JSON（末尾被截断、未闭合）→ 拒绝，
+     * 且不得越界读 payload 缓冲 */
+    const char *valid =
+        "{\"cmd\":\"upgrade\",\"version\":\"2.0.1\","
+        "\"url\":\"http://127.0.0.1:1/fw.bin\","
+        "\"checksum\":\"sha256:abc\"}";
+    ota_handle_message(valid, (int)strlen(valid) - 8);
+    assert(strcmp(ota_state_string(), "idle") == 0);
+    printf("  truncated payload reject: PASS\n");
+
+    /* P1-7: len 之后的垃圾字节不影响有效指令（只扫 [0, len)） */
+    {
+        char buf[256];
+        memcpy(buf, valid, strlen(valid));
+        memset(buf + strlen(valid), 'X', 16);   /* 垃圾，不写 NUL */
+        ota_handle_message(buf, (int)strlen(valid));
+        assert(strcmp(ota_state_string(), "downloading") == 0);
+    }
+    printf("  trailing garbage ignored: PASS\n");
+
+    ota_close();
+    printf("  test_p1_strict_parsing: ALL PASS\n");
+}
+
 int main(void)
 {
     printf("=== OTA Unit Tests ===\n\n");
@@ -1868,6 +1990,9 @@ int main(void)
     test_sig_download_missing();
     test_https_full_chain();
     test_https_bad_ca_rejected();
+
+    /* v1.2.9 P1-7/P1-8 严格解析用例 */
+    test_p1_strict_parsing();
 
     printf("\n=== ALL OTA tests PASSED ===\n");
     return 0;

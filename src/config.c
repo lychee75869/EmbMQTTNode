@@ -65,6 +65,12 @@ static void set_default_config(struct node_config *cfg)
     cfg->ota.ca_file[0]    = '\0';
     cfg->ota.ca_path[0]    = '\0';
 
+    /* HTTP Dashboard 默认：启用、固定端口 8080；
+     * P1-6 fail-closed：reboot token 默认空串 → /api/reboot 一律
+     * 403 拒绝，必须显式配置 http_reboot_token 才能远程重启 */
+    cfg->http.enabled = 1;
+    cfg->http.reboot_token[0] = '\0';
+
     /* 异常检测引擎默认：关闭 */
     cfg->anomaly_enabled = 0;
     cfg->anomaly_count = 0;
@@ -166,16 +172,66 @@ int config_load(const char *path, struct node_config *cfg)
                                  reg->field_name,
                                  &reg->scale,
                                  &reg->offset);
-            if (matched >= 6) {
-                cfg->modbus.reg_count++;
-                LOG_INFO("config: modbus reg[%d] slave=%d addr=%d "
-                         "type=%s field=%s scale=%.3f offset=%.3f",
-                         idx, reg->slave_id, reg->reg_addr,
-                         reg->data_type, reg->field_name,
-                         reg->scale, reg->offset);
-            } else {
+            if (matched < 6) {
                 LOG_WARN("config: invalid modbus_reg_%d format", idx);
+                continue;
             }
+
+            /*
+             * P1-4: 输入校验（fail-closed，非法映射整条丢弃）。
+             * 旧实现照单全收：reg_count=0 或负数、reg_addr 低于
+             * 基址（40001/30001）的映射会让 modbus_master_poll 里
+             * 的 `reg_addr - 40001` 下溢成巨大无符号偏移（读越界/
+             * 随机寄存器），reg_count 超过 MODBUS_REG_MAX 会溢出
+             * 32 字 reg_buf 栈缓冲。
+             * 合法域（按 Modbus 惯例）:
+             *   slave_id   1..247（RTU 从站地址空间）
+             *   func_code  3（保持寄存器，基址 40001）或 4（输入寄存器，基址 30001）
+             *   reg_count  1..MODBUS_REG_MAX(32)，且 addr 起连续 count 个
+             *              寄存器不越过各自地址段上限（offset < 10000）
+             */
+            if (reg->slave_id < 1 || reg->slave_id > 247) {
+                LOG_WARN("config: modbus_reg_%d slave_id %d out of "
+                         "range 1-247, entry dropped", idx, reg->slave_id);
+                continue;
+            }
+            if (reg->reg_count < 1 || reg->reg_count > MODBUS_REG_MAX) {
+                LOG_WARN("config: modbus_reg_%d reg_count %d out of "
+                         "range 1-%d, entry dropped",
+                         idx, reg->reg_count, MODBUS_REG_MAX);
+                continue;
+            }
+            if (reg->func_code == 3) {
+                if (reg->reg_addr < 40001 ||
+                    reg->reg_addr - 40001 + reg->reg_count > 10000) {
+                    LOG_WARN("config: modbus_reg_%d reg_addr %d invalid "
+                             "for func 3 (need 40001..%d), entry dropped",
+                             idx, reg->reg_addr,
+                             40001 - 1 + 10000 - reg->reg_count + 1);
+                    continue;
+                }
+            } else if (reg->func_code == 4) {
+                if (reg->reg_addr < 30001 ||
+                    reg->reg_addr - 30001 + reg->reg_count > 10000) {
+                    LOG_WARN("config: modbus_reg_%d reg_addr %d invalid "
+                             "for func 4 (need 30001..%d), entry dropped",
+                             idx, reg->reg_addr,
+                             30001 - 1 + 10000 - reg->reg_count + 1);
+                    continue;
+                }
+            } else {
+                LOG_WARN("config: modbus_reg_%d func_code %d unsupported "
+                         "(need 3 or 4), entry dropped",
+                         idx, reg->func_code);
+                continue;
+            }
+
+            cfg->modbus.reg_count++;
+            LOG_INFO("config: modbus reg[%d] slave=%d addr=%d count=%d "
+                     "func=%d type=%s field=%s scale=%.3f offset=%.3f",
+                     idx, reg->slave_id, reg->reg_addr, reg->reg_count,
+                     reg->func_code, reg->data_type, reg->field_name,
+                     reg->scale, reg->offset);
         }
 
         /* ── 规则引擎: rule_N = field,operator,threshold,action ── */
@@ -297,6 +353,13 @@ int config_load(const char *path, struct node_config *cfg)
             strncpy(cfg->ota.ca_file, v, sizeof(cfg->ota.ca_file) - 1);
         else if (strcmp(k, "ota_ca_path") == 0)
             strncpy(cfg->ota.ca_path, v, sizeof(cfg->ota.ca_path) - 1);
+
+        /* ── HTTP Dashboard: http_* 配置项（P1-6）── */
+        else if (strcmp(k, "http_enabled") == 0)
+            cfg->http.enabled = atoi(v);
+        else if (strcmp(k, "http_reboot_token") == 0)
+            strncpy(cfg->http.reboot_token, v,
+                    sizeof(cfg->http.reboot_token) - 1);
 
         /* ── 异常检测引擎: anomaly_enabled / anomaly_N ── */
         else if (strcmp(k, "anomaly_enabled") == 0)
@@ -479,6 +542,12 @@ void config_dump(const struct node_config *cfg)
              cfg->ota.ca_file[0] ? cfg->ota.ca_file : "(system default)");
     LOG_INFO("ota_ca_path         = %s",
              cfg->ota.ca_path[0] ? cfg->ota.ca_path : "(none)");
+
+    LOG_INFO("--- HTTP Dashboard ---");
+    LOG_INFO("http_enabled        = %d", cfg->http.enabled);
+    LOG_INFO("http_reboot_token   = %s",
+             cfg->http.reboot_token[0] ? "(configured)"
+                                       : "(unset, /api/reboot rejected)");
 
     LOG_INFO("--- Anomaly Engine ---");
     LOG_INFO("anomaly_enabled    = %d", cfg->anomaly_enabled);

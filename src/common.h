@@ -21,7 +21,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#define EMBMQTTNODE_VERSION "1.2.9"
+#define EMBMQTTNODE_VERSION "1.2.10"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败
@@ -203,6 +203,126 @@ struct anomaly_stats {
     double  current_score;                /* iForest 异常分数 (0-1) */
 };
 
+/* ─── 严格 JSON 字符串字段提取（P1-7/P1-8/P1-6 共用）────────── */
+
+/*
+ * json_get_string - 从 JSON 文本中严格提取字符串字段的值。
+ *
+ * 参数:
+ *   json/json_len  输入缓冲区及其长度（不要求 NUL 结尾）
+ *   key            字段名（不含两侧引号，如 "cmd"）
+ *   out/outsz      输出缓冲（成功时保证 NUL 结尾）
+ *
+ * 返回: 1 = 找到并完整提取；0 = 未找到 / 格式非法 / 值过长（拒绝而非截断）
+ *
+ * 严格性（针对 P1-7/P1-8 的修复语义）:
+ *   - 只在 [0, json_len) 内扫描，绝不依赖 NUL 结尾：MQTT payload
+ *     是带长度的字节序列而非 C 字符串，旧 strstr 写法会越界读
+ *   - key 必须处于"键位置"（左侧最近的非空白字符为 '{' 或 ','），
+ *     值字符串里出现的 "key" 字样不会误匹配
+ *   - 值必须是带引号的 JSON 字符串；解析 \" \\ \/ \b \f \n \r \t
+ *     转义；遇到不认识的转义（含 \uXXXX，内部指令不需要）返回 0，
+ *     宁可拒绝也不猜测
+ *   - 值内出现裸控制字符（< 0x20，JSON 规范禁止）返回 0
+ *   - 解码后长度超过 outsz-1 返回 0：绝不静默截断（截断的 URL /
+ *     checksum 会把攻击面悄悄放大）
+ */
+static inline int json_get_string(const char *json, size_t json_len,
+                                  const char *key, char *out, size_t outsz)
+{
+    if (!json || !key || !out || outsz < 2)
+        return 0;
+
+    size_t klen = strlen(key);
+    if (klen == 0 || klen > 64)
+        return 0;
+
+    /* 带引号的 key 字面量："key" */
+    char kq[70];
+    kq[0] = '"';
+    memcpy(kq + 1, key, klen);
+    kq[klen + 1] = '"';
+
+    for (size_t i = 0; i + klen + 2 <= json_len; i++) {
+        if (memcmp(json + i, kq, klen + 2) != 0)
+            continue;
+
+        /* 键位置检查：左侧最近的非空白字符必须是 '{' 或 ','，
+         * 否则这是值/嵌套内容里的字样，不是键 */
+        int at_key_pos = 0;
+        for (size_t j = i; j > 0; ) {
+            j--;
+            char c = json[j];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                continue;
+            at_key_pos = (c == '{' || c == ',');
+            break;
+        }
+        if (!at_key_pos)
+            continue;
+
+        /* 跳过空白 → ':' → 跳过空白 → 开引号 */
+        size_t p = i + klen + 2;
+        while (p < json_len && (json[p] == ' '  || json[p] == '\t' ||
+                                json[p] == '\n' || json[p] == '\r'))
+            p++;
+        if (p >= json_len || json[p] != ':')
+            continue;
+        p++;
+        while (p < json_len && (json[p] == ' '  || json[p] == '\t' ||
+                                json[p] == '\n' || json[p] == '\r'))
+            p++;
+        if (p >= json_len || json[p] != '"')
+            continue;
+        p++;    /* 进入值内容 */
+
+        /* 逐字符解码，直到闭引号 */
+        size_t o = 0;
+        int closed = 0;
+        while (p < json_len) {
+            char c = json[p];
+            if (c == '"') {
+                closed = 1;
+                break;
+            }
+            if (c == '\\') {
+                if (p + 1 >= json_len)
+                    return 0;   /* 转义悬空 */
+                char decoded;
+                switch (json[p + 1]) {
+                case '"':  decoded = '"';  break;
+                case '\\': decoded = '\\'; break;
+                case '/':  decoded = '/';  break;
+                case 'b':  decoded = '\b'; break;
+                case 'f':  decoded = '\f'; break;
+                case 'n':  decoded = '\n'; break;
+                case 'r':  decoded = '\r'; break;
+                case 't':  decoded = '\t'; break;
+                default:
+                    return 0;   /* \uXXXX 等：严格子集，不支持即拒绝 */
+                }
+                if (o + 1 >= outsz)
+                    return 0;   /* 值过长：拒绝而非截断 */
+                out[o++] = decoded;
+                p += 2;
+                continue;
+            }
+            if ((unsigned char)c < 0x20)
+                return 0;       /* 裸控制字符：非法 JSON */
+            if (o + 1 >= outsz)
+                return 0;       /* 值过长：拒绝而非截断 */
+            out[o++] = c;
+            p++;
+        }
+        if (!closed)
+            return 0;           /* 字符串未闭合 */
+
+        out[o] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 /* ─── OTA 远程升级配置（阶段四）────────────────────────────── */
 
 #define OTA_SLOT_DIR_DEFAULT          "/var/lib/embmqttnode"
@@ -238,6 +358,21 @@ struct ota_config {
     char    ca_path[256];             /* HTTPS 下载 CA 目录（c_rehash 格式），可选 */
 };
 
+/* ─── HTTP Dashboard 配置（P1-6）────────────────────────── */
+
+/* HTTP_REBOOT_TOKEN_MAX 与 http_config.reboot_token 同宽：
+ * 常量时间比较的定长缓冲上限 */
+#define HTTP_REBOOT_TOKEN_MAX   64
+
+struct http_config {
+    int     enabled;              /* 0=关闭 1=启用（默认 1，端口固定 8080） */
+    char    reboot_token[HTTP_REBOOT_TOKEN_MAX];
+                                /* POST /api/reboot 的认证 token。
+                                 * 空串 = 未配置 → fail-closed，
+                                 * 一律 403 拒绝（v1.2.9 前硬编码
+                                 * "reboot123" 等于全网可重启设备） */
+};
+
 /* 配置结构 */
 struct node_config {
     char    broker_host[128];
@@ -261,6 +396,9 @@ struct node_config {
 
     /* OTA 远程升级 */
     struct ota_config ota;
+
+    /* HTTP Dashboard（P1-6）*/
+    struct http_config http;
 
     /* 异常检测引擎 */
     int         anomaly_enabled;

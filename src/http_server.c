@@ -26,6 +26,12 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
+#ifdef __linux__
+#include <sys/reboot.h>
+#endif
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * 常量
@@ -268,6 +274,32 @@ static int http_read_body(int fd, char *body, int blen, int content_length)
  * API 处理函数
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * P1-6: 常量时间字符串比较（导出供单元测试）。
+ * 对两边分别取 SHA256 摘要后 CRYPTO_memcmp——比较耗时只取决于
+ * 摘要长度，与内容无关，防逐字节前缀猜测的时序侧信道。
+ * 任一参数为 NULL 或摘要计算失败返回 0（fail-closed）。
+ */
+int http_consttime_token_equal(const char *a, const char *b)
+{
+    if (!a || !b)
+        return 0;
+
+    unsigned char da[EVP_MAX_MD_SIZE];
+    unsigned char db[EVP_MAX_MD_SIZE];
+    unsigned int la = 0;
+    unsigned int lb = 0;
+
+    if (!EVP_Digest(a, strlen(a), da, &la, EVP_sha256(), NULL))
+        return 0;
+    if (!EVP_Digest(b, strlen(b), db, &lb, EVP_sha256(), NULL))
+        return 0;
+    if (la != lb || la == 0)
+        return 0;
+
+    return CRYPTO_memcmp(da, db, (size_t)la) == 0;
+}
+
 /* GET /api/status */
 static void handle_api_status(int fd)
 {
@@ -473,13 +505,45 @@ static void handle_api_reboot(int fd, int content_length)
 {
     char buf[128];
 
-    /* 读取 body */
-    char body[256] = {0};
+    /* 读取 body（P1-6: 缓冲扩到 512，超长由 http_read_body 拒绝） */
+    char body[512] = {0};
     if (content_length > 0)
         http_read_body(fd, body, sizeof(body), content_length);
 
-    /* 简单 token 认证 */
-    if (strstr(body, "\"token\":\"reboot123\"")) {
+    /*
+     * P1-6（v1.2.9）重启认证修复：
+     *   旧实现 strstr(body, "\"token\":\"reboot123\"") 硬编码弱 token，
+     *   且子串匹配可被 "xxx\"token\":\"reboot123\"yyy" 之类绕过。
+     *   新实现：
+     *   1. fail-closed：g_cfg 未注入 / http_reboot_token 未配置 → 一律 403
+     *   2. json_get_string 严格提取 body 中的 token 字符串值
+     *   3. SHA256 摘要 + CRYPTO_memcmp 常量时间比较（防时序侧信道
+     *      逐字节猜测 token 前缀）
+     *   4. 10s 限速（http 线程串行处理请求，static 计时即可）
+     */
+    const char *expected = (g_cfg != NULL) ? g_cfg->http.reboot_token : NULL;
+    char token[HTTP_REBOOT_TOKEN_MAX] = {0};
+    int authorized = 0;
+
+    if (expected != NULL && expected[0] != '\0' &&
+        json_get_string(body, strlen(body), "token",
+                        token, sizeof(token)) &&
+        http_consttime_token_equal(token, expected)) {
+
+        /* 10s 限速：连续重启请求只放行第一个 */
+        static time_t last_ok = 0;
+        time_t now = time(NULL);
+        if (last_ok != 0 && difftime(now, last_ok) < 10.0) {
+            snprintf(buf, sizeof(buf),
+                     "{\"error\":\"too many reboot requests, retry later\"}");
+            http_send_json(fd, 429, buf);
+            return;
+        }
+        last_ok = now;
+        authorized = 1;
+    }
+
+    if (authorized) {
         snprintf(buf, sizeof(buf),
                  "{\"status\":\"ok\",\"message\":\"rebooting...\"}");
         http_send_json(fd, 200, buf);
@@ -487,14 +551,20 @@ static void handle_api_reboot(int fd, int content_length)
         /* 给客户端一点时间接收响应 */
         usleep(500000);
         LOG_INFO("reboot requested via dashboard");
-        /* system("reboot") 在开发环境中仅打印日志或 exit */
 #ifdef __linux__
+        /* 落盘后直接 reboot(2)（不再经 system("reboot") 起 shell）；
+         * 非 root 权限时 reboot() 失败仅告警，不影响进程继续运行 */
         sync();
-        if (system("reboot")) { /* intentionally empty */ }
+        if (reboot(RB_AUTOBOOT) != 0) {
+            LOG_ERROR("reboot(RB_AUTOBOOT) failed: %s "
+                      "(insufficient permission?)", strerror(errno));
+        }
 #else
         LOG_INFO("reboot: would reboot now (not on linux)");
 #endif
     } else {
+        LOG_WARN("reboot rejected: invalid, missing token or "
+                 "http_reboot_token not configured (fail-closed)");
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"unauthorized: invalid or missing token\"}");
         http_send_json(fd, 403, buf);
@@ -930,6 +1000,20 @@ int http_server_start(int port, const char *bind_addr,
             LOG_ERROR("http_server: accept() failed: %s", strerror(errno));
             continue;
         }
+
+        /*
+         * P1-5（v1.2.9）recv/send 超时：防慢速连接攻击。
+         * 旧实现未设超时，恶意/异常客户端只要建立连接后不发数据，
+         * http_handle_client 内的 recv 就会永久阻塞——HTTP 线程是
+         * 串行 accept 的，一个卡死的连接等于整个 dashboard 拒绝服务。
+         * 这里对每个新连接设 10s 收/发超时，超时后 recv/send 返回
+         * -1/EAGAIN，连接被正常关闭，循环继续服务后续请求。
+         */
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         http_handle_client(client_fd);
     }

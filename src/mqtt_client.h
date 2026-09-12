@@ -80,6 +80,26 @@ int mqtt_build_ota_topic(const char *client_id, char *buf, int buf_len);
  */
 int mqtt_build_status_topic(const char *base_topic, char *buf, int buf_len);
 
+/*
+ * P1-9: 传感器数据 payload 构造（纯函数，供单元测试）：
+ * {"client_id","timestamp","temperature","humidity","pressure"}。
+ * 参数非法返回 E_INVAL；snprintf 截断（n < 0 || n >= buf_len）
+ * 返回 E_IO——上层据此拒绝发布半截 JSON。
+ */
+int mqtt_build_data_payload(const struct node_config *cfg,
+                            const struct sensor_data *data,
+                            char *buf, int buf_len);
+
+/*
+ * P1-9: 设备状态 payload 构造（纯函数，供单元测试）：
+ * {"client_id","status","version","hostname","mac","cpu",
+ *  "kernel","mem_kb","timestamp"}。返回值语义同上。
+ */
+int mqtt_build_status_payload(const struct node_config *cfg,
+                              const struct device_info *dev,
+                              const char *status,
+                              char *buf, int buf_len);
+
 /* 检查当前是否连接 */
 int mqtt_is_connected(void);
 

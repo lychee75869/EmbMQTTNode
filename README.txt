@@ -3,9 +3,9 @@ EmbMQTTNode - 嵌入式 MQTT 边缘网关
 
 基于 Linux 的嵌入式 MQTT 边缘计算网关，使用 C 语言开发。
 支持多协议传感器数据采集（I²C + Modbus）、MQTT over TLS 加密上报、
-断网本地缓存续传、设备身份管理、配置文件化、守护进程运行。
+断网本地缓存续传、设备身份管理、配置文件化、systemd 托管运行。
 
-当前版本 v1.2.1
+当前版本 v1.2.10
 
 快速开始
 --------
@@ -13,7 +13,7 @@ EmbMQTTNode - 嵌入式 MQTT 边缘网关
 1. 安装依赖（Ubuntu / WSL / Debian）
 
     sudo apt update
-    sudo apt install build-essential libmosquitto-dev libsqlite3-dev
+    sudo apt install build-essential libmosquitto-dev libsqlite3-dev libssl-dev
 
     # Modbus 模块（可选）
     sudo apt install libmodbus-dev
@@ -62,6 +62,8 @@ EmbMQTTNode - 嵌入式 MQTT 边缘网关
     ./test_rule_engine
     ./test_ota
     ./test_anomaly_engine
+    ./test_mqtt_client
+    ./test_mac_addr
 
 项目结构
 --------
@@ -69,18 +71,19 @@ EmbMQTTNode - 嵌入式 MQTT 边缘网关
 EmbMQTTNode/
 ├── docs/              # 项目文档（需求、设计、硬件选型、实施计划）
 ├── src/               # 源代码
-│   ├── main.c         # 程序入口
+│   ├── main.c         # 程序入口（多线程编排 + 独立 OTA 线程）
+│   ├── common.h       # 公共返回码 / json_get_string 提取器 / 版本号
 │   ├── config.c/h     # 配置文件解析
 │   ├── sensor.c/h     # 传感器抽象层（I²C SHT30/ADS1115/mock）
 │   ├── modbus_master.c/h  # Modbus 主站模块（RTU + TCP）
 │   ├── storage.c/h    # SQLite 本地缓存（断网续传）
 │   ├── mqtt_client.c/h    # MQTT 客户端封装（TLS + 遗嘱）
 │   ├── rule_engine.c/h  # 规则引擎 + 本地告警
-│   ├── http_server.c/h  # 本地 Web Dashboard
 │   ├── anomaly_engine.c/h  # 异常检测引擎（Z-score + Isolation Forest）
+│   ├── http_server.c/h  # 本地 Web Dashboard（含常量时间 token 认证）
 │   ├── gpio_hal.c/h     # GPIO 硬件抽象层
-│   ├── ota.c/h        # A/B 分区 OTA 远程升级
-│   ├── daemon.c/h     # 守护进程化
+│   ├── mac_addr.c/h     # 设备 MAC 地址读取
+│   ├── ota.c/h        # A/B 分区 OTA 远程升级（签名 + HTTPS）
 │   └── Makefile       # 构建（支持交叉编译 + 条件编译）
 ├── tests/             # 单元测试
 ├── tools/             # 开发工具
@@ -110,12 +113,22 @@ config/node.conf 主要配置项：
     modbus_tcp_port = 502
     modbus_reg_1 = 1,40001,1,3,int16,temperature,0.1,0
 
+    # HTTP Dashboard（可选）
+    http_enabled = 1
+    # POST /api/reboot 认证 token（未配置 = 一律 403，fail-closed）
+    #http_reboot_token = <openssl rand -hex 32 生成>
+
+    # OTA 远程升级（v1.2.9 起 fail-closed：必须配公钥才允许升级）
+    # ota_public_key = /etc/embmqttnode/ota_pub.pem   # ed25519 公钥
+    # ota_ca_file / ota_ca_path                        # HTTPS 下载 CA
+
 命令行参数
 ----------
 
     ./embmqttnode -c <config>    指定配置文件
-    ./embmqttnode -d             以守护进程运行
     ./embmqttnode -h             显示帮助
+
+    # 后台运行交给 systemd 管理（v1.2.2 起移除内置 daemon 模式）
 
 编译选项
 --------
@@ -141,14 +154,15 @@ config/node.conf 主要配置项：
 | sensor | sensor.c/h | 传感器抽象层，支持 SHT30/ADS1115/Mock |
 | modbus_master | modbus_master.c/h | Modbus RTU/TCP 主站，寄存器映射 + 类型转换 |
 | storage | storage.c/h | SQLite 本地缓存，线程安全 |
-| mqtt_client | mqtt_client.c/h | MQTT client，TLS 1.2+、遗嘱消息、设备状态上报 |
-| daemon | daemon.c/h | 标准双重 fork 守护进程化 |
+| mqtt_client | mqtt_client.c/h | MQTT client，TLS 1.2+、遗嘱消息、设备状态上报（_Atomic 线程安全）|
+| common | common.h | 返回码、版本号、json_get_string 严格 JSON 提取器 |
+| mac_addr | mac_addr.c/h | 设备 MAC 地址读取（设备身份）|
 | rule_engine | rule_engine.c/h | 规则引擎，支持 gt/lt/eq/ne/outside/rate 运算符 + 冷却防抖 |
 | anomaly_engine | anomaly_engine.c/h | 异常检测引擎：Z-score 统计 + Isolation Forest 推理 |
 | http_server | http_server.c/h | 内嵌 HTTP 服务器 + Web Dashboard（暗色主题单页应用）|
 | gpio_hal | gpio_hal.c/h | GPIO 抽象层，mock 模式（开发）/ libgpiod（真实硬件）|
-| ota | ota.c/h | A/B 分区 OTA 远程升级：HTTP 下载→SHA256 校验→安装→重启→回滚 |
-| main | main.c | 多线程编排（采集 + Modbus + 规则引擎 + 上报） |
+| ota | ota.c/h | A/B 分区 OTA：HTTPS 下载→ed25519 签名校验→安装→重启→回滚（互斥锁保护状态机）|
+| main | main.c | 多线程编排（采集 + Modbus + 上报 + OTA 独立线程 + HTTP） |
 
 后续计划
 --------
@@ -160,7 +174,25 @@ config/node.conf 主要配置项：
 5. ~~本地 Web Dashboard~~ ✅ 阶段五完成
 6. ~~构建系统 + 交叉编译 + CI~~ ✅ 阶段六完成
 7. ~~边缘 AI 异常检测~~ ✅ 方向 B 完成（Z-score + iForest）
-8. 硬件上板实测：ADS1115 / SHT30 真实采集（Orange Pi Zero 2W）
+8. rule_engine / anomaly_engine 架构重构：抽公共判定框架，消除约 60% 重复代码
+9. 硬件上板实测：ADS1115 / SHT30 真实采集（Orange Pi Zero 2W）
+
+版本更新历史
+------------
+
+    v1.2.10  P1 批量修复 8 项：跨线程原子/互斥（P1-3）、Modbus 参数校验（P1-4）、
+            HTTP 收发超时（P1-5）、reboot 常量时间 token 认证（P1-6/8）、
+            OTA 命令 JSON 严格解析（P1-7/8）、payload 截断拒绝发送（P1-9）、
+            OTA 独立线程不阻塞上报（P1-10）
+    v1.2.9   OTA 固件 ed25519 签名 + HTTPS 下载，fail-closed（P0-5 + P1-14）
+    v1.2.8   MQTT 订阅重连不丢失（on_connect 驱动）+ 启动竞态修复
+    v1.2.7   OTA 健康指示器 fail-safe，槽位写入全链路返回值检查
+    v1.2.6   OTA 回滚机制修复
+    v1.2.5   get_mac double fclose 修复
+    v1.2.4   断网本地缓存续传
+    v1.2.3   HTTP 栈溢出修复
+    v1.2.2   架构简化：移除内置 daemon，由 systemd 托管
+    v1.2.1   首个功能完整版本
 
 作者
 ----

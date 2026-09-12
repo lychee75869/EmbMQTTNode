@@ -28,6 +28,7 @@
 #include <assert.h>
 
 #include "../src/mqtt_client.h"
+#include "../src/http_server.h"   /* P1-6: http_consttime_token_equal */
 #include "../src/common.h"   /* E_OK / E_INVAL / E_NET */
 
 /* ─── 回调触发计数器（模拟"重订阅 + 重发状态"副作用）────── */
@@ -168,6 +169,155 @@ static void test_build_topic_truncate(void) {
     printf("  truncation null-terminated:  PASS\n");
 }
 
+/* ─── P1-9: payload 构造纯函数（截断拒绝）────────────────── */
+
+/*
+ * 正常数据：E_OK 且字段格式正确。
+ */
+static void test_build_data_payload_ok(void) {
+    printf("--- test_build_data_payload_ok (P1-9) ---\n");
+
+    struct node_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.client_id, sizeof(cfg.client_id), "node-01");
+
+    struct sensor_data d;
+    memset(&d, 0, sizeof(d));
+    d.temperature = 23.456;
+    d.humidity = 56.789;
+    d.pressure = 1013.25;
+    d.timestamp_ms = 1234567890123LL;
+
+    char payload[512];
+    int rc = mqtt_build_data_payload(&cfg, &d, payload, (int)sizeof(payload));
+    assert(rc == E_OK);
+    assert(strstr(payload, "\"client_id\":\"node-01\"") != NULL);
+    assert(strstr(payload, "\"timestamp\":1234567890123") != NULL);
+    assert(strstr(payload, "\"temperature\":23.46") != NULL);
+    assert(strstr(payload, "\"humidity\":56.79") != NULL);
+    assert(strstr(payload, "\"pressure\":1013.25") != NULL);
+    printf("  valid data payload E_OK:   PASS\n");
+}
+
+/*
+ * P1-9 核心：极端值（%.2f 展开约 310 字符）×3 个字段远超 512 缓冲，
+ * 构造器必须返回 E_IO 拒绝，而不是静默发布半截 JSON。
+ */
+static void test_build_data_payload_truncated(void) {
+    printf("--- test_build_data_payload_truncated (P1-9) ---\n");
+
+    struct node_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.client_id, sizeof(cfg.client_id), "node-01");
+
+    struct sensor_data d;
+    memset(&d, 0, sizeof(d));
+    d.temperature = 1e308;
+    d.humidity = 1e308;
+    d.pressure = 1e308;
+    d.timestamp_ms = 1LL;
+
+    char payload[512];
+    memset(payload, 0xAA, sizeof(payload));   /* 哨兵：拒绝时不破坏越界内容 */
+    int rc = mqtt_build_data_payload(&cfg, &d, payload, (int)sizeof(payload));
+    assert(rc == E_IO);
+    printf("  3x1e308 overflow -> E_IO:  PASS\n");
+
+    /* 小缓冲同样拒绝（正常值 + 16 字节缓冲） */
+    struct sensor_data small;
+    memset(&small, 0, sizeof(small));
+    small.temperature = 23.45;
+    small.humidity = 56.78;
+    small.pressure = 1013.25;
+    small.timestamp_ms = 1LL;
+    char tiny[16];
+    assert(mqtt_build_data_payload(&cfg, &small, tiny,
+                                   (int)sizeof(tiny)) == E_IO);
+    printf("  tiny buffer -> E_IO:       PASS\n");
+}
+
+/* 参数防御：NULL / buf_len<=0 → E_INVAL */
+static void test_build_data_payload_defensive(void) {
+    printf("--- test_build_data_payload_defensive ---\n");
+
+    struct node_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    struct sensor_data d;
+    memset(&d, 0, sizeof(d));
+    char buf[512];
+
+    assert(mqtt_build_data_payload(NULL, &d, buf, (int)sizeof(buf)) == E_INVAL);
+    assert(mqtt_build_data_payload(&cfg, NULL, buf, (int)sizeof(buf)) == E_INVAL);
+    assert(mqtt_build_data_payload(&cfg, &d, NULL, (int)sizeof(buf)) == E_INVAL);
+    assert(mqtt_build_data_payload(&cfg, &d, buf, 0) == E_INVAL);
+    assert(mqtt_build_data_payload(&cfg, &d, buf, -1) == E_INVAL);
+    printf("  NULL/len<=0 -> E_INVAL:    PASS\n");
+}
+
+/* 状态 payload：正常 E_OK + 小缓冲 E_IO */
+static void test_build_status_payload(void) {
+    printf("--- test_build_status_payload (P1-9) ---\n");
+
+    struct node_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.client_id, sizeof(cfg.client_id), "node-01");
+
+    struct device_info dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "testhost");
+    snprintf(dev.mac_addr, sizeof(dev.mac_addr), "aa:bb:cc:dd:ee:ff");
+    snprintf(dev.cpu_model, sizeof(dev.cpu_model), "test-cpu");
+    snprintf(dev.kernel_ver, sizeof(dev.kernel_ver), "6.1.0");
+    dev.total_mem_kb = 1024;
+
+    char payload[512];
+    int rc = mqtt_build_status_payload(&cfg, &dev, "online",
+                                       payload, (int)sizeof(payload));
+    assert(rc == E_OK);
+    assert(strstr(payload, "\"status\":\"online\"") != NULL);
+    assert(strstr(payload, "\"hostname\":\"testhost\"") != NULL);
+    assert(strstr(payload, "\"mac\":\"aa:bb:cc:dd:ee:ff\"") != NULL);
+    printf("  valid status payload E_OK: PASS\n");
+
+    char tiny[16];
+    assert(mqtt_build_status_payload(&cfg, &dev, "online",
+                                     tiny, (int)sizeof(tiny)) == E_IO);
+    printf("  tiny buffer -> E_IO:       PASS\n");
+
+    assert(mqtt_build_status_payload(NULL, &dev, "s",
+                                     payload, (int)sizeof(payload)) == E_INVAL);
+    assert(mqtt_build_status_payload(&cfg, NULL, "s",
+                                     payload, (int)sizeof(payload)) == E_INVAL);
+    assert(mqtt_build_status_payload(&cfg, &dev, NULL,
+                                     payload, (int)sizeof(payload)) == E_INVAL);
+    printf("  NULL args -> E_INVAL:      PASS\n");
+}
+
+/* ─── P1-6: 常量时间 token 比较 ─────────────────────────── */
+
+static void test_consttime_token_equal(void) {
+    printf("--- test_consttime_token_equal (P1-6) ---\n");
+
+    assert(http_consttime_token_equal("s3cret-token-abc", "s3cret-token-abc") == 1);
+    printf("  equal tokens -> 1:         PASS\n");
+
+    assert(http_consttime_token_equal("s3cret-token-abc", "s3cret-token-abd") == 0);
+    printf("  last byte differs -> 0:    PASS\n");
+
+    /* 前缀相同、长度不同（时序侧信道经典场景）也必须返回 0 */
+    assert(http_consttime_token_equal("s3cret", "s3cret-token-abc") == 0);
+    assert(http_consttime_token_equal("s3cret-token-abc", "s3cret") == 0);
+    printf("  length mismatch -> 0:      PASS\n");
+
+    assert(http_consttime_token_equal(NULL, "x") == 0);
+    assert(http_consttime_token_equal("x", NULL) == 0);
+    assert(http_consttime_token_equal(NULL, NULL) == 0);
+    printf("  NULL args -> 0:            PASS\n");
+
+    assert(http_consttime_token_equal("", "") == 1);
+    printf("  empty==empty -> 1:         PASS\n");
+}
+
 /* ─── 入口 ─────────────────────────────────────────────── */
 
 int main(void) {
@@ -184,6 +334,13 @@ int main(void) {
     test_build_status_topic();
     test_build_topic_defensive();
     test_build_topic_truncate();
+
+    /* v1.2.9 P1-9 / P1-6 用例 */
+    test_build_data_payload_ok();
+    test_build_data_payload_truncated();
+    test_build_data_payload_defensive();
+    test_build_status_payload();
+    test_consttime_token_equal();
 
     printf("\n=== ALL mqtt_client tests PASSED ===\n");
     return 0;

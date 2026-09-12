@@ -162,22 +162,17 @@ static int publish_by_source(const struct sensor_data *data,
         return mqtt_publish(&g_cfg, data);
     }
 
-    /* Modbus 数据：发布到 topic/modbus，以 JSON 格式发送 */
+    /* Modbus 数据：发布到 topic/modbus，以 JSON 格式发送。
+     * P1-9: 复用 mqtt_build_data_payload 构造（截断返回 E_IO，
+     * 拒绝发布半截 JSON），不再手写无检查的 snprintf。 */
     char modbus_topic[256];
     snprintf(modbus_topic, sizeof(modbus_topic), "%s/modbus", g_cfg.topic);
 
     char payload[512];
-    snprintf(payload, sizeof(payload),
-             "{\"client_id\":\"%s\","
-             "\"timestamp\":%lld,"
-             "\"temperature\":%.2f,"
-             "\"humidity\":%.2f,"
-             "\"pressure\":%.2f}",
-             g_cfg.client_id,
-             (long long)data->timestamp_ms,
-             data->temperature,
-             data->humidity,
-             data->pressure);
+    int build_rc = mqtt_build_data_payload(&g_cfg, data,
+                                           payload, (int)sizeof(payload));
+    if (build_rc != E_OK)
+        return build_rc;
     return mqtt_publish_raw(modbus_topic, payload, 1);
 }
 
@@ -295,12 +290,15 @@ static void *upload_thread(void *arg) {
     struct sensor_data pending[16];
 
     while (g_running) {
-        /* OTA 状态机驱动 */
-        if (g_cfg.ota.enabled)
-            ota_check_and_handle();
-
-        /* OTA 启动健康确认计时：稳定运行 boot_confirm_sec 后由 ota_confirm_boot
-         * 清零 boot_attempt（内含 enabled / count==0 短路，开销可忽略） */
+        /*
+         * P1-10（v1.2.9）：ota_check_and_handle 已从本线程移除，
+         * 由独立 ota_thread 以 500ms 周期驱动——旧实现把 OTA 状态机
+         * 挂在本 5s 上报循环里，固件下载（分钟级阻塞 recv）会把断网
+         * 补发、心跳上报一并卡住。这里只保留轻量的启动健康确认。
+         *
+         * OTA 启动健康确认计时：稳定运行 boot_confirm_sec 后由
+         * ota_confirm_boot 清零 boot_attempt（内含 enabled / count==0
+         * 短路，开销可忽略） */
         ota_confirm_boot();
 
         if (mqtt_is_connected()) {
@@ -317,6 +315,22 @@ static void *upload_thread(void *arg) {
                 LOG_INFO("uploaded %d/%d pending records", sent, n);
         }
         sleep(5);
+    }
+    return NULL;
+}
+
+/* ─── OTA 状态机线程（P1-10，v1.2.9）────────────────────── */
+
+/*
+ * 独立 OTA worker：500ms 周期驱动 ota_check_and_handle。
+ * 下载/验签/安装这类分钟级阻塞只影响本线程；状态机字段由
+ * ota.c 内 g_state_lock 保护，上报线程不再被 OTA 阻塞拖住。
+ */
+static void *ota_thread(void *arg) {
+    (void)arg;
+    while (g_running) {
+        ota_check_and_handle();
+        usleep(500000);   /* 500ms */
     }
     return NULL;
 }
@@ -514,13 +528,18 @@ int main(int argc, char *argv[]) {
     /* 12. 启动工作线程 */
     LOG_INFO("EmbMQTTNode v%s starting...", EMBMQTTNODE_VERSION);
 
-    pthread_t tid_sample, tid_upload, tid_modbus = 0, tid_http = 0;
+    pthread_t tid_sample, tid_upload, tid_modbus = 0, tid_http = 0, tid_ota = 0;
     pthread_create(&tid_sample, NULL, sample_thread, NULL);
     pthread_create(&tid_upload, NULL, upload_thread, NULL);
     /* Modbus 线程仅在 enabled 时启动 */
     if (g_cfg.modbus.enabled) {
         pthread_create(&tid_modbus, NULL, modbus_thread, NULL);
         LOG_INFO("modbus polling thread started");
+    }
+    /* P1-10: OTA 状态机独立线程（仅 enabled 时启动） */
+    if (g_cfg.ota.enabled) {
+        pthread_create(&tid_ota, NULL, ota_thread, NULL);
+        LOG_INFO("ota worker thread started (500ms poll)");
     }
     /* HTTP Dashboard 线程（阶段五） */
     {
@@ -536,6 +555,8 @@ int main(int argc, char *argv[]) {
     pthread_join(tid_upload, NULL);
     if (tid_modbus)
         pthread_join(tid_modbus, NULL);
+    if (tid_ota)
+        pthread_join(tid_ota, NULL);
     if (tid_http) {
         http_server_stop();
         pthread_join(tid_http, NULL);

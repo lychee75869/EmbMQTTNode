@@ -56,6 +56,7 @@
 #include <netdb.h>
 #include <stdarg.h>
 #include <strings.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -96,6 +97,19 @@ static char           g_target_version[OTA_VERSION_MAX];
 static char           g_download_url[OTA_URL_MAX];
 static char           g_expected_checksum[OTA_CHECKSUM_MAX];
 
+/*
+ * P1-3: OTA 状态机跨线程同步。
+ * 修复前 g_state / g_target_* 等只在网络线程（handle_message）与
+ * 上报线程（check_and_handle）之间靠"运气"传递——无任何同步原语，
+ * 属数据竞争 UB（另一处是 mqtt_client 的 g_connected）。
+ * 修复方案：pthread 互斥锁保护全部状态机字段。
+ *   · 锁内只做内存读写（快照/提交），绝不做网络/文件 I/O——
+ *     下载一卡几十秒不能拖死 ota_state_string 等查询方；
+ *   · 每步流程 = 锁内快照输入 → 解锁干活 → 回锁提交 → 解锁后上报
+ *     （ota_report_status 自身会加锁，调用方不得持锁调用，防死锁）。
+ */
+static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* MQTT 发布回调（由 main 注入） */
 static int (*g_mqtt_publish)(const char *topic,
                               const char *payload, int qos) = NULL;
@@ -111,6 +125,17 @@ static int  ota_sha256_file(const char *path, char *hash_out, int hash_len);
 static int  ota_install_firmware(const char *src_path, int target_slot);
 static int  ota_switch_slot(int slot);
 static int  ota_parse_upgrade_cmd(const char *json, int len);
+
+/* P1-3: 状态机各步独立函数（快照-干活-提交模式，锁内无 I/O） */
+static void ota_step_downloading(void);
+static void ota_step_verifying(void);
+static void ota_step_installing(void);
+static void ota_step_rebooting(void);
+static void ota_step_failed(void);
+
+/* P1-3: 由已快照的状态枚举取名（供已持锁快照的调用方使用，
+ * 避免在持锁路径调用会加锁的 ota_state_string 造成死锁） */
+static const char *ota_state_string_from(enum ota_state s);
 
 /* ═══════════════════════════════════════════════════════════
  * 公开 API
@@ -192,13 +217,24 @@ void ota_handle_message(const char *payload, int payload_len)
         LOG_INFO("ota: ignored (disabled)");
         return;
     }
+
+    /*
+     * P1-3: 状态机字段全部由 g_state_lock 保护。
+     * 解析（写 g_target_*）与推进 DOWNLOADING 都在锁内完成；
+     * ota_report_status / ota_state_string 自身会加锁，
+     * 因此所有上报/查询都放在解锁之后（防死锁）。
+     */
+    pthread_mutex_lock(&g_state_lock);
     if (g_state != OTA_STATE_IDLE) {
+        enum ota_state snap = g_state;
+        pthread_mutex_unlock(&g_state_lock);
         LOG_WARN("ota: busy (state=%s), ignoring command",
-                 ota_state_string());
+                 ota_state_string_from(snap));
         return;
     }
 
     if (ota_parse_upgrade_cmd(payload, payload_len) != E_OK) {
+        pthread_mutex_unlock(&g_state_lock);
         ota_report_status("error", "\"Invalid OTA command JSON\"");
         return;
     }
@@ -210,6 +246,7 @@ void ota_handle_message(const char *payload, int payload_len)
      * 离线签名把关的 OTA 等于向全网开放刷机口。
      */
     if (g_cfg.public_key[0] == '\0') {
+        pthread_mutex_unlock(&g_state_lock);
         LOG_ERROR("ota: upgrade rejected: ota_public_key not configured "
                   "(fail-closed: unsigned firmware install is not allowed)");
         ota_report_status("error",
@@ -218,190 +255,283 @@ void ota_handle_message(const char *payload, int payload_len)
         return;
     }
 
-    LOG_INFO("ota: upgrade cmd received version=%s", g_target_version);
+    char received_ver[OTA_VERSION_MAX];
+    snprintf(received_ver, sizeof(received_ver), "%s", g_target_version);
     g_state = OTA_STATE_DOWNLOADING;
+    pthread_mutex_unlock(&g_state_lock);
+
+    LOG_INFO("ota: upgrade cmd received version=%s", received_ver);
 }
 
+/*
+ * P1-3/P1-10: 状态机推进（由独立 OTA worker 线程周期调用）。
+ * 只做分发：锁内快照当前状态 → 解锁 → 派发到对应 step 函数。
+ * 每个 step 遵循"锁内快照输入 → 解锁干活（网络/文件 I/O）→
+ * 回锁提交状态 → 解锁后上报"——锁内绝不出现 I/O。
+ */
 int ota_check_and_handle(void)
 {
     if (!g_cfg.enabled)
         return 0;
-    if (g_state == OTA_STATE_IDLE)
+
+    pthread_mutex_lock(&g_state_lock);
+    enum ota_state snap = g_state;
+    pthread_mutex_unlock(&g_state_lock);
+
+    if (snap == OTA_STATE_IDLE)
         return 0;
 
-    switch (g_state) {
-
-    case OTA_STATE_DOWNLOADING: {
-        char dest_path[512];
-        char sig_path[sizeof(dest_path) + 4];   /* dest_path + ".sig" */
-        char sig_url[OTA_URL_MAX + 4];          /* 固件 URL + ".sig" */
-
-        snprintf(dest_path, sizeof(dest_path), "%s/%s/%s",
-                 g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
-
-        ota_report_status("downloading", NULL);
-        LOG_INFO("ota: downloading %s → %s", g_download_url, dest_path);
-
-        if (ota_http_download(g_download_url, dest_path) != E_OK) {
-            ota_report_status("error", "\"HTTP download failed\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
-
-        /*
-         * v1.2.9 fail-closed：同时下载签名文件 <固件URL>.sig。
-         * 公钥已配置（ota_handle_message 已把关），.sig 拿不到就是
-         * 异常事件（中间人剥离签名 / 源站部署不全），必须拒绝安装。
-         */
-        int surl = snprintf(sig_url, sizeof(sig_url),
-                            "%s%s", g_download_url, OTA_SIG_SUFFIX);
-        if (surl < 0 || (size_t)surl >= sizeof(sig_url)) {
-            LOG_ERROR("ota: signature URL too long");
-            ota_report_status("error", "\"Signature URL too long\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
-        snprintf(sig_path, sizeof(sig_path), "%s%s", dest_path,
-                 OTA_SIG_SUFFIX);
-
-        LOG_INFO("ota: downloading signature %s → %s", sig_url, sig_path);
-        if (ota_http_download(sig_url, sig_path) != E_OK) {
-            LOG_ERROR("ota: signature file download failed, refusing install");
-            ota_report_status("error", "\"Signature file download failed\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
-
-        g_download_pct = 100;
-        g_state = OTA_STATE_VERIFYING;
-        break;
+    switch (snap) {
+    case OTA_STATE_DOWNLOADING: ota_step_downloading(); break;
+    case OTA_STATE_VERIFYING:   ota_step_verifying();   break;
+    case OTA_STATE_INSTALLING:  ota_step_installing();  break;
+    case OTA_STATE_REBOOTING:   ota_step_rebooting();   break;
+    case OTA_STATE_FAILED:      ota_step_failed();      break;
+    default: break;
     }
 
-    case OTA_STATE_VERIFYING: {
-        char hash_str[128] = {0};
-        char src_path[512];
-        char sig_path[sizeof(src_path) + 4];    /* src_path + ".sig" */
-        snprintf(src_path, sizeof(src_path), "%s/%s/%s",
-                 g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
-        snprintf(sig_path, sizeof(sig_path), "%s%s", src_path,
-                 OTA_SIG_SUFFIX);
+    pthread_mutex_lock(&g_state_lock);
+    int busy = (g_state != OTA_STATE_IDLE);
+    pthread_mutex_unlock(&g_state_lock);
+    return busy;
+}
 
-        ota_report_status("verifying", NULL);
+/* ── DOWNLOADING：下载固件 + .sig（网络 I/O，全程不持锁）── */
 
-        /* ── 第一道关卡：SHA256 checksum（快速失败） ── */
-        if (ota_sha256_file(src_path, hash_str, sizeof(hash_str)) != E_OK) {
-            ota_report_status("error", "\"SHA256 computation failed\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
+static void ota_step_downloading(void)
+{
+    char url[OTA_URL_MAX];
+    char dest_path[512];
 
-        LOG_INFO("ota: sha256 computed = %s", hash_str);
-        LOG_INFO("ota: sha256 expected = %s", g_expected_checksum);
+    pthread_mutex_lock(&g_state_lock);
+    if (g_state != OTA_STATE_DOWNLOADING) {
+        /* 状态已被其他路径改写（理论上不会发生），保守放弃本步 */
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+    snprintf(url, sizeof(url), "%s", g_download_url);
+    pthread_mutex_unlock(&g_state_lock);
 
-        /* 比较校验和（兼容带 "sha256:" 前缀的格式） */
-        const char *exp = g_expected_checksum;
-        if (strncmp(exp, "sha256:", 7) == 0)
-            exp += 7;
+    snprintf(dest_path, sizeof(dest_path), "%s/%s/%s",
+             g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
 
-        if (strcasecmp(hash_str, exp) != 0) {
-            LOG_ERROR("ota: checksum mismatch!");
-            ota_report_status("error", "\"Checksum mismatch\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
+    ota_report_status("downloading", NULL);
+    LOG_INFO("ota: downloading %s → %s", url, dest_path);
 
-        ota_report_status("verifying", "\"checksum_ok\":true");
-
-        /*
-         * ── 第二道关卡：数字签名验签（v1.2.9，硬性 fail-closed） ──
-         * checksum 只证明"固件与指令一致"，防不住指令+固件被中间人
-         * 一并伪造；签名来自离线私钥，才是拒绝伪造固件的根。
-         * 验签失败 / .sig 缺失 / 公钥读不出 → 一律 FAILED，绝不切槽。
-         */
-        if (ota_verify_signature(src_path, sig_path, g_cfg.public_key)
-                != E_OK) {
-            LOG_ERROR("ota: signature verification failed, refusing install");
-            ota_report_status("error", "\"Signature verification failed\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
-
-        ota_report_status("verifying", "\"signature_ok\":true");
-        g_state = OTA_STATE_INSTALLING;
-        break;
+    if (ota_http_download(url, dest_path) != E_OK) {
+        ota_report_status("error", "\"HTTP download failed\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
     }
 
-    case OTA_STATE_INSTALLING: {
-        /* 目标槽位 = 非当前槽 */
-        g_target_slot = (g_active_slot == 0) ? 1 : 0;
+    /*
+     * v1.2.9 fail-closed：同时下载签名文件 <固件URL>.sig。
+     * 公钥已配置（ota_handle_message 已把关），.sig 拿不到就是
+     * 异常事件（中间人剥离签名 / 源站部署不全），必须拒绝安装。
+     */
+    char sig_url[OTA_URL_MAX + 4];
+    int surl = snprintf(sig_url, sizeof(sig_url),
+                        "%s%s", url, OTA_SIG_SUFFIX);
+    if (surl < 0 || (size_t)surl >= sizeof(sig_url)) {
+        LOG_ERROR("ota: signature URL too long");
+        ota_report_status("error", "\"Signature URL too long\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+    char sig_path[sizeof(dest_path) + 4];   /* dest_path + ".sig" */
+    snprintf(sig_path, sizeof(sig_path), "%s%s", dest_path,
+             OTA_SIG_SUFFIX);
 
-        char src_path[512];
-        snprintf(src_path, sizeof(src_path), "%s/%s/%s",
-                 g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
-
-        ota_report_status("installing",
-                          "\"target_slot\":\"%c\"",
-                          g_target_slot ? 'B' : 'A');
-
-        if (ota_install_firmware(src_path, g_target_slot) != E_OK) {
-            ota_report_status("error", "\"Installation failed\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
-
-        /* 新版本进入试用，从 1 开始计数（首次 post_boot_check 读到 1，
-         * 0 < 1 < max → 自增到 2；稳定运行 boot_confirm_sec 后 confirm 清零）
-         *
-         * v1.2.7 fail-safe（缺陷 ①）：boot_count 是回滚判定的命根子。
-         * 此刻尚未切槽、尚未 exit(42)；若写 "1" 失败（磁盘满/权限错误）
-         * 却继续推进状态机，切槽后新固件会读到旧值（通常是 0=已确认）
-         * → 直接报 confirmed → 回滚保护被静默绕过。因此写失败必须
-         * 中止安装：上报 error、state=FAILED，留在当前好固件上，
-         * 用户/运维可稍后重试升级（该路径由 tests/test_ota.c 用例 C 覆盖）。 */
-        if (ota_write_slot_file(OTA_BOOT_COUNT_FILE, "1") != E_OK) {
-            LOG_ERROR("ota: failed to persist boot_count=1 "
-                      "(disk full or permission error?), aborting install");
-            ota_report_status("error",
-                              "\"Boot count persist failed, install aborted\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
-
-        /* 切换活动槽位 */
-        if (ota_switch_slot(g_target_slot) != E_OK) {
-            ota_report_status("error", "\"Slot switch failed\"");
-            g_state = OTA_STATE_FAILED;
-            break;
-        }
-
-        g_state = OTA_STATE_REBOOTING;
-        break;
+    LOG_INFO("ota: downloading signature %s → %s", sig_url, sig_path);
+    if (ota_http_download(sig_url, sig_path) != E_OK) {
+        LOG_ERROR("ota: signature file download failed, refusing install");
+        ota_report_status("error", "\"Signature file download failed\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
     }
 
-    case OTA_STATE_REBOOTING: {
-        ota_report_status("rebooting", NULL);
-        LOG_INFO("ota: rebooting to slot %c...",
-                 g_target_slot ? 'B' : 'A');
+    pthread_mutex_lock(&g_state_lock);
+    g_download_pct = 100;
+    g_state = OTA_STATE_VERIFYING;
+    pthread_mutex_unlock(&g_state_lock);
+}
 
-        /* 给 MQTT 一点时间发送状态消息 */
-        usleep(500000);
+/* ── VERIFYING：SHA256 + 验签（文件 I/O，全程不持锁）──── */
 
-        /* 优雅退出 → 由 systemd RestartForceExitStatus=42 自动重启 */
-        LOG_INFO("ota: exiting for reboot (expect systemd to restart)");
-        exit(42);
-        break;
+static void ota_step_verifying(void)
+{
+    char expected_checksum[OTA_CHECKSUM_MAX];
+    char public_key[512];
+
+    pthread_mutex_lock(&g_state_lock);
+    if (g_state != OTA_STATE_VERIFYING) {
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+    snprintf(expected_checksum, sizeof(expected_checksum), "%s",
+             g_expected_checksum);
+    snprintf(public_key, sizeof(public_key), "%s", g_cfg.public_key);
+    pthread_mutex_unlock(&g_state_lock);
+
+    char hash_str[128] = {0};
+    char src_path[512];
+    char sig_path[sizeof(src_path) + 4];    /* src_path + ".sig" */
+    snprintf(src_path, sizeof(src_path), "%s/%s/%s",
+             g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
+    snprintf(sig_path, sizeof(sig_path), "%s%s", src_path,
+             OTA_SIG_SUFFIX);
+
+    ota_report_status("verifying", NULL);
+
+    /* ── 第一道关卡：SHA256 checksum（快速失败） ── */
+    if (ota_sha256_file(src_path, hash_str, sizeof(hash_str)) != E_OK) {
+        ota_report_status("error", "\"SHA256 computation failed\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
     }
 
-    case OTA_STATE_FAILED:
-        LOG_WARN("ota: in failed state, resetting to IDLE");
-        g_state = OTA_STATE_IDLE;
-        break;
+    LOG_INFO("ota: sha256 computed = %s", hash_str);
+    LOG_INFO("ota: sha256 expected = %s", expected_checksum);
 
-    default:
-        break;
+    /* 比较校验和（兼容带 "sha256:" 前缀的格式） */
+    const char *exp = expected_checksum;
+    if (strncmp(exp, "sha256:", 7) == 0)
+        exp += 7;
+
+    if (strcasecmp(hash_str, exp) != 0) {
+        LOG_ERROR("ota: checksum mismatch!");
+        ota_report_status("error", "\"Checksum mismatch\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
     }
 
-    return (g_state != OTA_STATE_IDLE) ? 1 : 0;
+    ota_report_status("verifying", "\"checksum_ok\":true");
+
+    /*
+     * ── 第二道关卡：数字签名验签（v1.2.9，硬性 fail-closed） ──
+     * checksum 只证明"固件与指令一致"，防不住指令+固件被中间人
+     * 一并伪造；签名来自离线私钥，才是拒绝伪造固件的根。
+     * 验签失败 / .sig 缺失 / 公钥读不出 → 一律 FAILED，绝不切槽。
+     */
+    if (ota_verify_signature(src_path, sig_path, public_key) != E_OK) {
+        LOG_ERROR("ota: signature verification failed, refusing install");
+        ota_report_status("error", "\"Signature verification failed\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+
+    ota_report_status("verifying", "\"signature_ok\":true");
+    pthread_mutex_lock(&g_state_lock);
+    g_state = OTA_STATE_INSTALLING;
+    pthread_mutex_unlock(&g_state_lock);
+}
+
+/* ── INSTALLING：写备用槽 + 切槽（文件 I/O，全程不持锁）─ */
+
+static void ota_step_installing(void)
+{
+    int target_slot;
+
+    pthread_mutex_lock(&g_state_lock);
+    if (g_state != OTA_STATE_INSTALLING) {
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+    /* 目标槽位 = 非当前槽 */
+    target_slot = (g_active_slot == 0) ? 1 : 0;
+    g_target_slot = target_slot;   /* 提前登记，REBOOTING 日志要用 */
+    pthread_mutex_unlock(&g_state_lock);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/%s/%s",
+             g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
+
+    ota_report_status("installing",
+                      "\"target_slot\":\"%c\"",
+                      target_slot ? 'B' : 'A');
+
+    if (ota_install_firmware(src_path, target_slot) != E_OK) {
+        ota_report_status("error", "\"Installation failed\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+
+    /* 新版本进入试用，从 1 开始计数（首次 post_boot_check 读到 1，
+     * 0 < 1 < max → 自增到 2；稳定运行 boot_confirm_sec 后 confirm 清零）
+     *
+     * v1.2.7 fail-safe（缺陷 ①）：boot_count 是回滚判定的命根子。
+     * 此刻尚未切槽、尚未 exit(42)；若写 "1" 失败（磁盘满/权限错误）
+     * 却继续推进状态机，切槽后新固件会读到旧值（通常是 0=已确认）
+     * → 直接报 confirmed → 回滚保护被静默绕过。因此写失败必须
+     * 中止安装：上报 error、state=FAILED，留在当前好固件上，
+     * 用户/运维可稍后重试升级（该路径由 tests/test_ota.c 用例 C 覆盖）。 */
+    if (ota_write_slot_file(OTA_BOOT_COUNT_FILE, "1") != E_OK) {
+        LOG_ERROR("ota: failed to persist boot_count=1 "
+                  "(disk full or permission error?), aborting install");
+        ota_report_status("error",
+                          "\"Boot count persist failed, install aborted\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+
+    /* 切换活动槽位（内部文件写在锁外，g_active_slot 更新在锁内） */
+    if (ota_switch_slot(target_slot) != E_OK) {
+        ota_report_status("error", "\"Slot switch failed\"");
+        pthread_mutex_lock(&g_state_lock);
+        g_state = OTA_STATE_FAILED;
+        pthread_mutex_unlock(&g_state_lock);
+        return;
+    }
+
+    pthread_mutex_lock(&g_state_lock);
+    g_state = OTA_STATE_REBOOTING;
+    pthread_mutex_unlock(&g_state_lock);
+}
+
+/* ── REBOOTING：上报后 exit(42) 交由 systemd 重启 ───────── */
+
+static void ota_step_rebooting(void)
+{
+    pthread_mutex_lock(&g_state_lock);
+    int target_slot = g_target_slot;
+    pthread_mutex_unlock(&g_state_lock);
+
+    ota_report_status("rebooting", NULL);
+    LOG_INFO("ota: rebooting to slot %c...",
+             target_slot ? 'B' : 'A');
+
+    /* 给 MQTT 一点时间发送状态消息 */
+    usleep(500000);
+
+    /* 优雅退出 → 由 systemd RestartForceExitStatus=42 自动重启 */
+    LOG_INFO("ota: exiting for reboot (expect systemd to restart)");
+    exit(42);
+}
+
+/* ── FAILED：复位回 IDLE，等待下一条指令 ────────────────── */
+
+static void ota_step_failed(void)
+{
+    pthread_mutex_lock(&g_state_lock);
+    g_state = OTA_STATE_IDLE;
+    pthread_mutex_unlock(&g_state_lock);
+    LOG_WARN("ota: in failed state, resetting to IDLE");
 }
 
 /*
@@ -424,30 +554,34 @@ void ota_post_boot_check(void)
 
     /* 读取当前计数（ota_init 已读过，这里以文件为准再读一次，外部可能改写）*/
     char count_buf[16] = {0};
+    int file_attempt = 0;
     if (ota_read_slot_file(OTA_BOOT_COUNT_FILE, count_buf, sizeof(count_buf)) > 0) {
-        g_boot_attempt = atoi(count_buf);
-    } else {
-        g_boot_attempt = 0;
+        file_attempt = atoi(count_buf);
     }
+    pthread_mutex_lock(&g_state_lock);
+    g_boot_attempt = file_attempt;
+    int attempt = g_boot_attempt;
+    int active_slot = g_active_slot;
+    pthread_mutex_unlock(&g_state_lock);
 
     /* count == 0：已确认健康（或从未升级），正常启动 */
-    if (g_boot_attempt == 0) {
+    if (attempt == 0) {
         LOG_INFO("ota: confirmed boot on slot %c",
-                 g_active_slot ? 'B' : 'A');
+                 active_slot ? 'B' : 'A');
         ota_report_status("running", "\"slot\":\"%c\"",
-                          g_active_slot ? 'B' : 'A');
+                          active_slot ? 'B' : 'A');
         return;
     }
 
     /* count >= max：试用期内反复失败 → 回滚 */
-    if (g_boot_attempt >= max_attempts) {
+    if (attempt >= max_attempts) {
         LOG_ERROR("ota: max boot attempts (%d) reached, rolling back!",
-                  g_boot_attempt);
+                  attempt);
         ota_report_status("rollback",
                           "\"reason\":\"boot_failed_%d_times\"",
-                          g_boot_attempt);
+                          attempt);
 
-        int fallback_slot = (g_active_slot == 0) ? 1 : 0;
+        int fallback_slot = (active_slot == 0) ? 1 : 0;
 
         /* v1.2.7 fail-safe（缺陷 ②）：切槽失败时绝不能清零计数——
          * 否则下轮重启读到 count 已被清 0，坏固件会被永久"确认"。
@@ -475,7 +609,7 @@ void ota_post_boot_check(void)
         if (ota_write_slot_file(OTA_BOOT_COUNT_FILE, "0") != E_OK) {
             LOG_ERROR("ota: failed to clear boot_count after rollback "
                       "(count stays %d, may re-trigger rollback)",
-                      g_boot_attempt);
+                      attempt);
         } /* 旧固件免试用 */
 
         LOG_INFO("ota: rolled back to slot %c, rebooting...",
@@ -485,9 +619,13 @@ void ota_post_boot_check(void)
     }
 
     /* 0 < count < max：试用期内，递增后继续尝试 */
+    pthread_mutex_lock(&g_state_lock);
     g_boot_attempt++;
+    attempt = g_boot_attempt;
+    active_slot = g_active_slot;
+    pthread_mutex_unlock(&g_state_lock);
     char new_count[16];
-    snprintf(new_count, sizeof(new_count), "%d", g_boot_attempt);
+    snprintf(new_count, sizeof(new_count), "%d", attempt);
 
     /* v1.2.7 fail-safe（缺陷 ④）：递增失败只告警。最坏情况 count 卡住
      * 永远到不了 max，坏固件反复崩溃直到 StartLimitBurst 耗尽——此处
@@ -496,18 +634,18 @@ void ota_post_boot_check(void)
         LOG_ERROR("ota: failed to persist boot_count=%d, rollback "
                   "threshold may never be reached "
                   "(StartLimitBurst is the last resort)",
-                  g_boot_attempt);
+                  attempt);
     }
 
     LOG_WARN("ota: trial boot attempt %d/%d on slot %c (confirm in %ds)",
-             g_boot_attempt, max_attempts,
-             g_active_slot ? 'B' : 'A',
+             attempt, max_attempts,
+             active_slot ? 'B' : 'A',
              g_cfg.boot_confirm_sec > 0 ? g_cfg.boot_confirm_sec
                                         : OTA_BOOT_CONFIRM_SEC_DEFAULT);
 
     ota_report_status("running",
                       "\"slot\":\"%c\",\"boot_attempt\":%d",
-                      g_active_slot ? 'B' : 'A', g_boot_attempt);
+                      active_slot ? 'B' : 'A', attempt);
 }
 
 /*
@@ -519,14 +657,20 @@ void ota_post_boot_check(void)
  */
 void ota_confirm_boot(void)
 {
-    if (!g_cfg.enabled || g_boot_attempt == 0)
+    /* P1-3: 锁内快照判定依据（g_boot_attempt / g_boot_time 由锁保护） */
+    pthread_mutex_lock(&g_state_lock);
+    int attempt = g_boot_attempt;
+    time_t boot_time = g_boot_time;
+    pthread_mutex_unlock(&g_state_lock);
+
+    if (!g_cfg.enabled || attempt == 0)
         return;   /* 已确认 / 未启用，no-op */
 
     int confirm_sec = g_cfg.boot_confirm_sec;
     if (confirm_sec <= 0)
         confirm_sec = OTA_BOOT_CONFIRM_SEC_DEFAULT;
 
-    if (difftime(time(NULL), g_boot_time) < (double)confirm_sec)
+    if (difftime(time(NULL), boot_time) < (double)confirm_sec)
         return;   /* 还没稳定运行够久 */
 
     /* v1.2.7 fail-safe（缺陷 ⑤）：必须先确认文件清零成功，再清内存标志。
@@ -538,17 +682,27 @@ void ota_confirm_boot(void)
         LOG_ERROR("ota: failed to clear boot_count, will retry in 5s");
         return;   /* 关键：内存标志保留，5s 后主循环再调 */
     }
-    g_boot_attempt = 0;   /* 文件清成功才清内存 */
+
+    pthread_mutex_lock(&g_state_lock);
+    /* 提交前复核：文件清零成功，但内存计数若已被其他线程改写
+     * （理论上不会），保留新值更安全 */
+    if (g_boot_attempt == attempt)
+        g_boot_attempt = 0;   /* 文件清成功才清内存 */
+    pthread_mutex_unlock(&g_state_lock);
 
     LOG_INFO("ota: boot confirmed healthy after %ds, counter cleared",
              confirm_sec);
+    pthread_mutex_lock(&g_state_lock);
+    int active_slot = g_active_slot;
+    pthread_mutex_unlock(&g_state_lock);
     ota_report_status("running", "\"slot\":\"%c\",\"confirmed\":true",
-                      g_active_slot ? 'B' : 'A');
+                      active_slot ? 'B' : 'A');
 }
 
-const char *ota_state_string(void)
+/* P1-3: 由已快照的状态枚举取名（无锁，配合调用方快照使用） */
+static const char *ota_state_string_from(enum ota_state s)
 {
-    switch (g_state) {
+    switch (s) {
     case OTA_STATE_IDLE:        return "idle";
     case OTA_STATE_DOWNLOADING: return "downloading";
     case OTA_STATE_VERIFYING:   return "verifying";
@@ -559,10 +713,21 @@ const char *ota_state_string(void)
     }
 }
 
+const char *ota_state_string(void)
+{
+    /* P1-3: 锁内快照后再取名，g_state 的读取全部经锁 */
+    pthread_mutex_lock(&g_state_lock);
+    enum ota_state snap = g_state;
+    pthread_mutex_unlock(&g_state_lock);
+    return ota_state_string_from(snap);
+}
+
 void ota_close(void)
 {
-    g_mqtt_publish = NULL;
+    pthread_mutex_lock(&g_state_lock);
     g_state = OTA_STATE_IDLE;
+    pthread_mutex_unlock(&g_state_lock);
+    g_mqtt_publish = NULL;
     LOG_INFO("ota closed");
 }
 
@@ -577,15 +742,30 @@ static void ota_report_status(const char *state, const char *extra_fmt, ...)
     if (!g_mqtt_publish)
         return;
 
+    /*
+     * P1-3: 锁内快照要上报的状态字段（g_target_version /
+     * g_current_version / g_download_pct 都由锁保护），随后解锁
+     * 再拼 payload 与发布——上层（step 函数）保证不持锁调用本函数，
+     * 此处加锁不会与调用方形成死锁。
+     */
+    char version[OTA_VERSION_MAX];
+    int pct;
+    pthread_mutex_lock(&g_state_lock);
+    if (g_target_version[0] != '\0')
+        snprintf(version, sizeof(version), "%s", g_target_version);
+    else
+        snprintf(version, sizeof(version), "%s", g_current_version);
+    pct = g_download_pct;
+    pthread_mutex_unlock(&g_state_lock);
+
     char payload[512];
     int off = snprintf(payload, sizeof(payload),
                        "{\"state\":\"%s\",\"version\":\"%s\"",
-                       state, g_target_version[0] ? g_target_version
-                                                  : g_current_version);
+                       state, version);
 
-    if (g_download_pct > 0 && g_download_pct < 100) {
+    if (pct > 0 && pct < 100) {
         off += snprintf(payload + off, sizeof(payload) - off,
-                        ",\"progress\":%d", g_download_pct);
+                        ",\"progress\":%d", pct);
     }
 
     if (extra_fmt) {
@@ -1346,11 +1526,14 @@ static int ota_switch_slot(int slot)
 {
     const char *slot_str = (slot == 0) ? "A" : "B";
 
+    /* P1-3: 文件写在锁外（写不成宁可不推进），成功后回锁更新内存 */
     if (ota_write_slot_file(OTA_CURRENT_SLOT_FILE, slot_str) != E_OK) {
         return E_IO;
     }
 
+    pthread_mutex_lock(&g_state_lock);
     g_active_slot = slot;
+    pthread_mutex_unlock(&g_state_lock);
     LOG_INFO("ota: switched to slot %s", slot_str);
     return E_OK;
 }
@@ -1358,75 +1541,89 @@ static int ota_switch_slot(int slot)
 /* ─── OTA 指令 JSON 解析 ────────────────────────────────── */
 
 /*
- * 极简 JSON 解析：提取 upgrade 指令的关键字段
+ * 严格 JSON 指令解析（P1-7/P1-8 修复，v1.2.9）：
  * 格式: {"cmd":"upgrade","version":"2.0.1","url":"http://...","checksum":"sha256:abc...","force":false}
+ *
+ * P1-7（payload 截断/越界读）：
+ *   旧实现用 strstr 直接在 payload 上扫，依赖 payload 以 NUL 结尾；
+ *   MQTT 消息长度由 payload_len 给出，libmosquitto 保证 NUL 结尾但
+ *   该契约未显式检查，且遇 ',' 即截断字段、无转义处理、超长静默截断。
+ *   新实现先把 [0, len) 拷贝到 NUL 终止的本地缓冲（len 上限
+ *   OTA_JSON_BUF_SIZE，超长直接拒绝），再用 json_get_string 提取：
+ *   键必须是对象成员（左侧为 '{' 或 ','）、值带完整转义检查、
+ *   超长拒绝而非截断、裸控制字符拒绝。
+ *
+ * P1-8（cmd 子串误匹配）：
+ *   旧实现 `strstr(json, "upgrade")`——"cmd":"upgradex" 甚至
+ *   url 里恰好含 "upgrade" 字样都会被当作升级指令。
+ *   新实现提取 cmd 字符串值后 strcmp 精确比较 "upgrade"。
+ *
+ * 调用方（ota_handle_message）持有 g_state_lock，本函数写
+ * g_target_* 全局是安全的。
  */
 static int ota_parse_upgrade_cmd(const char *json, int len)
 {
-    (void)len;
-
-    /* 查找 cmd 字段 */
-    const char *p = strstr(json, "\"cmd\"");
-    if (!p || !strstr(json, "upgrade")) {
-        LOG_ERROR("ota: not an upgrade command");
+    if (!json || len <= 0 || len >= OTA_JSON_BUF_SIZE) {
+        LOG_ERROR("ota: invalid payload length %d (max %d)",
+                  len, OTA_JSON_BUF_SIZE - 1);
         return E_INVAL;
     }
 
-    /* 清空目标字段 */
-    memset(g_target_version, 0, sizeof(g_target_version));
-    memset(g_download_url, 0, sizeof(g_download_url));
-    memset(g_expected_checksum, 0, sizeof(g_expected_checksum));
+    /* P1-7: 显式拷贝到 NUL 终止缓冲，解析不依赖调用方内存契约 */
+    char buf[OTA_JSON_BUF_SIZE];
+    memcpy(buf, json, (size_t)len);
+    buf[len] = '\0';
+    size_t buf_len = (size_t)len;
 
-    /* 提取 version */
-    p = strstr(json, "\"version\"");
-    if (p) {
-        p = strchr(p, ':');
-        if (p) {
-            p++; /* skip : */
-            while (*p == ' ' || *p == '"') p++;
-            int i = 0;
-            while (*p && *p != '"' && *p != ',' && i < OTA_VERSION_MAX - 1) {
-                g_target_version[i++] = *p++;
-            }
-            g_target_version[i] = '\0';
-        }
+    char cmd[16] = {0};
+    char version[OTA_VERSION_MAX] = {0};
+    char url[OTA_URL_MAX] = {0};
+    char checksum[OTA_CHECKSUM_MAX] = {0};
+
+    if (!json_get_string(buf, buf_len, "cmd", cmd, sizeof(cmd))) {
+        LOG_ERROR("ota: missing or malformed \"cmd\" field");
+        return E_INVAL;
     }
 
-    /* 提取 url */
-    p = strstr(json, "\"url\"");
-    if (p) {
-        p = strchr(p, ':');
-        if (p) {
-            p++;
-            while (*p == ' ' || *p == '"') p++;
-            int i = 0;
-            while (*p && *p != '"' && i < OTA_URL_MAX - 1) {
-                g_download_url[i++] = *p++;
-            }
-            g_download_url[i] = '\0';
-        }
+    /* P1-8: 精确比较，杜绝 "upgradex"/内嵌子串误匹配 */
+    if (strcmp(cmd, "upgrade") != 0) {
+        LOG_ERROR("ota: not an upgrade command (cmd=\"%s\")", cmd);
+        return E_INVAL;
     }
 
-    /* 提取 checksum */
-    p = strstr(json, "\"checksum\"");
-    if (p) {
-        p = strchr(p, ':');
-        if (p) {
-            p++;
-            while (*p == ' ' || *p == '"') p++;
-            int i = 0;
-            while (*p && *p != '"' && i < OTA_CHECKSUM_MAX - 1) {
-                g_expected_checksum[i++] = *p++;
-            }
-            g_expected_checksum[i] = '\0';
-        }
+    if (!json_get_string(buf, buf_len, "version",
+                         version, sizeof(version))) {
+        LOG_ERROR("ota: missing or malformed \"version\" field");
+        return E_INVAL;
+    }
+
+    if (!json_get_string(buf, buf_len, "url", url, sizeof(url))) {
+        LOG_ERROR("ota: missing or malformed \"url\" field");
+        return E_INVAL;
+    }
+
+    /* checksum 可缺省（空值走 VERIFYING 关卡时必然 mismatch → FAILED，
+     * fail-closed）；存在但超长/畸形则拒绝解析。 */
+    if (!json_get_string(buf, buf_len, "checksum",
+                         checksum, sizeof(checksum))) {
+        LOG_ERROR("ota: malformed \"checksum\" field");
+        return E_INVAL;
     }
 
     /* 校验必要字段 */
-    if (g_target_version[0] == '\0' || g_download_url[0] == '\0') {
+    if (version[0] == '\0' || url[0] == '\0') {
         LOG_ERROR("ota: upgrade cmd missing version or url");
         return E_INVAL;
     }
+
+    /* 提交到全局目标字段（调用方持锁） */
+    memset(g_target_version, 0, sizeof(g_target_version));
+    memset(g_download_url, 0, sizeof(g_download_url));
+    memset(g_expected_checksum, 0, sizeof(g_expected_checksum));
+    snprintf(g_target_version, sizeof(g_target_version), "%s", version);
+    snprintf(g_download_url, sizeof(g_download_url), "%s", url);
+    snprintf(g_expected_checksum, sizeof(g_expected_checksum), "%s",
+             checksum);
 
     LOG_INFO("ota parsed: version=%s url=%s checksum=%s",
              g_target_version, g_download_url,

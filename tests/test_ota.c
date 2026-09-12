@@ -27,7 +27,25 @@
  *   D. ota_write_slot_file 内部 rename 失败 → 补 LOG_ERROR 告警
  *      （fflush/fsync 失败分支无法在 tmpfs 稳定注入，未单测覆盖，
  *       由 src/ota.c 内注释说明、日志兜底）
+ *
+ * v1.2.9（P0-5 固件签名 + HTTPS + P1-14 响应头解析）新增用例：
+ *   E. 验签函数独立单测：有效签名通过 / 篡改固件拒绝 / 换密钥拒绝 /
+ *      .sig 缺失拒绝 / 公钥路径未配置或不可读拒绝
+ *   F. fail-closed：公钥未配置 → 升级指令直接拒绝（不降级 checksum-only）
+ *   G. http 全链路（响应头分两次 send 的 P1-14 路径）：有效签名 → 安装切槽
+ *   H. 签名不匹配（checksum 过、签名不过）→ FAILED 不切槽
+ *   I. .sig 404 → FAILED 不切槽
+ *   J. https 全链路（自签证书当 CA，IP SAN）→ 安装切槽
+ *   K. https 错误 CA → 下载失败 FAILED
+ *
+ * 兼容性说明：v1.2.6/v1.2.7 既有用例的断言零改动；仅测试脚手架随
+ * fail-closed 语义适配（make_v127_config 预置公钥路径；用例 C 的
+ * 一次性 HTTP 服务器升级为可服务 固件+.sig 的测试服务器）。
  */
+
+/* 先引 common.h：拿到 _POSIX_C_SOURCE/_DEFAULT_SOURCE 定义，
+ * 保证后续系统头暴露 usleep 等扩展声明 */
+#include "../src/common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,8 +60,11 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <openssl/evp.h>
-#include "../src/common.h"
+#include <openssl/ssl.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
 #include "../src/config.h"
 #include "../src/ota.h"
 
@@ -66,6 +87,19 @@ static void cleanup_test_dir(void)
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", g_test_dir);
     system(cmd);
+}
+
+/*
+ * v1.2.9 辅助：把测试公钥路径写入 cfg->public_key（fail-closed 要求
+ * 该字段非空，否则升级指令被直接拒绝）。经 512 字节中转缓冲构造并
+ * 断言不截断，避免 -Wformat-truncation 告警。
+ */
+static void set_test_pubkey(struct ota_config *cfg)
+{
+    char tmp[512];
+    int n = snprintf(tmp, sizeof(tmp), "%s/ota_pub.pem", g_test_dir);
+    assert(n > 0 && (size_t)n < sizeof(cfg->public_key));
+    memcpy(cfg->public_key, tmp, (size_t)n + 1);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -167,6 +201,8 @@ static void test_publish_callback(void)
     cfg.enabled = 1;
     strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
     cfg.boot_attempt_max = 3;
+    /* v1.2.9 fail-closed：公钥路径必须非空，否则升级指令被直接拒绝 */
+    set_test_pubkey(&cfg);
 
     assert(ota_init(&cfg, "test-client", "1.0.0") == E_OK);
 
@@ -218,6 +254,8 @@ static void test_json_parsing(void)
     cfg.enabled = 1;
     strncpy(cfg.slot_dir, g_test_dir, sizeof(cfg.slot_dir) - 1);
     cfg.boot_attempt_max = 3;
+    /* v1.2.9 fail-closed：公钥路径必须非空（仅进 downloading 用） */
+    set_test_pubkey(&cfg);
 
     assert(ota_init(&cfg, "test-client", "1.0.0") == E_OK);
 
@@ -268,7 +306,9 @@ static void test_config_parsing(void)
         "broker_port = 1883\n"
         "ota_enabled = 1\n"
         "ota_slot_dir = /mnt/ota/test\n"
-        "ota_boot_attempt_max = 5\n";
+        "ota_boot_attempt_max = 5\n"
+        "ota_public_key = /etc/embmqttnode/ota_pub.pem\n"
+        "ota_ca_file = /etc/embmqttnode/ota_ca.pem\n";
 
     FILE *fp = fopen(tmp_path, "w");
     assert(fp);
@@ -282,6 +322,10 @@ static void test_config_parsing(void)
     assert(cfg.ota.enabled == 1);
     assert(strcmp(cfg.ota.slot_dir, "/mnt/ota/test") == 0);
     assert(cfg.ota.boot_attempt_max == 5);
+    assert(strcmp(cfg.ota.public_key,
+                  "/etc/embmqttnode/ota_pub.pem") == 0);
+    assert(strcmp(cfg.ota.ca_file,
+                  "/etc/embmqttnode/ota_ca.pem") == 0);
     printf("  ota config parsed ok:   PASS\n");
 
     remove(tmp_path);
@@ -613,6 +657,10 @@ static void make_v127_config(struct ota_config *cfg)
     strncpy(cfg->slot_dir, g_test_dir, sizeof(cfg->slot_dir) - 1);
     cfg->boot_attempt_max = 3;
     cfg->boot_confirm_sec = 300;
+    /* v1.2.9 fail-closed：公钥路径必须非空，否则升级指令被直接拒绝。
+     * 公钥文件按需由各用例生成到该路径；未触达 VERIFYING 的用例
+     * （回滚/健康确认等）不需要文件真实存在。 */
+    set_test_pubkey(cfg);
 }
 
 /*
@@ -798,13 +846,115 @@ static void test_sha256_hex(const void *data, size_t len,
     out[off] = '\0';
 }
 
+/* ── v1.2.9 测试辅助：文件 / 密钥 / 证书 / 测试服务器 ───────── */
+
+/* 写原始字节到文件 */
+static void write_file_bytes(const char *path, const void *data, size_t len)
+{
+    FILE *fp = fopen(path, "wb");
+    assert(fp != NULL);
+    assert(fwrite(data, 1, len, fp) == len);
+    fclose(fp);
+}
+
+/* 生成确定模式的伪固件内容 */
+static void fill_fw(char *fw, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+        fw[i] = (char)(i * 7 + 3);
+}
+
+/* 生成 RSA-2048 密钥对；pubkey_out_path 非 NULL 时导出公钥 PEM。
+ * 返回 EVP_PKEY（调用方 EVP_PKEY_free）。 */
+static EVP_PKEY *test_gen_rsa_key(const char *pubkey_out_path)
+{
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    assert(pctx != NULL);
+    assert(EVP_PKEY_keygen_init(pctx) == 1);
+    assert(EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) == 1);
+    EVP_PKEY *pkey = NULL;
+    assert(EVP_PKEY_keygen(pctx, &pkey) == 1 && pkey != NULL);
+    EVP_PKEY_CTX_free(pctx);
+
+    if (pubkey_out_path) {
+        BIO *bio = BIO_new_file(pubkey_out_path, "w");
+        assert(bio != NULL);
+        assert(PEM_write_bio_PUBKEY(bio, pkey) == 1);
+        BIO_free(bio);
+    }
+    return pkey;
+}
+
+/* 对数据做 SHA256 签名（与设备侧 ota_verify_signature 的 RSA 路径对应） */
+static void test_sign_data(EVP_PKEY *pkey, const void *data, size_t len,
+                           unsigned char *sig, size_t *sig_len)
+{
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    assert(ctx != NULL);
+    assert(EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, pkey) == 1);
+    assert(EVP_DigestSignUpdate(ctx, data, len) == 1);
+
+    size_t need = 0;
+    assert(EVP_DigestSignFinal(ctx, NULL, &need) == 1);
+    assert(need <= *sig_len);
+    assert(EVP_DigestSignFinal(ctx, sig, &need) == 1);
+    *sig_len = need;
+    EVP_MD_CTX_free(ctx);
+}
+
+/* 用 openssl CLI 生成自签证书（含 IP SAN 127.0.0.1），既是服务端证书
+ * 也是测试用 CA（与设备侧 X509_check_ip_asc 校验路径配套） */
+static void gen_self_signed_cert(const char *cert_path, const char *key_path)
+{
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "openssl req -x509 -newkey rsa:2048 -nodes -days 1 "
+             "-subj /CN=127.0.0.1 "
+             "-addext subjectAltName=IP:127.0.0.1 "
+             "-keyout '%s' -out '%s' >/dev/null 2>&1",
+             key_path, cert_path);
+    int rc = system(cmd);
+    assert(rc != -1);
+    struct stat st;
+    assert(stat(cert_path, &st) == 0 && st.st_size > 0);
+}
+
+/* 测试服务器连接发送（TLS / 裸 socket 自适应），返回已发送字节数 */
+static int srv_conn_send(SSL *ssl, int fd, const char *buf, int len)
+{
+    int off = 0;
+    while (off < len) {
+        ssize_t n;
+        if (ssl) {
+            n = SSL_write(ssl, buf + off, len - off);
+        } else {
+            n = write(fd, buf + off, (size_t)(len - off));
+        }
+        if (n <= 0)
+            return -1;
+        off += (int)n;
+    }
+    return len;
+}
+
 /*
- * v1.2.7 辅助：fork 一个一次性 HTTP 服务器（监听 127.0.0.1 临时端口），
- * 对第一个连接返回 "HTTP/1.0 200 OK" + body。端口号经管道回传父进程。
- * alarm(30) 兜底：父进程意外失败时子进程不会永久阻塞在 accept。
+ * v1.2.9 辅助：fork 一个一次性测试服务器（监听 127.0.0.1 临时端口），
+ * 替代 v1.2.7 的单请求 start_local_http_server（fail-closed 后设备
+ * 每次升级要连两次：固件 + .sig）。
+ *
+ *   use_tls       1 = HTTPS（tls_cert/tls_key 为 PEM 路径）
+ *   fw/fw_len     固件请求的 200 响应体
+ *   sig/sig_len   ".sig" 请求的 200 响应体；sig==NULL 时 .sig 请求回 404
+ *   split_header  1 = 响应头拆两次 send（半截头 + 剩余头，P1-14 用例）
+ *
+ * 服务器循环处理多个连接，直到父进程 SIGTERM 回收（alarm 兜底）。
+ * 端口号经管道回传父进程。
  */
-static pid_t start_local_http_server(const char *body, int body_len,
-                                     int *port_out)
+static pid_t start_ota_test_server(int use_tls,
+                                   const char *tls_cert, const char *tls_key,
+                                   const void *fw, int fw_len,
+                                   const void *sig, int sig_len,
+                                   int split_header, int *port_out)
 {
     int fds[2];
     assert(pipe(fds) == 0);
@@ -814,9 +964,10 @@ static pid_t start_local_http_server(const char *body, int body_len,
     assert(pid >= 0);
 
     if (pid == 0) {
-        /* ── 子进程：一次性 HTTP 服务器 ── */
+        /* ── 子进程：一次性 HTTP(S) 服务器 ── */
         close(fds[0]);
-        alarm(30);
+        alarm(60);
+        signal(SIGPIPE, SIG_IGN);
 
         int srv = socket(AF_INET, SOCK_STREAM, 0);
         assert(srv >= 0);
@@ -827,8 +978,10 @@ static pid_t start_local_http_server(const char *body, int body_len,
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port        = 0;              /* 内核分配临时端口 */
 
+        int one = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         assert(bind(srv, (struct sockaddr *)&addr, sizeof(addr)) == 0);
-        assert(listen(srv, 1) == 0);
+        assert(listen(srv, 4) == 0);
 
         struct sockaddr_in real;
         socklen_t rlen = sizeof(real);
@@ -841,41 +994,102 @@ static pid_t start_local_http_server(const char *body, int body_len,
         assert((int)write(fds[1], msg, (size_t)m) == m);
         close(fds[1]);
 
-        /* 接受一次连接，读完请求头即应答 */
-        int c = accept(srv, NULL, NULL);
-        assert(c >= 0);
+        /* 循环服务多个连接（固件 + .sig 各一次请求） */
+        for (;;) {
+            int c = accept(srv, NULL, NULL);
+            if (c < 0)
+                continue;
 
-        char req[2048];
-        int total = 0;
-        while (total < (int)sizeof(req) - 1) {
-            ssize_t n = read(c, req + total, sizeof(req) - 1 - (size_t)total);
-            if (n <= 0)
-                break;
-            total += (int)n;
-            req[total] = '\0';
-            if (strstr(req, "\r\n\r\n"))
-                break;
+            SSL     *ssl  = NULL;
+            SSL_CTX *sctx = NULL;
+            if (use_tls) {
+                sctx = SSL_CTX_new(TLS_server_method());
+                assert(sctx != NULL);
+                assert(SSL_CTX_use_certificate_file(
+                           sctx, tls_cert, SSL_FILETYPE_PEM) == 1);
+                assert(SSL_CTX_use_PrivateKey_file(
+                           sctx, tls_key, SSL_FILETYPE_PEM) == 1);
+                ssl = SSL_new(sctx);
+                assert(ssl != NULL);
+                SSL_set_fd(ssl, c);
+                if (SSL_accept(ssl) != 1) {
+                    SSL_free(ssl);
+                    SSL_CTX_free(sctx);
+                    close(c);
+                    continue;
+                }
+            }
+
+            /* 读完请求头（判断请求的是固件还是 .sig） */
+            char req[2048] = {0};
+            int total = 0;
+            while (total < (int)sizeof(req) - 1) {
+                ssize_t n;
+                if (ssl) {
+                    n = SSL_read(ssl, req + total,
+                                 sizeof(req) - 1 - (size_t)total);
+                } else {
+                    n = read(c, req + total,
+                             sizeof(req) - 1 - (size_t)total);
+                }
+                if (n <= 0)
+                    break;
+                total += (int)n;
+                req[total] = '\0';
+                if (strstr(req, "\r\n\r\n"))
+                    break;
+            }
+
+            int    is_sig   = (strstr(req, ".sig") != NULL);
+            int    code     = 200;
+            /* fw/sig 为二进制（签名字节），统一按 const char * 处理 */
+            const char *body     = is_sig ? (const char *)sig
+                                          : (const char *)fw;
+            int         body_len = is_sig ? sig_len : fw_len;
+            if (is_sig && (!sig || sig_len <= 0)) {
+                /* 用例 I：签名文件缺失 → 404 */
+                code     = 404;
+                body     = "not found";
+                body_len = 9;
+            }
+
+            char hdr[256];
+            int h = snprintf(hdr, sizeof(hdr),
+                             "HTTP/1.0 %d %s\r\n"
+                             "Content-Type: application/octet-stream\r\n"
+                             "Content-Length: %d\r\n"
+                             "Connection: close\r\n"
+                             "\r\n",
+                             code, code == 200 ? "OK" : "Not Found",
+                             body_len);
+
+            if (split_header) {
+                /* P1-14 用例：半截头一次 send，间隔后发剩余头 + body */
+                int half = h / 2;
+                assert(srv_conn_send(ssl, c, hdr, half) == half);
+                usleep(20000);
+                assert(srv_conn_send(ssl, c, hdr + half, h - half)
+                       == h - half);
+            } else {
+                assert(srv_conn_send(ssl, c, hdr, h) == h);
+            }
+
+            int off = 0;
+            while (off < body_len) {
+                int w = srv_conn_send(ssl, c, body + off, body_len - off);
+                assert(w > 0);
+                off += w;
+            }
+
+            if (ssl) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+            }
+            if (sctx)
+                SSL_CTX_free(sctx);
+            close(c);
         }
-
-        char hdr[256];
-        int h = snprintf(hdr, sizeof(hdr),
-                         "HTTP/1.0 200 OK\r\n"
-                         "Content-Type: application/octet-stream\r\n"
-                         "Content-Length: %d\r\n"
-                         "Connection: close\r\n"
-                         "\r\n", body_len);
-        assert((int)write(c, hdr, (size_t)h) == h);
-
-        int off = 0;
-        while (off < body_len) {
-            ssize_t w = write(c, body + off, (size_t)(body_len - off));
-            assert(w > 0);
-            off += (int)w;
-        }
-        shutdown(c, SHUT_WR);
-        close(c);
-        close(srv);
-        _exit(0);
+        _exit(0);   /* 不可达 */
     }
 
     /* ── 父进程：读取端口号 ── */
@@ -888,6 +1102,14 @@ static pid_t start_local_http_server(const char *body, int body_len,
     *port_out = atoi(msg);
     assert(*port_out > 0);
     return pid;
+}
+
+/* SIGTERM 回收测试服务器子进程 */
+static void stop_test_server(pid_t pid)
+{
+    kill(pid, SIGTERM);
+    int status = 0;
+    waitpid(pid, &status, 0);
 }
 
 /*
@@ -914,8 +1136,25 @@ static void test_install_persist_fail_aborts(void)
     char sha[128];
     test_sha256_hex(fw, sizeof(fw), sha, sizeof(sha));
 
+    /* v1.2.9 fail-closed 脚手架适配：生成 RSA 密钥对并对固件签名，
+     * 公钥写到 make_v127_config 约定的 <g_test_dir>/ota_pub.pem，
+     * 测试服务器同时服务固件与 .sig（设备侧断言保持零改动） */
+    char pubkey_path[512];
+    snprintf(pubkey_path, sizeof(pubkey_path), "%s/ota_pub.pem", g_test_dir);
+    EVP_PKEY *pkey = test_gen_rsa_key(pubkey_path);
+    assert(pkey != NULL);
+
+    unsigned char sig[512];
+    size_t sig_len = sizeof(sig);
+    test_sign_data(pkey, fw, sizeof(fw), sig, &sig_len);
+    char sig_path[512];
+    snprintf(sig_path, sizeof(sig_path), "%s/ota_fw_c.sig", g_test_dir);
+    write_file_bytes(sig_path, sig, sig_len);
+
     int port = 0;
-    pid_t srv = start_local_http_server(fw, (int)sizeof(fw), &port);
+    pid_t srv = start_ota_test_server(0, NULL, NULL,
+                                      fw, (int)sizeof(fw),
+                                      sig, (int)sig_len, 0, &port);
     assert(port > 0);
 
     struct ota_config cfg;
@@ -978,13 +1217,10 @@ static void test_install_persist_fail_aborts(void)
     assert(strcmp(ota_state_string(), "idle") == 0);
     printf("  failed resets to idle:       PASS\n");
 
-    /* 回收 HTTP 服务器子进程 */
-    int status = 0;
-    pid_t r = waitpid(srv, &status, 0);
-    assert(r == srv);
-    assert(WIFEXITED(status));
-    assert(WEXITSTATUS(status) == 0);
+    /* 回收测试服务器子进程（SIGTERM；循环服务型，不再期望自然退出） */
+    stop_test_server(srv);
 
+    EVP_PKEY_free(pkey);
     ota_close();
     clear_write_fail("boot_count");
     cleanup_test_dir();
@@ -1069,6 +1305,532 @@ static void test_write_rename_fail_logs_error(void)
     cleanup_test_dir();
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * v1.2.9 测试（P0-5 固件签名 fail-closed + HTTPS + P1-14）
+ * ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 用例 E：ota_verify_signature 独立单测。
+ * 覆盖：有效签名 / 篡改固件 / 换密钥 / .sig 缺失 / 公钥路径未配置 /
+ * 公钥文件不可读。
+ */
+static void test_sig_verify_unit(void)
+{
+    printf("--- test_sig_verify_unit (v1.2.9 E) ---\n");
+
+    setup_test_dir();
+
+    char fw[512];
+    fill_fw(fw, sizeof(fw));
+
+    char fw_path[512], sig_path[512], pub_path[512];
+    snprintf(fw_path,  sizeof(fw_path),  "%s/unit_fw.bin",  g_test_dir);
+    snprintf(sig_path, sizeof(sig_path), "%s/unit_fw.sig",  g_test_dir);
+    snprintf(pub_path, sizeof(pub_path), "%s/unit_pub.pem", g_test_dir);
+    write_file_bytes(fw_path, fw, sizeof(fw));
+
+    EVP_PKEY *pkey = test_gen_rsa_key(pub_path);
+    assert(pkey != NULL);
+
+    unsigned char sig[512];
+    size_t sig_len = sizeof(sig);
+    test_sign_data(pkey, fw, sizeof(fw), sig, &sig_len);
+    write_file_bytes(sig_path, sig, sig_len);
+
+    /* 1. 有效签名 → E_OK */
+    assert(ota_verify_signature(fw_path, sig_path, pub_path) == E_OK);
+    printf("  valid signature accepted:        PASS\n");
+
+    /* 2. 篡改固件（1 字节）→ 拒绝 */
+    char fw_tamper[512];
+    snprintf(fw_tamper, sizeof(fw_tamper),
+             "%s/unit_fw_tampered.bin", g_test_dir);
+    fw[10] ^= 0xFF;
+    write_file_bytes(fw_tamper, fw, sizeof(fw));
+    fw[10] ^= 0xFF;
+    assert(ota_verify_signature(fw_tamper, sig_path, pub_path) != E_OK);
+    printf("  tampered firmware rejected:      PASS\n");
+
+    /* 3. 换密钥（另一把私钥签的固件，配本钥匙公钥验）→ 拒绝 */
+    char pub2_path[512], sig2_path[512];
+    snprintf(pub2_path, sizeof(pub2_path), "%s/unit_pub2.pem", g_test_dir);
+    snprintf(sig2_path, sizeof(sig2_path), "%s/unit_fw_other.sig", g_test_dir);
+    EVP_PKEY *other = test_gen_rsa_key(pub2_path);
+    assert(other != NULL);
+    unsigned char sig2[512];
+    size_t sig2_len = sizeof(sig2);
+    test_sign_data(other, fw, sizeof(fw), sig2, &sig2_len);
+    write_file_bytes(sig2_path, sig2, sig2_len);
+    assert(ota_verify_signature(fw_path, sig2_path, pub_path) != E_OK);
+    printf("  wrong-key signature rejected:    PASS\n");
+    EVP_PKEY_free(other);
+
+    /* 4. .sig 文件缺失 → 拒绝 */
+    assert(ota_verify_signature(fw_path, "/nonexistent/fw.sig",
+                                pub_path) != E_OK);
+    printf("  missing sig file rejected:       PASS\n");
+
+    /* 5. 公钥路径未配置（空串）→ 拒绝 */
+    assert(ota_verify_signature(fw_path, sig_path, "") != E_OK);
+    printf("  empty pubkey path rejected:      PASS\n");
+
+    /* 6. 公钥文件不可读 → 拒绝 */
+    assert(ota_verify_signature(fw_path, sig_path,
+                                "/nonexistent/ota_pub.pem") != E_OK);
+    printf("  unreadable pubkey rejected:      PASS\n");
+
+    EVP_PKEY_free(pkey);
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 F：fail-closed 核心语义——公钥未配置时升级指令直接拒绝，
+ * 不进入 DOWNLOADING（绝不降级回 checksum-only）。
+ */
+static void test_pubkey_unconfigured_rejected(void)
+{
+    printf("--- test_pubkey_unconfigured_rejected (v1.2.9 F) ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+
+    struct ota_config cfg;
+    make_v127_config(&cfg);
+    cfg.public_key[0] = '\0';   /* 关键：未配置公钥 */
+
+    assert(ota_init(&cfg, "test-client", "1.2.9") == E_OK);
+    ota_set_mqtt_publish(test_publish_cb);
+
+    const char *json =
+        "{\"cmd\":\"upgrade\",\"version\":\"2.0.0\","
+        "\"url\":\"http://127.0.0.1:1/fw.bin\","
+        "\"checksum\":\"sha256:abc\"}";
+
+    g_test_publish_called = 0;
+    g_test_publish_payload[0] = '\0';
+    ota_handle_message(json, (int)strlen(json));
+
+    /* 指令被直接拒绝：不进入 downloading */
+    assert(strcmp(ota_state_string(), "idle") == 0);
+    printf("  upgrade cmd rejected (idle):     PASS\n");
+
+    /* 上报 error */
+    assert(g_test_publish_called == 1);
+    assert(strstr(g_test_publish_payload, "\"error\"") != NULL);
+    printf("  error status reported:           PASS\n");
+
+    /* 状态机推进 no-op（没有开始任何下载） */
+    assert(ota_check_and_handle() == 0);
+    printf("  no download attempted:           PASS\n");
+
+    ota_close();
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 G：http 全链路 + P1-14。
+ * 服务器把响应头拆成两次 send（半截头 + 剩余头+body），设备侧用
+ * 累积缓冲解析必须正确切分且不丢 body 字节（固件 SHA256 匹配 +
+ * 槽内固件字节数完整即证明）。有效签名 → 安装切槽 → 试用计数。
+ */
+static void test_full_chain_signature_ok(void)
+{
+    printf("--- test_full_chain_signature_ok (v1.2.9 G) ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+
+    char fw[1024];
+    fill_fw(fw, sizeof(fw));
+    char sha[128];
+    test_sha256_hex(fw, sizeof(fw), sha, sizeof(sha));
+
+    char pubkey_path[512], sig_path[512];
+    snprintf(pubkey_path, sizeof(pubkey_path),
+             "%s/ota_pub.pem", g_test_dir);
+    snprintf(sig_path, sizeof(sig_path), "%s/fw_ok.sig", g_test_dir);
+
+    EVP_PKEY *pkey = test_gen_rsa_key(pubkey_path);
+    assert(pkey != NULL);
+    unsigned char sig[512];
+    size_t sig_len = sizeof(sig);
+    test_sign_data(pkey, fw, sizeof(fw), sig, &sig_len);
+    write_file_bytes(sig_path, sig, sig_len);
+
+    int port = 0;
+    /* split_header=1：响应头分两次 send（P1-14 累积缓冲解析路径） */
+    pid_t srv = start_ota_test_server(0, NULL, NULL,
+                                      fw, (int)sizeof(fw),
+                                      sig, (int)sig_len, 1, &port);
+
+    struct ota_config cfg;
+    make_v127_config(&cfg);
+    assert(ota_init(&cfg, "test-client", "1.2.9") == E_OK);
+
+    char json[768];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"upgrade\",\"version\":\"3.0.0\","
+             "\"url\":\"http://127.0.0.1:%d/fw.bin\","
+             "\"checksum\":\"sha256:%s\"}", port, sha);
+
+    fflush(NULL);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        /* 子进程：全链路 下载→校验→安装→切槽 → REBOOTING exit(42) */
+        ota_handle_message(json, (int)strlen(json));
+        while (ota_check_and_handle() == 1)
+            ;
+        _exit(99);   /* 不应到达 */
+    }
+
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 42);
+    printf("  full chain upgrade, exit 42:     PASS\n");
+
+    ota_close();
+
+    /* 切槽成功：current_slot=B、boot_count=1（进入试用） */
+    char buf[16] = {0};
+    assert(read_slot_file("current_slot", buf, sizeof(buf)) > 0);
+    assert(buf[0] == 'B');
+    printf("  slot switched to B:              PASS\n");
+
+    assert(read_slot_file("boot_count", buf, sizeof(buf)) > 0);
+    assert(strstr(buf, "1") != NULL);
+    printf("  boot_count=1 (trial):            PASS\n");
+
+    /* 固件字节完整落槽（分片头解析无丢字节） */
+    char fwpath[512];
+    struct stat st;
+    snprintf(fwpath, sizeof(fwpath), "%s/slot_b/embmqttnode", g_test_dir);
+    assert(stat(fwpath, &st) == 0);
+    assert(st.st_size == (off_t)sizeof(fw));
+    printf("  firmware intact in slot_b:       PASS\n");
+
+    stop_test_server(srv);
+    EVP_PKEY_free(pkey);
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 H：签名不匹配——服务器下发的固件与被签名的固件内容不同，
+ * 但 checksum 按下发固件计算（checksum 关通过），签名关必须拦截。
+ * 验证 FAILED、不切槽、boot_count 不动、可复位重试。
+ */
+static void test_full_chain_sig_mismatch(void)
+{
+    printf("--- test_full_chain_sig_mismatch (v1.2.9 H) ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "0\n");
+
+    char fw_served[1024], fw_signed[1024];
+    fill_fw(fw_served, sizeof(fw_served));
+    fill_fw(fw_signed, sizeof(fw_signed));
+    fw_served[100] = (char)(fw_served[100] + 1);   /* 仅差 1 字节 */
+
+    /* checksum 按下发的 fw_served 计算 → checksum 关放行 */
+    char sha[128];
+    test_sha256_hex(fw_served, sizeof(fw_served), sha, sizeof(sha));
+
+    char pubkey_path[512], sig_path[512];
+    snprintf(pubkey_path, sizeof(pubkey_path),
+             "%s/ota_pub.pem", g_test_dir);
+    snprintf(sig_path, sizeof(sig_path), "%s/fw_mismatch.sig", g_test_dir);
+
+    EVP_PKEY *pkey = test_gen_rsa_key(pubkey_path);
+    assert(pkey != NULL);
+    unsigned char sig[512];
+    size_t sig_len = sizeof(sig);
+    test_sign_data(pkey, fw_signed, sizeof(fw_signed), sig, &sig_len);
+    write_file_bytes(sig_path, sig, sig_len);
+
+    int port = 0;
+    pid_t srv = start_ota_test_server(0, NULL, NULL,
+                                      fw_served, (int)sizeof(fw_served),
+                                      sig, (int)sig_len, 0, &port);
+
+    struct ota_config cfg;
+    make_v127_config(&cfg);
+    assert(ota_init(&cfg, "test-client", "1.2.9") == E_OK);
+
+    char json[768];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"upgrade\",\"version\":\"9.9.9\","
+             "\"url\":\"http://127.0.0.1:%d/fw.bin\","
+             "\"checksum\":\"sha256:%s\"}", port, sha);
+    ota_handle_message(json, (int)strlen(json));
+
+    int rc = ota_check_and_handle();    /* DOWNLOADING：固件+.sig 均下载 */
+    assert(rc == 1);
+    assert(strcmp(ota_state_string(), "verifying") == 0);
+
+    rc = ota_check_and_handle();        /* checksum 过、签名不过 → FAILED */
+    assert(rc == 1);
+    assert(strcmp(ota_state_string(), "failed") == 0);
+    printf("  sig mismatch → FAILED:           PASS\n");
+
+    /* 不切槽、不写 boot_count=1 */
+    char buf[16] = {0};
+    assert(read_slot_file("current_slot", buf, sizeof(buf)) > 0);
+    assert(buf[0] == 'A');
+    printf("  current_slot stays A:            PASS\n");
+
+    assert(read_slot_file("boot_count", buf, sizeof(buf)) > 0);
+    assert(strspn(buf, "0\n") >= 1);
+    printf("  boot_count stays 0:              PASS\n");
+
+    rc = ota_check_and_handle();        /* FAILED → IDLE（可重试） */
+    assert(rc == 0);
+    assert(strcmp(ota_state_string(), "idle") == 0);
+    printf("  failed resets to idle:           PASS\n");
+
+    stop_test_server(srv);
+    EVP_PKEY_free(pkey);
+    ota_close();
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 I：.sig 下载 404（中间人剥离签名 / 源站部署不全）→
+ * fail-closed，下载阶段即 FAILED，不进入校验/安装。
+ */
+static void test_sig_download_missing(void)
+{
+    printf("--- test_sig_download_missing (v1.2.9 I) ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "0\n");
+
+    char fw[1024];
+    fill_fw(fw, sizeof(fw));
+    char sha[128];
+    test_sha256_hex(fw, sizeof(fw), sha, sizeof(sha));
+
+    char pubkey_path[512];
+    snprintf(pubkey_path, sizeof(pubkey_path),
+             "%s/ota_pub.pem", g_test_dir);
+    EVP_PKEY *pkey = test_gen_rsa_key(pubkey_path);
+    assert(pkey != NULL);
+
+    int port = 0;
+    /* sig=NULL → .sig 请求回 404 */
+    pid_t srv = start_ota_test_server(0, NULL, NULL,
+                                      fw, (int)sizeof(fw),
+                                      NULL, 0, 0, &port);
+
+    struct ota_config cfg;
+    make_v127_config(&cfg);
+    assert(ota_init(&cfg, "test-client", "1.2.9") == E_OK);
+
+    char json[768];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"upgrade\",\"version\":\"9.9.8\","
+             "\"url\":\"http://127.0.0.1:%d/fw.bin\","
+             "\"checksum\":\"sha256:%s\"}", port, sha);
+    ota_handle_message(json, (int)strlen(json));
+
+    int rc = ota_check_and_handle();    /* 固件下载 OK，.sig 404 → FAILED */
+    assert(rc == 1);
+    assert(strcmp(ota_state_string(), "failed") == 0);
+    printf("  sig 404 → FAILED:                PASS\n");
+
+    char buf[16] = {0};
+    assert(read_slot_file("current_slot", buf, sizeof(buf)) > 0);
+    assert(buf[0] == 'A');
+    printf("  current_slot stays A:            PASS\n");
+
+    assert(read_slot_file("boot_count", buf, sizeof(buf)) > 0);
+    assert(strspn(buf, "0\n") >= 1);
+    printf("  boot_count stays 0:              PASS\n");
+
+    rc = ota_check_and_handle();
+    assert(rc == 0);
+    assert(strcmp(ota_state_string(), "idle") == 0);
+    printf("  failed resets to idle:           PASS\n");
+
+    stop_test_server(srv);
+    EVP_PKEY_free(pkey);
+    ota_close();
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 J：https 全链路。自签证书（IP SAN 127.0.0.1）既是服务端证书
+ * 也是信任 CA（ota_ca_file 指向），TLS 握手 + 证书链 + 主机名/IP 校验
+ * 全部通过 → 下载 → 验签 → 安装切槽（fork，exit 42）。
+ */
+static void test_https_full_chain(void)
+{
+    printf("--- test_https_full_chain (v1.2.9 J) ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+
+    /* 自签证书 + 私钥（openssl CLI 生成，含 IP SAN） */
+    char cert[512], cakey[512];
+    snprintf(cert,  sizeof(cert),  "%s/tls_cert.pem", g_test_dir);
+    snprintf(cakey, sizeof(cakey), "%s/tls_key.pem",  g_test_dir);
+    gen_self_signed_cert(cert, cakey);
+
+    char fw[1024];
+    fill_fw(fw, sizeof(fw));
+    char sha[128];
+    test_sha256_hex(fw, sizeof(fw), sha, sizeof(sha));
+
+    char pubkey_path[512], sig_path[512];
+    snprintf(pubkey_path, sizeof(pubkey_path),
+             "%s/ota_pub.pem", g_test_dir);
+    snprintf(sig_path, sizeof(sig_path), "%s/fw_https.sig", g_test_dir);
+
+    EVP_PKEY *pkey = test_gen_rsa_key(pubkey_path);
+    assert(pkey != NULL);
+    unsigned char sig[512];
+    size_t sig_len = sizeof(sig);
+    test_sign_data(pkey, fw, sizeof(fw), sig, &sig_len);
+    write_file_bytes(sig_path, sig, sig_len);
+
+    int port = 0;
+    pid_t srv = start_ota_test_server(1, cert, cakey,
+                                      fw, (int)sizeof(fw),
+                                      sig, (int)sig_len, 0, &port);
+
+    struct ota_config cfg;
+    make_v127_config(&cfg);
+    /* 设备侧信任自签 CA（测试 CA 锚点手法，见任务说明） */
+    strncpy(cfg.ca_file, cert, sizeof(cfg.ca_file) - 1);
+    cfg.ca_file[sizeof(cfg.ca_file) - 1] = '\0';
+
+    assert(ota_init(&cfg, "test-client", "1.2.9") == E_OK);
+
+    char json[768];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"upgrade\",\"version\":\"4.0.0\","
+             "\"url\":\"https://127.0.0.1:%d/fw.bin\","
+             "\"checksum\":\"sha256:%s\"}", port, sha);
+
+    fflush(NULL);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        ota_handle_message(json, (int)strlen(json));
+        while (ota_check_and_handle() == 1)
+            ;
+        _exit(99);   /* 不应到达 */
+    }
+
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 42);
+    printf("  https full chain, exit 42:       PASS\n");
+
+    ota_close();
+
+    char buf[16] = {0};
+    assert(read_slot_file("current_slot", buf, sizeof(buf)) > 0);
+    assert(buf[0] == 'B');
+    printf("  slot switched to B:              PASS\n");
+
+    assert(read_slot_file("boot_count", buf, sizeof(buf)) > 0);
+    assert(strstr(buf, "1") != NULL);
+    printf("  boot_count=1 (trial):            PASS\n");
+
+    char fwpath[512];
+    struct stat st;
+    snprintf(fwpath, sizeof(fwpath), "%s/slot_b/embmqttnode", g_test_dir);
+    assert(stat(fwpath, &st) == 0);
+    assert(st.st_size == (off_t)sizeof(fw));
+    printf("  firmware intact in slot_b:       PASS\n");
+
+    stop_test_server(srv);
+    EVP_PKEY_free(pkey);
+    cleanup_test_dir();
+}
+
+/*
+ * 用例 K：证书校验失败——设备信任的 CA 与服务端证书不匹配（错 CA），
+ * TLS 握手必须失败（SSL_VERIFY_PEER），下载失败 → FAILED。
+ */
+static void test_https_bad_ca_rejected(void)
+{
+    printf("--- test_https_bad_ca_rejected (v1.2.9 K) ---\n");
+
+    setup_test_dir();
+    write_slot_file("current_slot", "A\n");
+    write_slot_file("boot_count",   "0\n");
+
+    /* 服务端证书（pair1）与设备信任的 CA（pair2）是两套独立密钥 */
+    char cert[512], cakey[512], wrongca[512], wrongkey[512];
+    snprintf(cert,     sizeof(cert),     "%s/tls_cert.pem", g_test_dir);
+    snprintf(cakey,    sizeof(cakey),    "%s/tls_key.pem",  g_test_dir);
+    snprintf(wrongca,  sizeof(wrongca),  "%s/wrong_ca.pem", g_test_dir);
+    snprintf(wrongkey, sizeof(wrongkey), "%s/wrong_key.pem", g_test_dir);
+    gen_self_signed_cert(cert, cakey);
+    gen_self_signed_cert(wrongca, wrongkey);   /* 另一套独立密钥的错 CA */
+
+    char fw[1024];
+    fill_fw(fw, sizeof(fw));
+    char sha[128];
+    test_sha256_hex(fw, sizeof(fw), sha, sizeof(sha));
+
+    char pubkey_path[512], sig_path[512];
+    snprintf(pubkey_path, sizeof(pubkey_path),
+             "%s/ota_pub.pem", g_test_dir);
+    snprintf(sig_path, sizeof(sig_path), "%s/fw_badca.sig", g_test_dir);
+
+    EVP_PKEY *pkey = test_gen_rsa_key(pubkey_path);
+    assert(pkey != NULL);
+    unsigned char sig[512];
+    size_t sig_len = sizeof(sig);
+    test_sign_data(pkey, fw, sizeof(fw), sig, &sig_len);
+    write_file_bytes(sig_path, sig, sig_len);
+
+    int port = 0;
+    pid_t srv = start_ota_test_server(1, cert, cakey,
+                                      fw, (int)sizeof(fw),
+                                      sig, (int)sig_len, 0, &port);
+
+    struct ota_config cfg;
+    make_v127_config(&cfg);
+    strncpy(cfg.ca_file, wrongca, sizeof(cfg.ca_file) - 1);
+    cfg.ca_file[sizeof(cfg.ca_file) - 1] = '\0';   /* 错 CA → 校验必败 */
+
+    assert(ota_init(&cfg, "test-client", "1.2.9") == E_OK);
+
+    char json[768];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"upgrade\",\"version\":\"4.0.1\","
+             "\"url\":\"https://127.0.0.1:%d/fw.bin\","
+             "\"checksum\":\"sha256:%s\"}", port, sha);
+    ota_handle_message(json, (int)strlen(json));
+
+    int rc = ota_check_and_handle();    /* TLS 证书校验失败 → 下载失败 */
+    assert(rc == 1);
+    assert(strcmp(ota_state_string(), "failed") == 0);
+    printf("  wrong CA → download FAILED:      PASS\n");
+
+    char buf[16] = {0};
+    assert(read_slot_file("current_slot", buf, sizeof(buf)) > 0);
+    assert(buf[0] == 'A');
+    printf("  current_slot stays A:            PASS\n");
+
+    rc = ota_check_and_handle();
+    assert(rc == 0);
+    assert(strcmp(ota_state_string(), "idle") == 0);
+    printf("  failed resets to idle:           PASS\n");
+
+    stop_test_server(srv);
+    EVP_PKEY_free(pkey);
+    ota_close();
+    cleanup_test_dir();
+}
+
 /* ═══════════════════════════════════════════════════════════ */
 
 int main(void)
@@ -1097,6 +1859,15 @@ int main(void)
     test_rollback_clear_fail_keeps_count();
     test_install_persist_fail_aborts();
     test_write_rename_fail_logs_error();
+
+    /* v1.2.9 固件签名 + HTTPS + P1-14 用例 */
+    test_sig_verify_unit();
+    test_pubkey_unconfigured_rejected();
+    test_full_chain_signature_ok();
+    test_full_chain_sig_mismatch();
+    test_sig_download_missing();
+    test_https_full_chain();
+    test_https_bad_ca_rejected();
 
     printf("\n=== ALL OTA tests PASSED ===\n");
     return 0;

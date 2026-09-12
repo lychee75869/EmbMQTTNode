@@ -10,11 +10,14 @@
  *   - 升级进度/状态通过 MQTT 上报
  *
  * 安全：
- *   - SHA256 固件完整性校验
+ *   - SHA256 固件完整性校验（快速失败）
+ *   - v1.2.9 固件数字签名验签（RSA/EC/Ed25519，硬性关卡，fail-closed）：
+ *     公钥未配置 → 升级指令直接拒绝；.sig 缺失/签名不匹配 → 拒绝安装
+ *   - v1.2.9 HTTPS 下载（SSL_VERIFY_PEER + 主机名校验，fail-closed）
  *   - 回滚保护：新版本启动失败 3 次自动切回旧版本
  *
- * 依赖：libcrypto (OpenSSL) 用于 SHA256
- *       make 时自动添加 -lcrypto
+ * 依赖：libcrypto + libssl (OpenSSL) 用于 SHA256/验签/TLS
+ *       make 时自动添加 -lcrypto -lssl
  */
 #ifndef OTA_H
 #define OTA_H
@@ -72,6 +75,18 @@ void ota_confirm_boot(void);
  * 返回当前 OTA 状态的字符串描述
  */
 const char *ota_state_string(void);
+
+/*
+ * v1.2.9 固件签名验签（独立可测）：
+ * 用 pubkey_path 的 PEM 公钥（"-----BEGIN PUBLIC KEY-----"，支持 RSA/EC
+ * → SHA256 摘要签名；Ed25519 → 原生签名）验证 sig_path 中对 fw_path
+ * 文件内容的签名（签名工具: tools/sign_firmware.sh）。
+ * 返回: E_OK 验签通过；E_INVAL/E_IO/E_NOT_FOUND 参数或文件问题；
+ *       其他非 0 = 签名不匹配。
+ */
+int ota_verify_signature(const char *fw_path,
+                         const char *sig_path,
+                         const char *pubkey_path);
 
 /*
  * 关闭 OTA 子系统

@@ -21,7 +21,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#define EMBMQTTNODE_VERSION "1.2.8"
+#define EMBMQTTNODE_VERSION "1.2.9"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败
@@ -228,6 +228,14 @@ struct ota_config {
     char    slot_dir[256];            /* 槽位根目录 */
     int     boot_attempt_max;         /* 最大启动尝试次数 */
     int     boot_confirm_sec;         /* 稳定运行确认时间（秒），超时后确认本次启动为健康 */
+    /* v1.2.9 固件签名 + HTTPS 下载（fail-closed 语义详见 src/ota.c 头注释）：
+     * public_key 空串=未配置 → OTA 升级指令直接拒绝（不降级到 checksum-only）；
+     * 已配置（含生产默认值）→ 验签为硬性关卡，.sig 缺失/签名不匹配/公钥
+     * 不可读一律拒绝安装。ca_file/ca_path 控制 https 下载的证书校验锚点，
+     * 两者均空时尝试系统 CA 常见位置，找不到即拒绝 https 下载。 */
+    char    public_key[256];          /* 固件签名公钥路径（PEM，RSA/EC/Ed25519） */
+    char    ca_file[256];             /* HTTPS 下载 CA 证书 bundle（PEM），空=系统默认 */
+    char    ca_path[256];             /* HTTPS 下载 CA 目录（c_rehash 格式），可选 */
 };
 
 /* 配置结构 */

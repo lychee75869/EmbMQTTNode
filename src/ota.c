@@ -4,15 +4,29 @@
  *
  * ── 升级流程 ──
  * 1. MQTT 收到 upgrade 指令（JSON）
- * 2. HTTP GET 下载固件到 download/ 目录
- * 3. SHA256 校验固件完整性
+ * 2. HTTP(S) GET 下载固件到 download/ 目录，同时下载 <固件URL>.sig 签名文件
+ * 3. SHA256 校验固件完整性（快速失败）→ 数字签名验签（硬性关卡）
  * 4. 解压/复制到备用槽位
  * 5. 更新 current_slot 文件，切换到新槽位（写入 boot_count = 1，启用试用计数）
  * 6. 退出程序（exit(42)），由 systemd 通过 RestartForceExitStatus=42 重启
  * 7. 启动后 post_boot_check（不依赖网络）：
  *    试用计数达 max → 回滚；稳定运行 boot_confirm_sec → confirm 清零
  *
- * ── 安全 ──
+ * ── 安全（v1.2.9 威胁模型）──
+ * - 固件签名验签（fail-closed，防伪造的根）：
+ *   OTA 指令经 MQTT 下发，而 MQTT 通道本身可能是明文的——仅靠指令里带的
+ *   SHA256 checksum 防不住"同时伪造指令+固件"的中间人（校验和随指令一起
+ *   被替换）。因此完整性之外还需要来自离线私钥的数字签名：
+ *     · 公钥路径未配置（空串）→ OTA 升级指令直接拒绝，绝不降级回
+ *       checksum-only（用户已确认的 fail-closed 语义）
+ *     · 公钥已配置 → 验签是硬性关卡：.sig 下载失败 / 签名不匹配 /
+ *       公钥文件读不出 → state=FAILED + 上报 error，绝不切槽
+ *   校验顺序：SHA256 checksum（快速失败）→ 数字签名（强校验）
+ * - HTTPS 下载（http:// 仍支持，用于局域网自建源场景）：https:// 走
+ *   SSL_VERIFY_PEER + CA 锚点（ota_ca_file/ota_ca_path，缺省尝试系统 CA
+ *   常见位置，找不到即拒绝）+ SNI + 证书主机名匹配（域名 X509_check_host /
+ *   IP 字面量 X509_check_ip_asc）。签名关卡是防伪造的根，传输加密是防
+ *   窃听/防固件+签名被整体换包的辅助手段，二者互补不互替。
  * - SHA256 固件完整性校验（需 libcrypto）
  * - 启动失败自动回滚（boot_attempt ≥ max_attempts 切回旧槽，max 默认 3）
  * - 健康确认机制（稳定运行 boot_confirm_sec 后由主循环周期驱动清零试用计数）
@@ -24,6 +38,12 @@
  * 持久化"写不成宁可不推进状态机"——所有推进动作的前置条件都是
  * ota_write_slot_file / ota_switch_slot 持久化成功；写失败按各调用点
  * 的 fail-safe 策略中止/重试/告警（详见各处 "v1.2.7 fail-safe" 注释）。
+ *
+ * v1.2.9（P0-5 + P1-14）：
+ * - 固件签名验签（ota_verify_signature，独立可测）+ .sig 下载
+ * - HTTPS 下载支持（OpenSSL，-lssl）
+ * - P1-14：响应头解析改为累积缓冲 + NUL 终止后查找（修复跨 TCP 段/TLS
+ *   记录的头部切分错误、读未初始化栈内存的 UB、body 字节丢失）
  */
 
 #include "ota.h"
@@ -36,7 +56,13 @@
 #include <netdb.h>
 #include <stdarg.h>
 #include <strings.h>
+#include <arpa/inet.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/err.h>
 
 /* ─── 内部常量 ─────────────────────────────────────────── */
 
@@ -44,9 +70,11 @@
 #define OTA_CMD_TOPIC_FMT     "embmqttnode/%s/ota/cmd"
 #define OTA_DOWNLOAD_SUBDIR   "download"
 #define OTA_FIRMWARE_FILE     "firmware.bin"
+#define OTA_SIG_SUFFIX        ".sig"
 #define OTA_CURRENT_SLOT_FILE "current_slot"
 #define OTA_BOOT_COUNT_FILE   "boot_count"
 #define OTA_HTTP_BUF_SIZE     4096
+#define OTA_HTTP_HEADER_MAX   8192    /* 响应头累积缓冲上限（防恶意超长头） */
 #define OTA_JSON_BUF_SIZE     2048
 
 /* ─── 内部状态 ─────────────────────────────────────────── */
@@ -175,6 +203,21 @@ void ota_handle_message(const char *payload, int payload_len)
         return;
     }
 
+    /*
+     * v1.2.9 fail-closed（用户已确认的语义，勿改为降级）：
+     * 签名公钥未配置 → 直接拒绝升级指令。绝不降级回 checksum-only——
+     * MQTT 通道可能是明文的，checksum 随指令可被中间人一并伪造，没有
+     * 离线签名把关的 OTA 等于向全网开放刷机口。
+     */
+    if (g_cfg.public_key[0] == '\0') {
+        LOG_ERROR("ota: upgrade rejected: ota_public_key not configured "
+                  "(fail-closed: unsigned firmware install is not allowed)");
+        ota_report_status("error",
+                          "\"Firmware public key not configured, "
+                          "upgrade rejected (fail-closed)\"");
+        return;
+    }
+
     LOG_INFO("ota: upgrade cmd received version=%s", g_target_version);
     g_state = OTA_STATE_DOWNLOADING;
 }
@@ -190,6 +233,9 @@ int ota_check_and_handle(void)
 
     case OTA_STATE_DOWNLOADING: {
         char dest_path[512];
+        char sig_path[sizeof(dest_path) + 4];   /* dest_path + ".sig" */
+        char sig_url[OTA_URL_MAX + 4];          /* 固件 URL + ".sig" */
+
         snprintf(dest_path, sizeof(dest_path), "%s/%s/%s",
                  g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
 
@@ -201,6 +247,31 @@ int ota_check_and_handle(void)
             g_state = OTA_STATE_FAILED;
             break;
         }
+
+        /*
+         * v1.2.9 fail-closed：同时下载签名文件 <固件URL>.sig。
+         * 公钥已配置（ota_handle_message 已把关），.sig 拿不到就是
+         * 异常事件（中间人剥离签名 / 源站部署不全），必须拒绝安装。
+         */
+        int surl = snprintf(sig_url, sizeof(sig_url),
+                            "%s%s", g_download_url, OTA_SIG_SUFFIX);
+        if (surl < 0 || (size_t)surl >= sizeof(sig_url)) {
+            LOG_ERROR("ota: signature URL too long");
+            ota_report_status("error", "\"Signature URL too long\"");
+            g_state = OTA_STATE_FAILED;
+            break;
+        }
+        snprintf(sig_path, sizeof(sig_path), "%s%s", dest_path,
+                 OTA_SIG_SUFFIX);
+
+        LOG_INFO("ota: downloading signature %s → %s", sig_url, sig_path);
+        if (ota_http_download(sig_url, sig_path) != E_OK) {
+            LOG_ERROR("ota: signature file download failed, refusing install");
+            ota_report_status("error", "\"Signature file download failed\"");
+            g_state = OTA_STATE_FAILED;
+            break;
+        }
+
         g_download_pct = 100;
         g_state = OTA_STATE_VERIFYING;
         break;
@@ -209,11 +280,15 @@ int ota_check_and_handle(void)
     case OTA_STATE_VERIFYING: {
         char hash_str[128] = {0};
         char src_path[512];
+        char sig_path[sizeof(src_path) + 4];    /* src_path + ".sig" */
         snprintf(src_path, sizeof(src_path), "%s/%s/%s",
                  g_slot_dir, OTA_DOWNLOAD_SUBDIR, OTA_FIRMWARE_FILE);
+        snprintf(sig_path, sizeof(sig_path), "%s%s", src_path,
+                 OTA_SIG_SUFFIX);
 
         ota_report_status("verifying", NULL);
 
+        /* ── 第一道关卡：SHA256 checksum（快速失败） ── */
         if (ota_sha256_file(src_path, hash_str, sizeof(hash_str)) != E_OK) {
             ota_report_status("error", "\"SHA256 computation failed\"");
             g_state = OTA_STATE_FAILED;
@@ -236,6 +311,22 @@ int ota_check_and_handle(void)
         }
 
         ota_report_status("verifying", "\"checksum_ok\":true");
+
+        /*
+         * ── 第二道关卡：数字签名验签（v1.2.9，硬性 fail-closed） ──
+         * checksum 只证明"固件与指令一致"，防不住指令+固件被中间人
+         * 一并伪造；签名来自离线私钥，才是拒绝伪造固件的根。
+         * 验签失败 / .sig 缺失 / 公钥读不出 → 一律 FAILED，绝不切槽。
+         */
+        if (ota_verify_signature(src_path, sig_path, g_cfg.public_key)
+                != E_OK) {
+            LOG_ERROR("ota: signature verification failed, refusing install");
+            ota_report_status("error", "\"Signature verification failed\"");
+            g_state = OTA_STATE_FAILED;
+            break;
+        }
+
+        ota_report_status("verifying", "\"signature_ok\":true");
         g_state = OTA_STATE_INSTALLING;
         break;
     }
@@ -602,46 +693,267 @@ static int ota_ensure_dirs(void)
     return E_OK;
 }
 
-/* ─── HTTP GET 下载 ─────────────────────────────────────── */
+/* ─── HTTP(S) GET 下载（v1.2.9 重写）────────────────────── */
 
-static int ota_http_download(const char *url, const char *dest_path)
+/*
+ * URL 解析结果
+ */
+struct ota_url_parts {
+    int  use_tls;               /* 0=http 1=https */
+    char host[256];             /* 主机名或 IP 字面量（不含端口） */
+    int  port;                  /* 端口（http 默认 80 / https 默认 443） */
+    char path[512];             /* 请求路径（以 / 开头） */
+};
+
+/*
+ * 解析 http(s)://host[:port]/path。
+ * 返回 E_OK 成功；E_INVAL 协议不支持或格式非法。
+ */
+static int ota_parse_url(const char *url, struct ota_url_parts *out)
 {
-    /* 解析 URL: http://host[:port]/path */
-    const char *proto = "http://";
-    if (strncmp(url, proto, 7) != 0) {
-        LOG_ERROR("ota: only HTTP supported");
+    if (!url || !out)
+        return E_INVAL;
+
+    /* v1.2.9：https 支持加入；http 保留（局域网自建源场景），
+     * 防伪造由固件签名关卡兜底，见文件头威胁模型注释。 */
+    if (strncmp(url, "http://", 7) == 0) {
+        out->use_tls = 0;
+        out->port    = 80;
+        url += 7;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        out->use_tls = 1;
+        out->port    = 443;
+        url += 8;
+    } else {
+        LOG_ERROR("ota: unsupported URL scheme (need http:// or https://)");
+        return E_INVAL;
+    }
+
+    const char *slash    = strchr(url, '/');
+    size_t      host_len = slash ? (size_t)(slash - url) : strlen(url);
+    if (host_len == 0 || host_len >= sizeof(out->host))
+        return E_INVAL;
+    memcpy(out->host, url, host_len);
+    out->host[host_len] = '\0';
+
+    /* host 里带端口则拆出 */
+    char *colon = strchr(out->host, ':');
+    if (colon) {
+        *colon      = '\0';
+        out->port   = atoi(colon + 1);
+        if (out->port <= 0 || out->port > 65535)
+            return E_INVAL;
+    }
+    if (out->host[0] == '\0')
+        return E_INVAL;
+
+    snprintf(out->path, sizeof(out->path), "%s", slash ? slash : "/");
+    return E_OK;
+}
+
+/*
+ * 传输抽象：send/recv 收敛到 conn_* 包装层，http（裸 socket）与
+ * https（SSL）共用同一套请求构造 / 响应解析逻辑。
+ */
+struct ota_conn {
+    int      sock;
+    SSL     *ssl;                   /* https 时非 NULL */
+    SSL_CTX *ctx;                   /* 持有 SSL_CTX，conn_close 时释放 */
+};
+
+static int conn_send_all(struct ota_conn *c, const char *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        if (c->ssl) {
+            int n = SSL_write(c->ssl, buf + off, (int)(len - off));
+            if (n <= 0)
+                return E_NET;
+            off += (size_t)n;
+        } else {
+            ssize_t n = send(c->sock, buf + off, len - off, 0);
+            if (n <= 0)
+                return E_NET;
+            off += (size_t)n;
+        }
+    }
+    return E_OK;
+}
+
+/* 返回 >0 收到的字节数，0 = 对端正常关闭，<0 = 错误 */
+static int conn_recv(struct ota_conn *c, char *buf, size_t size)
+{
+    if (c->ssl) {
+        int n = SSL_read(c->ssl, buf, (int)size);
+        if (n > 0)
+            return n;
+        int err = SSL_get_error(c->ssl, n);
+        return (err == SSL_ERROR_ZERO_RETURN) ? 0 : -1;
+    }
+    for (;;) {
+        ssize_t n = recv(c->sock, buf, size, 0);
+        if (n > 0)
+            return (int)n;
+        if (n == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
+static void conn_close(struct ota_conn *c)
+{
+    if (c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+        c->ssl = NULL;
+    }
+    if (c->ctx) {
+        SSL_CTX_free(c->ctx);
+        c->ctx = NULL;
+    }
+    if (c->sock >= 0) {
+        close(c->sock);
+        c->sock = -1;
+    }
+}
+
+/*
+ * 证书主机名匹配：域名走 X509_check_host，IP 字面量走 X509_check_ip_asc
+ * （X509_check_host 不校验 IP 形式的 SAN，需分流）。
+ */
+static int ota_cert_matches_host(X509 *cert, const char *host)
+{
+    struct in_addr  v4;
+    struct in6_addr v6;
+    if (inet_pton(AF_INET, host, &v4) == 1 ||
+        inet_pton(AF_INET6, host, &v6) == 1)
+        return X509_check_ip_asc(cert, host, 0) == 1;
+    return X509_check_host(cert, host, strlen(host), 0, NULL) == 1;
+}
+
+/*
+ * 在已连接的 socket 上完成 TLS 握手 + 证书校验（fail-closed）：
+ *   - SSL_VERIFY_PEER：证书链必须能验证到配置的 CA 锚点
+ *   - CA 锚点：ota_ca_file / ota_ca_path 优先；均未配置时尝试系统 CA
+ *     常见位置；一个都找不到 → 拒绝连接（绝不裸奔）
+ *   - SNI：SSL_set_tlsext_host_name（虚拟主机场景）
+ *   - 主机名：握手后显式 X509_check_host / X509_check_ip_asc
+ * 成功时填充 c->ssl / c->ctx；失败返回 E_NET/E_IO/E_NO_MEM。
+ */
+static int ota_tls_connect(struct ota_conn *c, const char *host)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        LOG_ERROR("ota: SSL_CTX_new failed");
+        return E_NO_MEM;
+    }
+
+    /* 硬性证书校验，绝不使用 SSL_VERIFY_NONE */
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+    const char *ca_file = g_cfg.ca_file[0] ? g_cfg.ca_file : NULL;
+    const char *ca_path = g_cfg.ca_path[0] ? g_cfg.ca_path : NULL;
+
+    if (ca_file || ca_path) {
+        if (SSL_CTX_load_verify_locations(ctx, ca_file, ca_path) != 1) {
+            LOG_ERROR("ota: load verify locations failed (file=%s path=%s)",
+                      ca_file ? ca_file : "(none)",
+                      ca_path ? ca_path : "(none)");
+            ERR_clear_error();
+            SSL_CTX_free(ctx);
+            return E_IO;
+        }
+    } else {
+        /* 系统默认 CA 常见位置（嵌入式发行版差异大，逐个探测） */
+        static const char *const sys_ca[] = {
+            "/etc/ssl/certs/ca-certificates.crt",   /* Debian/Ubuntu */
+            "/etc/pki/tls/certs/ca-bundle.crt",     /* Fedora/RHEL */
+            "/etc/ssl/ca-bundle.pem",               /* OpenSUSE */
+            "/etc/ssl/cert.pem",                    /* macOS/BSD/Alpine */
+        };
+        int loaded = 0;
+        for (size_t i = 0; i < sizeof(sys_ca) / sizeof(sys_ca[0]); i++) {
+            if (access(sys_ca[i], R_OK) == 0 &&
+                SSL_CTX_load_verify_locations(ctx, sys_ca[i], NULL) == 1) {
+                LOG_INFO("ota: using system CA bundle %s", sys_ca[i]);
+                loaded = 1;
+                break;
+            }
+        }
+        if (!loaded) {
+            LOG_ERROR("ota: no system CA bundle found, refusing HTTPS "
+                      "without certificate verification (fail-closed)");
+            ERR_clear_error();
+            SSL_CTX_free(ctx);
+            return E_IO;
+        }
+    }
+
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        ERR_clear_error();
+        SSL_CTX_free(ctx);
+        return E_NO_MEM;
+    }
+
+    /* SNI：让服务端按主机名返回正确证书 */
+    SSL_set_tlsext_host_name(ssl, host);
+
+    SSL_set_fd(ssl, c->sock);
+    if (SSL_connect(ssl) != 1) {
+        LOG_ERROR("ota: TLS handshake failed with %s "
+                  "(cert chain or protocol problem)", host);
+        ERR_clear_error();
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
         return E_NET;
     }
 
-    const char *host_start = url + 7;
-    const char *path_start = strchr(host_start, '/');
-    char host[256];
-    char path[512];
-    int  port = 80;
-
-    if (path_start) {
-        size_t host_len = (size_t)(path_start - host_start);
-        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
-        memcpy(host, host_start, host_len);
-        host[host_len] = '\0';
-        strncpy(path, path_start, sizeof(path));
-        path[sizeof(path) - 1] = '\0';
-    } else {
-        size_t host_len = strlen(host_start);
-        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
-        memcpy(host, host_start, host_len);
-        host[host_len] = '\0';
-        strncpy(path, "/", sizeof(path));
+    /* SSL_VERIFY_PEER 已保证证书链有效；主机名匹配在此显式把关 */
+    X509 *cert = SSL_get_peer_certificate(ssl);
+    if (!cert) {
+        LOG_ERROR("ota: peer presented no certificate");
+        ERR_clear_error();
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return E_NET;
+    }
+    int host_ok = ota_cert_matches_host(cert, host);
+    X509_free(cert);
+    if (!host_ok) {
+        LOG_ERROR("ota: certificate does not match host %s", host);
+        ERR_clear_error();
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return E_NET;
     }
 
-    /* 检查 host 中是否包含端口 */
-    char *colon = strchr(host, ':');
-    if (colon) {
-        *colon = '\0';
-        port = atoi(colon + 1);
-    }
+    c->ssl = ssl;
+    c->ctx = ctx;
+    LOG_INFO("ota: TLS established with %s (peer cert verified)", host);
+    return E_OK;
+}
 
-    LOG_INFO("ota: http GET host=%s port=%d path=%s", host, port, path);
+/*
+ * HTTP(S) GET 下载。
+ * v1.2.9（P1-14）响应头解析重写：
+ *   - 累积缓冲：头可能拆在多个 TCP 段 / TLS 记录里到达，逐段追加到
+ *     hdr 缓冲、NUL 终止后再查找 "\r\n\r\n"（旧实现只在单个 recv 缓冲
+ *     内 strstr，跨段头永远切不开，且 recv 后未 NUL 终止就 strchr /
+ *     strstr 是读未初始化栈内存的 UB）
+ *   - 分隔符之后落在同一缓冲里的 body 字节直接写入文件，不丢字节
+ *   - 状态行解析基于完整累积缓冲
+ */
+static int ota_http_download(const char *url, const char *dest_path)
+{
+    struct ota_url_parts up;
+    if (ota_parse_url(url, &up) != E_OK)
+        return E_NET;
+
+    LOG_INFO("ota: %s GET host=%s port=%d path=%s",
+             up.use_tls ? "https" : "http", up.host, up.port, up.path);
 
     /* DNS 解析 */
     struct addrinfo hints, *res;
@@ -650,10 +962,10 @@ static int ota_http_download(const char *url, const char *dest_path)
     hints.ai_socktype = SOCK_STREAM;
 
     char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", port);
+    snprintf(port_str, sizeof(port_str), "%d", up.port);
 
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        LOG_ERROR("ota: DNS lookup failed for %s", host);
+    if (getaddrinfo(up.host, port_str, &hints, &res) != 0) {
+        LOG_ERROR("ota: DNS lookup failed for %s", up.host);
         return E_NET;
     }
 
@@ -677,19 +989,26 @@ static int ota_http_download(const char *url, const char *dest_path)
     }
     freeaddrinfo(res);
 
-    /* 发送 HTTP GET 请求 */
+    struct ota_conn conn = { .sock = sock, .ssl = NULL, .ctx = NULL };
+
+    if (up.use_tls && ota_tls_connect(&conn, up.host) != E_OK) {
+        conn_close(&conn);
+        return E_NET;
+    }
+
+    /* 发送 HTTP GET 请求（http/https 共用） */
     char request[1024];
     int req_len = snprintf(request, sizeof(request),
                            "GET %s HTTP/1.0\r\n"
                            "Host: %s\r\n"
-                           "User-Agent: EmbMQTTNode-OTA/1.0\r\n"
+                           "User-Agent: EmbMQTTNode-OTA/1.1\r\n"
                            "Connection: close\r\n"
                            "\r\n",
-                           path, host);
+                           up.path, up.host);
 
-    if (send(sock, request, req_len, 0) < 0) {
-        LOG_ERROR("ota: send() failed: %s", strerror(errno));
-        close(sock);
+    if (conn_send_all(&conn, request, (size_t)req_len) != E_OK) {
+        LOG_ERROR("ota: send() failed");
+        conn_close(&conn);
         return E_NET;
     }
 
@@ -697,44 +1016,93 @@ static int ota_http_download(const char *url, const char *dest_path)
     FILE *fp = fopen(dest_path, "wb");
     if (!fp) {
         LOG_ERROR("ota: fopen %s failed: %s", dest_path, strerror(errno));
-        close(sock);
+        conn_close(&conn);
         return E_IO;
     }
 
+    char hdr[OTA_HTTP_HEADER_MAX];  /* 响应头累积缓冲（P1-14） */
     char buf[OTA_HTTP_BUF_SIZE];
+    int  hdr_len     = 0;
     int  header_done = 0;
     int  total_bytes = 0;
     int  status_code = 0;
+    int  io_failed   = 0;
 
-    while (1) {
-        int n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0)
+    while (!header_done) {
+        int n = conn_recv(&conn, buf, sizeof(buf));
+        if (n < 0) {
+            LOG_ERROR("ota: recv header failed");
+            io_failed = 1;
             break;
-
-        if (!header_done) {
-            /* 查找 HTTP 状态码 */
-            if (status_code == 0) {
-                char *sp = strchr(buf, ' ');
-                if (sp) status_code = atoi(sp + 1);
-            }
-
-            /* 查找 header 结束标记 \r\n\r\n */
-            char *body = strstr(buf, "\r\n\r\n");
-            if (body) {
-                header_done = 1;
-                int header_len = (body - buf) + 4;
-                fwrite(body + 4, 1, n - header_len, fp);
-                total_bytes += n - header_len;
-            }
-            continue;
+        }
+        if (n == 0) {
+            LOG_ERROR("ota: connection closed before header complete");
+            io_failed = 1;
+            break;
         }
 
-        fwrite(buf, 1, n, fp);
+        /* 防恶意超长头：缓冲将满仍未见分隔符则放弃 */
+        int space = (int)sizeof(hdr) - 1 - hdr_len;
+        if (n > space) {
+            if (space == 0) {
+                LOG_ERROR("ota: HTTP header too large (>%d bytes)",
+                          (int)sizeof(hdr) - 1);
+                io_failed = 1;
+                break;
+            }
+            n = space;
+        }
+
+        memcpy(hdr + hdr_len, buf, (size_t)n);
+        hdr_len += n;
+        hdr[hdr_len] = '\0';    /* P1-14：先 NUL 终止再查找 */
+
+        char *sep = strstr(hdr, "\r\n\r\n");
+        if (sep) {
+            header_done = 1;
+
+            /* 状态行解析基于完整累积缓冲 */
+            if (strncmp(hdr, "HTTP/", 5) == 0) {
+                char *sp = strchr(hdr, ' ');
+                if (sp)
+                    status_code = atoi(sp + 1);
+            }
+
+            int header_total = (int)(sep - hdr) + 4;
+            int body_bytes   = hdr_len - header_total;
+            if (body_bytes > 0) {
+                /* 头尾相连落进缓冲的 body 字节：不丢 */
+                fwrite(sep + 4, 1, (size_t)body_bytes, fp);
+                total_bytes += body_bytes;
+            }
+        } else if (hdr_len >= (int)sizeof(hdr) - 1) {
+            LOG_ERROR("ota: HTTP header too large (>%d bytes)",
+                      (int)sizeof(hdr) - 1);
+            io_failed = 1;
+            break;
+        }
+    }
+
+    while (!io_failed) {
+        int n = conn_recv(&conn, buf, sizeof(buf));
+        if (n < 0) {
+            LOG_ERROR("ota: recv body failed");
+            io_failed = 1;
+            break;
+        }
+        if (n == 0)
+            break;      /* Connection: close → 读到对端关闭即完成 */
+        fwrite(buf, 1, (size_t)n, fp);
         total_bytes += n;
     }
 
     fclose(fp);
-    close(sock);
+    conn_close(&conn);
+
+    if (io_failed) {
+        unlink(dest_path);
+        return E_NET;
+    }
 
     if (status_code != 200) {
         LOG_ERROR("ota: HTTP %d", status_code);
@@ -785,6 +1153,146 @@ static int ota_sha256_file(const char *path, char *hash_out, int hash_len)
     }
     hash_out[off] = '\0';
 
+    return E_OK;
+}
+
+/* ─── 固件签名验签（v1.2.9，独立可测）────────────────────── */
+
+/*
+ * 用 PEM 公钥验证 .sig 签名文件对固件文件的签名。
+ *
+ * 算法支持（OpenSSL EVP 通用验签，1.1.x 兼容，不用 3.x 独有 API）：
+ *   - RSA / EC 公钥：SHA256 摘要签名，固件流式喂入（不整载内存）
+ *   - Ed25519      ：原生签名（无预摘要），固件整载内存一次性验证
+ *
+ * 返回 E_OK 验签通过；其他值 = 参数错 / 文件缺失不可读 / 公钥格式错 /
+ * 签名不匹配。所有失败路径调用方都必须拒绝安装（fail-closed）。
+ */
+int ota_verify_signature(const char *fw_path,
+                         const char *sig_path,
+                         const char *pubkey_path)
+{
+    if (!fw_path || !sig_path || !pubkey_path || pubkey_path[0] == '\0') {
+        LOG_ERROR("ota: verify_signature: invalid args");
+        return E_INVAL;
+    }
+
+    /* 1. 加载公钥（PEM "PUBLIC KEY"，RSA/EC/Ed25519 通用） */
+    FILE *kfp = fopen(pubkey_path, "r");
+    if (!kfp) {
+        LOG_ERROR("ota: open public key %s failed: %s",
+                  pubkey_path, strerror(errno));
+        return E_IO;
+    }
+    EVP_PKEY *pkey = PEM_read_PUBKEY(kfp, NULL, NULL, NULL);
+    fclose(kfp);
+    if (!pkey) {
+        LOG_ERROR("ota: parse public key %s failed (not a PEM PUBLIC KEY?)",
+                  pubkey_path);
+        ERR_clear_error();
+        return E_IO;
+    }
+
+    /* 2. 读取签名文件（原始签名字节，不做 base64） */
+    FILE *sfp = fopen(sig_path, "rb");
+    if (!sfp) {
+        LOG_ERROR("ota: open signature %s failed: %s",
+                  sig_path, strerror(errno));
+        EVP_PKEY_free(pkey);
+        return E_NOT_FOUND;
+    }
+    unsigned char sig_buf[4096];
+    size_t sig_len = fread(sig_buf, 1, sizeof(sig_buf), sfp);
+    int sig_trunc = fgetc(sfp) != EOF;   /* 超过缓冲视为异常 */
+    fclose(sfp);
+    if (sig_len == 0 || sig_trunc) {
+        LOG_ERROR("ota: signature %s empty or too large (%zu bytes)",
+                  sig_path, sig_len);
+        EVP_PKEY_free(pkey);
+        return E_IO;
+    }
+
+    int  is_ed25519 = (EVP_PKEY_id(pkey) == EVP_PKEY_ED25519);
+    int  ok         = 0;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        return E_NO_MEM;
+    }
+
+    if (is_ed25519) {
+        /* Ed25519：原生一次性签名，无 EVP_DigestSign/Verify 前缀 */
+        FILE *ffp = fopen(fw_path, "rb");
+        if (!ffp) {
+            LOG_ERROR("ota: open firmware %s failed: %s",
+                      fw_path, strerror(errno));
+            EVP_MD_CTX_free(ctx);
+            EVP_PKEY_free(pkey);
+            return E_IO;
+        }
+        /* 整载固件（网关固件体量 MB 级，可接受） */
+        if (fseek(ffp, 0, SEEK_END) == 0) {
+            long fsize = ftell(ffp);
+            rewind(ffp);
+            if (fsize > 0) {
+                unsigned char *fw = malloc((size_t)fsize);
+                if (fw) {
+                    size_t got = fread(fw, 1, (size_t)fsize, ffp);
+                    if (got == (size_t)fsize &&
+                        EVP_DigestVerifyInit(ctx, NULL, NULL, NULL,
+                                             pkey) == 1) {
+                        ok = EVP_DigestVerify(ctx, sig_buf, sig_len,
+                                              fw, got);
+                    }
+                    free(fw);
+                } else {
+                    EVP_MD_CTX_free(ctx);
+                    EVP_PKEY_free(pkey);
+                    fclose(ffp);
+                    return E_NO_MEM;
+                }
+            }
+        }
+        fclose(ffp);
+    } else {
+        /* RSA / EC：流式 SHA256 摘要 + EVP_DigestVerifyFinal */
+        FILE *ffp = fopen(fw_path, "rb");
+        if (!ffp) {
+            LOG_ERROR("ota: open firmware %s failed: %s",
+                      fw_path, strerror(errno));
+            EVP_MD_CTX_free(ctx);
+            EVP_PKEY_free(pkey);
+            return E_IO;
+        }
+
+        if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) == 1) {
+            unsigned char fbuf[OTA_HTTP_BUF_SIZE];
+            size_t n;
+            int upd_ok = 1;
+            while ((n = fread(fbuf, 1, sizeof(fbuf), ffp)) > 0) {
+                if (EVP_DigestVerifyUpdate(ctx, fbuf, n) != 1) {
+                    upd_ok = 0;
+                    break;
+                }
+            }
+            if (upd_ok)
+                ok = EVP_DigestVerifyFinal(ctx, sig_buf, sig_len);
+        }
+        fclose(ffp);
+    }
+
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    ERR_clear_error();
+
+    if (ok != 1) {
+        LOG_ERROR("ota: signature verification FAILED (fw=%s sig=%s)",
+                  fw_path, sig_path);
+        return E_INVAL;
+    }
+
+    LOG_INFO("ota: signature verification ok (%s)",
+             is_ed25519 ? "Ed25519" : "SHA256/RSA-or-EC");
     return E_OK;
 }
 

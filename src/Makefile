@@ -7,7 +7,7 @@ CROSS_COMPILE ?=
 CC       ?= $(CROSS_COMPILE)gcc
 STRIP    ?= $(CROSS_COMPILE)strip
 CFLAGS   ?= -std=c11 -Wall -Wextra -O0 -g -pthread -D_DEFAULT_SOURCE
-LDFLAGS  ?= -pthread -lmosquitto -lsqlite3 -lm -lcrypto
+LDFLAGS  ?= -pthread -lmosquitto -lsqlite3 -lm -lcrypto -lssl
 
 # Modbus 可选模块（条件编译，默认启用）
 BUILD_WITH_MODBUS ?= 1

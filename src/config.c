@@ -58,6 +58,12 @@ static void set_default_config(struct node_config *cfg)
     strncpy(cfg->ota.slot_dir, OTA_SLOT_DIR_DEFAULT, sizeof(cfg->ota.slot_dir) - 1);
     cfg->ota.boot_attempt_max = OTA_BOOT_ATTEMPT_MAX;
     cfg->ota.boot_confirm_sec = OTA_BOOT_CONFIRM_SEC_DEFAULT;
+    /* v1.2.9：签名公钥默认不配置（空串）→ fail-closed，OTA 升级指令被
+     * 直接拒绝；固件签名体系必须显式部署（ota_public_key 指向公钥 PEM）。
+     * HTTPS CA 默认空 → 尝试系统 CA 常见位置，找不到拒绝 https 下载。 */
+    cfg->ota.public_key[0] = '\0';
+    cfg->ota.ca_file[0]    = '\0';
+    cfg->ota.ca_path[0]    = '\0';
 
     /* 异常检测引擎默认：关闭 */
     cfg->anomaly_enabled = 0;
@@ -285,6 +291,12 @@ int config_load(const char *path, struct node_config *cfg)
             cfg->ota.boot_attempt_max = atoi(v);
         else if (strcmp(k, "ota_boot_confirm_sec") == 0)
             cfg->ota.boot_confirm_sec = atoi(v);
+        else if (strcmp(k, "ota_public_key") == 0)
+            strncpy(cfg->ota.public_key, v, sizeof(cfg->ota.public_key) - 1);
+        else if (strcmp(k, "ota_ca_file") == 0)
+            strncpy(cfg->ota.ca_file, v, sizeof(cfg->ota.ca_file) - 1);
+        else if (strcmp(k, "ota_ca_path") == 0)
+            strncpy(cfg->ota.ca_path, v, sizeof(cfg->ota.ca_path) - 1);
 
         /* ── 异常检测引擎: anomaly_enabled / anomaly_N ── */
         else if (strcmp(k, "anomaly_enabled") == 0)
@@ -460,6 +472,13 @@ void config_dump(const struct node_config *cfg)
     LOG_INFO("ota_slot_dir       = %s", cfg->ota.slot_dir);
     LOG_INFO("ota_boot_attempt_max= %d", cfg->ota.boot_attempt_max);
     LOG_INFO("ota_boot_confirm_sec= %d", cfg->ota.boot_confirm_sec);
+    LOG_INFO("ota_public_key      = %s",
+             cfg->ota.public_key[0] ? cfg->ota.public_key
+                                    : "(unset, OTA commands rejected)");
+    LOG_INFO("ota_ca_file         = %s",
+             cfg->ota.ca_file[0] ? cfg->ota.ca_file : "(system default)");
+    LOG_INFO("ota_ca_path         = %s",
+             cfg->ota.ca_path[0] ? cfg->ota.ca_path : "(none)");
 
     LOG_INFO("--- Anomaly Engine ---");
     LOG_INFO("anomaly_enabled    = %d", cfg->anomaly_enabled);

@@ -32,7 +32,7 @@ test_rule_engine: test_rule_engine.c ../src/rule_engine.c ../src/config.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
 test_ota: test_ota.c ../src/ota.c ../src/config.c
-	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lcrypto
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lcrypto -lssl
 
 test_anomaly_engine: test_anomaly_engine.c ../src/anomaly_engine.c ../src/config.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)

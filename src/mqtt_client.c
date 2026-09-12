@@ -16,28 +16,53 @@
 static struct mosquitto *g_mosq = NULL;
 static volatile int g_connected = 0;
 static mqtt_ota_callback g_ota_cb = NULL;
+/* P1-13/P2-19: "连接成功"回调，由 on_connect 在每次 CONNACK 成功时调用 */
+static mqtt_connected_callback g_connected_cb = NULL;
 
 /* ─── 回调 ─────────────────────────────────────────────────── */
+
+/*
+ * P1-13/P2-19: CONNACK 处理逻辑从 on_connect 抽出为独立函数。
+ * why: ① 修复 P1-13——clean_session=true（mosquitto_new 第二参）
+ * 下 broker 在断连时清空本客户端全部订阅，libmosquitto 的
+ * loop_start 自动重连虽会再次触发 on_connect，但订阅不会自动
+ * 恢复，必须在每次连接成功时通过回调重新订阅；② 抽成无副作用
+ * 入口的函数后，"注册回调 → CONNACK 成功 → 回调触发"这条
+ * P1-13/P2-19 的核心链路可以在无 broker 环境下单元测试。
+ * 注: 本函数运行在 libmosquitto 网络线程；回调内调用
+ * mosquitto_publish/subscribe 是官方允许的线程安全用法。
+ */
+int mqtt_handle_connack(int rc)
+{
+    if (rc == 0) {
+        g_connected = 1;
+        LOG_INFO("mqtt connected");
+        /* 先置 g_connected 再调回调：回调内的 publish/subscribe
+         * 依赖 g_connected==1 的前置检查（见各函数开头） */
+        if (g_connected_cb) {
+            g_connected_cb();
+        }
+        return E_OK;
+    }
+
+    g_connected = 0;
+    switch (rc) {
+    case 1:  LOG_ERROR("mqtt connect refused: protocol version"); break;
+    case 2:  LOG_ERROR("mqtt connect refused: identifier rejected"); break;
+    case 3:  LOG_ERROR("mqtt connect refused: broker unavailable"); break;
+    case 4:  LOG_ERROR("mqtt connect refused: bad username or password"); break;
+    case 5:  LOG_ERROR("mqtt connect refused: not authorized"); break;
+    default: LOG_ERROR("mqtt connect failed, code: %d", rc); break;
+    }
+    return E_NET;
+}
 
 static void on_connect(struct mosquitto *mosq, void *obj, int rc)
 {
     (void)mosq;
     (void)obj;
-
-    if (rc == 0) {
-        g_connected = 1;
-        LOG_INFO("mqtt connected");
-    } else {
-        g_connected = 0;
-        switch (rc) {
-        case 1:  LOG_ERROR("mqtt connect refused: protocol version"); break;
-        case 2:  LOG_ERROR("mqtt connect refused: identifier rejected"); break;
-        case 3:  LOG_ERROR("mqtt connect refused: broker unavailable"); break;
-        case 4:  LOG_ERROR("mqtt connect refused: bad username or password"); break;
-        case 5:  LOG_ERROR("mqtt connect refused: not authorized"); break;
-        default: LOG_ERROR("mqtt connect failed, code: %d", rc); break;
-        }
-    }
+    /* P1-13/P2-19: 逻辑移入 mqtt_handle_connack（可单测），本回调仅转发 */
+    mqtt_handle_connack(rc);
 }
 
 static void on_disconnect(struct mosquitto *mosq, void *obj, int rc)
@@ -243,8 +268,8 @@ int mqtt_publish_status(const struct node_config *cfg,
         return E_INVAL;
 
     char status_topic[256];
-    snprintf(status_topic, sizeof(status_topic),
-             "%s/status", cfg->topic);
+    /* P1-13/P2-19: 主题构造下沉到纯函数 mqtt_build_status_topic（可单测） */
+    mqtt_build_status_topic(cfg->topic, status_topic, (int)sizeof(status_topic));
 
     char payload[512];
     snprintf(payload, sizeof(payload),
@@ -286,8 +311,8 @@ int mqtt_subscribe_ota(const char *client_id)
     if (!g_mosq || !g_connected || !client_id) return E_INVAL;
 
     char ota_topic[256];
-    snprintf(ota_topic, sizeof(ota_topic),
-             "embmqttnode/%s/ota/cmd", client_id);
+    /* P1-13/P2-19: 主题构造下沉到纯函数 mqtt_build_ota_topic（可单测） */
+    mqtt_build_ota_topic(client_id, ota_topic, (int)sizeof(ota_topic));
 
     int rc = mosquitto_subscribe(g_mosq, NULL, ota_topic, 1);
     if (rc != MOSQ_ERR_SUCCESS) {
@@ -306,6 +331,32 @@ void mqtt_set_ota_callback(mqtt_ota_callback cb)
 {
     g_ota_cb = cb;
     LOG_INFO("mqtt ota callback %s", cb ? "registered" : "cleared");
+}
+
+/* ─── 连接成功回调注册（P1-13/P2-19）───────────────────── */
+
+void mqtt_set_connected_callback(mqtt_connected_callback cb)
+{
+    g_connected_cb = cb;
+    LOG_INFO("mqtt connected callback %s", cb ? "registered" : "cleared");
+}
+
+/* ─── 主题构造（纯函数，P1-13/P2-19 供单元测试）────────── */
+
+int mqtt_build_ota_topic(const char *client_id, char *buf, int buf_len)
+{
+    if (!client_id || !buf || buf_len <= 0) return E_INVAL;
+
+    snprintf(buf, (size_t)buf_len, "embmqttnode/%s/ota/cmd", client_id);
+    return E_OK;
+}
+
+int mqtt_build_status_topic(const char *base_topic, char *buf, int buf_len)
+{
+    if (!base_topic || !buf || buf_len <= 0) return E_INVAL;
+
+    snprintf(buf, (size_t)buf_len, "%s/status", base_topic);
+    return E_OK;
 }
 
 /* ─── 原始发布（自定义 topic + payload）──────────────────── */

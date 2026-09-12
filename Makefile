@@ -31,8 +31,9 @@ test:
 		./test_rule_engine && \
 		./test_ota && \
 		./test_anomaly_engine && \
-		./test_mac_addr
-	@echo "=== All 7 tests passed ==="
+		./test_mac_addr && \
+		./test_mqtt_client
+	@echo "=== All 8 tests passed ==="
 
 clean:
 	$(MAKE) -C src clean

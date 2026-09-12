@@ -13,7 +13,7 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr
+TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client
 
 .PHONY: all clean distclean
 
@@ -39,6 +39,12 @@ test_anomaly_engine: test_anomaly_engine.c ../src/anomaly_engine.c ../src/config
 
 test_mac_addr: test_mac_addr.c ../src/mac_addr.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
+
+# P1-13/P2-19: mqtt_client 回调调度 + 主题构造单测。
+# 只测纯函数化路径（mqtt_handle_connack / mqtt_build_*_topic），
+# 不触碰真实网络；链接 -lmosquitto 仅为解析 mqtt_client.c 其余符号。
+test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto
 
 clean:
 	rm -f $(TESTS) test_data.db test_modbus_tmp.conf

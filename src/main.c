@@ -344,6 +344,41 @@ static void usage(const char *prog) {
     printf("  -h          显示帮助\n");
 }
 
+/* ─── MQTT 连接成功回调（P1-13/P2-19 修复）──────────────── */
+
+/*
+ * v1.2.8（P1-13/P2-19）："连接成功后要做的事"从 main 的定时猜测
+ * （旧实现：mqtt_init 返回后 usleep(500000)，再一次性 publish
+ * online + subscribe ota，返回值不接、失败不重试）改为 on_connect
+ * 事件驱动。本回调由 mqtt_handle_connack 在 libmosquitto 网络线程
+ * 中、每次成功 CONNACK 时调用——首次连接与断网自动重连（loop_start
+ * 内置重连）都会触发，天然覆盖两个缺陷：
+ *
+ *   P1-13: clean_session=true 下 broker 断连即清空订阅，旧实现仅在
+ *          启动订阅一次，一次断网重连后 OTA 升级通道永久失效；
+ *          现在每次重连成功都会重新订阅。
+ *   P2-19: 连接异步建立（on_connect 才置 g_connected），旧实现固定
+ *          sleep 0.5s 后调用，慢网/认证慢的 broker 下静默失败且永不
+ *          重试；现在由 CONNACK 事件驱动，不存在时序竞态。
+ *
+ * 有意的语义改进：online 状态随每次重连重发。旧实现只在启动时发
+ * 一次，断网期间 broker 侧由遗嘱消息标记 offline，重连后不再刷新；
+ * 现在每次重连都会重发 online，broker 侧状态与真实连接保持一致。
+ *
+ * 线程说明：回调运行在 libmosquitto 网络线程，从回调内调用
+ * mosquitto_publish / mosquitto_subscribe 是官方文档允许的用法
+ * （与 loop_start 配合的线程安全接口）。
+ */
+static void on_mqtt_connected(void) {
+    /* online 状态随每次连接/重连成功重发（语义改进，见函数头注释） */
+    if (mqtt_publish_status(&g_cfg, &g_dev, "online") != E_OK)
+        LOG_WARN("publish online status failed on connect");
+
+    /* P1-13 核心：clean session 下 broker 已清订阅，必须重订 */
+    if (mqtt_subscribe_ota(g_cfg.client_id) != E_OK)
+        LOG_WARN("subscribe ota topic failed on connect");
+}
+
 /* ─── 入口 ────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
@@ -407,17 +442,24 @@ int main(int argc, char *argv[]) {
     char will_topic[256];
     snprintf(will_topic, sizeof(will_topic), "%s/status", g_cfg.topic);
 
-    /* 5b. MQTT 连接（传入遗嘱 topic + payload） */
+    /*
+     * 5b. P2-19: 注册"连接成功"回调。必须在 mqtt_init 之前注册：
+     * mqtt_init 内部 mosquitto_connect + loop_start 返回后，CONNACK
+     * 随时可能先于 main 的下一条语句到达（连接由网络线程异步建立），
+     * 若注册在 mqtt_init 之后，存在"首次 CONNACK 已到但回调未注册"
+     * 的窗口，online 上报与 OTA 订阅会静默丢失。提前注册则该窗口不
+     * 存在；mqtt_init 失败（E_NET）路径下连接从未建立，on_connect
+     * 不会触发，离线模式行为不受影响。
+     */
+    mqtt_set_connected_callback(on_mqtt_connected);
+
+    /* 5c. MQTT 连接（传入遗嘱 topic + payload）。
+     * P1-13/P2-19: 旧的 5c/5d（usleep(500000) + 一次性 publish
+     * online / subscribe ota）已删除——online 上报与 OTA 订阅移入
+     * on_mqtt_connected 回调，由每次 CONNACK 成功事件驱动。 */
     if (mqtt_init(g_cfg.broker_host, g_cfg.broker_port, g_cfg.client_id,
                   &g_cfg.tls, will_topic, will_payload) != E_OK) {
         LOG_WARN("mqtt_init failed, running in offline mode");
-    } else {
-        /* 5c. 等待连接建立后发布在线状态 */
-        usleep(500000);
-        mqtt_publish_status(&g_cfg, &g_dev, "online");
-
-        /* 5d. 订阅 OTA 升级指令 */
-        mqtt_subscribe_ota(g_cfg.client_id);
     }
 
     /* 6. 初始化 Modbus（可选模块） */

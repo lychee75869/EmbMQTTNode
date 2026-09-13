@@ -15,6 +15,7 @@
 #include <string.h>
 #include <assert.h>
 #include <time.h>
+#include <pthread.h>
 #include "../src/common.h"
 #include "../src/rule_engine.h"
 #include "../src/config.h"
@@ -417,6 +418,110 @@ static void test_edge_cases(void)
     rule_engine_close();
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * 测试 8: 并发烟雾测试（P1-2 / v1.2.11）
+ *
+ * 模拟生产竞争面：
+ *   - 两个"采集线程"（sample_thread + modbus_thread）并发 evaluate
+ *   - 一个"dashboard 线程"（http_thread）并发 get_stats
+ *
+ * 阶段一（状态搅动，静默）：OP_RATE 规则每次 evaluate 都写
+ * rate_history 环形缓冲（竞争面 #1），阈值设为永不触发。
+ * 阶段二（精确计数）：无冷却、恒触发的 gt 规则，两线程各调 N 次，
+ * 最终 trigger_count 必须精确等于 2N——若统计更新不是原子的
+ * （修复前的无锁竞争），并发自增必然丢失更新，计数 < 2N。
+ * ═══════════════════════════════════════════════════════════ */
+
+#define CONC_CHURN_ITERS  5000   /* 阶段一：每线程 evaluate 次数 */
+#define CONC_TRIGG_ITERS  25     /* 阶段二：每线程 evaluate 次数 */
+
+/* 线程函数共用的字段值：阶段一 25.0（不触发），阶段二 60.0（恒触发） */
+static double g_conc_temp = 25.0;
+
+static void *conc_eval_thread(void *arg)
+{
+    int iters = *(const int *)arg;
+    struct sensor_data d = make_data(g_conc_temp, 50.0, 1013.0);
+    char msg[256];
+    for (int i = 0; i < iters; i++)
+        rule_engine_evaluate(&d, msg, (int)sizeof(msg));
+    return NULL;
+}
+
+static void *conc_stats_thread(void *arg)
+{
+    int iters = *(const int *)arg;
+    struct rule_stats st[RULE_MAX];
+    for (int i = 0; i < iters; i++) {
+        int n = rule_engine_get_stats(st, RULE_MAX);
+        assert(n == 1);
+        assert(strcmp(st[0].name, "r_conc") == 0);
+    }
+    return NULL;
+}
+
+static void test_concurrency(void)
+{
+    printf("--- test_concurrency (P1-2) ---\n");
+
+    /* ── 阶段一：rate_history 高频并发读写 + get_stats 并发读 ── */
+    {
+        struct node_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.rule_count = 1;
+        /* 阈值 1e9：rate 永不触发，但每次 evaluate 都会 push 历史 */
+        make_rule(&cfg.rules[0], "r_conc", "temperature", OP_RATE,
+                  1e9, 0, 0, ACTION_LOG_ONLY, 0);
+        assert(rule_engine_init(&cfg) == E_OK);
+
+        int iters = CONC_CHURN_ITERS;
+        pthread_t ta, tb, tc;
+        assert(pthread_create(&ta, NULL, conc_eval_thread, &iters) == 0);
+        assert(pthread_create(&tb, NULL, conc_eval_thread, &iters) == 0);
+        assert(pthread_create(&tc, NULL, conc_stats_thread, &iters) == 0);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+        pthread_join(tc, NULL);
+
+        struct rule_stats st[2];
+        int n = rule_engine_get_stats(st, 2);
+        assert(n == 1);
+        assert(st[0].trigger_count == 0);   /* 永不触发 */
+        printf("  churn: 2x%d evals + %d stats reads, no crash: PASS\n",
+               CONC_CHURN_ITERS, CONC_CHURN_ITERS);
+
+        rule_engine_close();
+    }
+
+    /* ── 阶段二：恒触发规则，统计计数必须精确无丢失 ── */
+    {
+        struct node_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.rule_count = 1;
+        /* 无冷却：每次 evaluate 必然触发一次并自增 trigger_count */
+        make_rule(&cfg.rules[0], "r_cnt", "temperature", OP_GT,
+                  50.0, 0, 0, ACTION_LOG_ONLY, 0);
+        assert(rule_engine_init(&cfg) == E_OK);
+
+        g_conc_temp = 60.0;   /* 60 > 50：恒触发 */
+        int iters = CONC_TRIGG_ITERS;
+        pthread_t ta, tb;
+        assert(pthread_create(&ta, NULL, conc_eval_thread, &iters) == 0);
+        assert(pthread_create(&tb, NULL, conc_eval_thread, &iters) == 0);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+
+        struct rule_stats st[2];
+        int n = rule_engine_get_stats(st, 2);
+        assert(n == 1);
+        assert(st[0].trigger_count == 2 * CONC_TRIGG_ITERS);
+        printf("  exact count: %d == 2x%d triggers, no lost update: PASS\n",
+               st[0].trigger_count, CONC_TRIGG_ITERS);
+
+        rule_engine_close();
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════ */
 
 int main(void)
@@ -430,6 +535,7 @@ int main(void)
     test_statistics();
     test_config_parsing();
     test_edge_cases();
+    test_concurrency();
 
     printf("\n=== ALL rule engine tests PASSED ===\n");
     return 0;

@@ -211,9 +211,10 @@ static void test_edge_cases(void)
         anomaly_engine_close();
     }
 
-    /* 未初始化时调用 evaluate */
+    /* 未初始化时调用 evaluate（补全 id/source 字段初始化，消除
+     * -Wmissing-field-initializers 告警，v1.2.11 零警告要求） */
     assert(anomaly_engine_evaluate(
-               &(struct sensor_data){25.0, 50.0, 1013.0, 0},
+               &(struct sensor_data){25.0, 50.0, 1013.0, 0, 0, 0},
                NULL, 0) == 0);
     printf("  evaluate while closed:         PASS\n");
 

@@ -11,11 +11,28 @@
  *   - 统计数据收集（供 Web Dashboard 查询）
  *
  * 后续叠加（阶段二）：Isolation Forest 推理引擎
+ *
+ * v1.2.11（P1-2 修复）：共享状态数据竞争。
+ *   modbus_enabled=1 时 sample_thread 与 modbus_thread 并发调用
+ *   anomaly_engine_evaluate，http_thread 并发调用
+ *   anomaly_engine_get_stats，对 window / last_triggered / g_stats
+ *   的无锁读写构成 C11 UB。修复方式与 rule_engine.c 一致：
+ *   静态互斥锁 g_lock + 锁内只碰内存（LOG 移到解锁后打印，
+ *   参考 ota.c 的 g_state_lock 模式）。
+ *   锁序说明：本锁与 rule_engine 的锁互不嵌套——main.c 的
+ *   process_sensor_data 顺序调用两个 evaluate，http_server.c 的
+ *   handler 顺序调用两个 get_stats，任一时刻单线程最多持有一把
+ *   引擎锁，不存在锁层级，也就不可能死锁。
+ *   init/close 不加锁：生命周期函数仅由 main 线程在工作线程创建前 /
+ *   join 后调用（见 main.c 步骤 8/13），无并发访问窗口。
+ *   已知例外：iforest_predict 在模型缺失时打一次 LOG_WARN（进程
+ *   生命周期仅一次），该罕见路径的日志在锁内，不影响正确性。
  */
 
 #include "anomaly_engine.h"
 #include "iforest_model.h"
 #include <math.h>
+#include <pthread.h>
 
 /* ─── 内部状态 ─────────────────────────────────────────── */
 
@@ -23,6 +40,12 @@ static struct anomaly_config g_anoms[ANOMALY_MAX];
 static int                   g_anomaly_count = 0;
 static int                   g_initialized   = 0;
 static struct anomaly_stats  g_stats[ANOMALY_MAX];
+
+/* P1-2（v1.2.11）：保护 g_anoms / g_anomaly_count / g_initialized /
+ * g_stats 的所有运行时读写（evaluate 与 get_stats）。
+ * 静态初始化，进程生命周期内无需 destroy / 重新初始化；
+ * anomaly_engine_init 重置的是状态数据，锁本身保持可用。 */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ─── 时间戳获取（单调时钟，不受系统时间调整影响）─────── */
 
@@ -323,12 +346,29 @@ int anomaly_engine_init(const struct node_config *cfg)
 uint8_t anomaly_engine_evaluate(const struct sensor_data *data,
                                  char *alert_msg, int alert_msg_len)
 {
-    if (!g_initialized || !data)
+    if (!data)
         return 0;
 
     int64_t now          = now_ms();
     uint8_t triggered    = 0;
     int     alert_written = 0;
+
+    /* P1-2: 锁内只收集触发日志、锁外打印——临界区内不做任何 I/O
+     * （参考 ota.c "锁内只碰内存" 的做法）。 */
+    struct trigger_log {
+        char    name[ANOMALY_NAME_LEN];
+        int     count;
+        uint8_t mask;
+        double  score;
+    } logs[ANOMALY_MAX];
+    int log_count = 0;
+
+    pthread_mutex_lock(&g_lock);
+
+    if (!g_initialized) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
 
     for (int i = 0; i < g_anomaly_count; i++) {
         struct anomaly_config *a = &g_anoms[i];
@@ -354,17 +394,31 @@ uint8_t anomaly_engine_evaluate(const struct sensor_data *data,
             g_stats[i].last_triggered = now;
             triggered |= a->action_mask;
 
-            LOG_INFO("anomaly triggered: '%s' (count=%d, act=0x%02x, "
-                     "score=%.4f)",
-                     a->name, g_stats[i].trigger_count,
-                     a->action_mask, score);
-
-            /* 仅第一条触发规则生成告警消息 */
+            /* 仅第一条触发规则生成告警消息
+             * （写调用方栈缓冲，纯内存操作，可在锁内进行） */
             if (!alert_written && alert_msg && alert_msg_len > 0) {
                 gen_alert_msg(a, data, score, alert_msg, alert_msg_len);
                 alert_written = 1;
             }
+
+            /* 日志解锁后统一打印，此处只登记 */
+            if (log_count < ANOMALY_MAX) {
+                memcpy(logs[log_count].name, a->name, ANOMALY_NAME_LEN);
+                logs[log_count].count = g_stats[i].trigger_count;
+                logs[log_count].mask  = a->action_mask;
+                logs[log_count].score = score;
+                log_count++;
+            }
         }
+    }
+
+    pthread_mutex_unlock(&g_lock);
+
+    for (int i = 0; i < log_count; i++) {
+        LOG_INFO("anomaly triggered: '%s' (count=%d, act=0x%02x, "
+                 "score=%.4f)",
+                 logs[i].name, logs[i].count,
+                 logs[i].mask, logs[i].score);
     }
 
     return triggered;
@@ -375,10 +429,15 @@ int anomaly_engine_get_stats(struct anomaly_stats *stats, int max_count)
     if (!stats || max_count <= 0)
         return E_INVAL;
 
+    /* P1-2: 读侧同样持锁——http_thread 与采集线程的 evaluate 并发，
+     * 无锁 memcpy 会读到半更新的统计字段。拷贝到调用方缓冲后立即
+     * 解锁，快照一致。 */
+    pthread_mutex_lock(&g_lock);
     int n = (g_anomaly_count < max_count) ? g_anomaly_count : max_count;
     for (int i = 0; i < n; i++) {
         memcpy(&stats[i], &g_stats[i], sizeof(struct anomaly_stats));
     }
+    pthread_mutex_unlock(&g_lock);
     return n;
 }
 

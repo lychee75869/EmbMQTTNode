@@ -9,10 +9,25 @@
  *   - 变化率（rate）使用滑动窗口 + 环形缓冲区
  *   - 返回动作掩码，由调用方执行 MQTT 告警 / GPIO 控制
  *   - 统计数据收集（供 Web Dashboard 查询）
+ *
+ * v1.2.11（P1-2 修复）：共享状态数据竞争。
+ *   modbus_enabled=1 时 sample_thread 与 modbus_thread 并发调用
+ *   rule_engine_evaluate，http_thread 并发调用 rule_engine_get_stats，
+ *   对 rate_history / last_triggered / g_stats 的无锁读写构成 C11 UB。
+ *   修复：静态互斥锁 g_lock 保护全部共享状态（PTHREAD_MUTEX_INITIALIZER
+ *   静态初始化，不改 init 接口）；锁内只碰内存，LOG 移到解锁后打印
+ *   （参考 ota.c 的 g_state_lock 模式）。
+ *   锁序说明：本锁与 anomaly_engine 的锁互不嵌套——main.c 的
+ *   process_sensor_data 顺序调用两个 evaluate，http_server.c 的
+ *   handler 顺序调用两个 get_stats，任一时刻单线程最多持有一把
+ *   引擎锁，不存在锁层级，也就不可能死锁。
+ *   init/close 不加锁：生命周期函数仅由 main 线程在工作线程创建前 /
+ *   join 后调用（见 main.c 步骤 7/13），无并发访问窗口。
  */
 
 #include "rule_engine.h"
 #include <math.h>
+#include <pthread.h>
 
 /* ─── 内部状态 ─────────────────────────────────────────── */
 
@@ -20,6 +35,12 @@ static struct rule  g_rules[RULE_MAX];       /* 规则副本（含运行时状�
 static int          g_rule_count = 0;         /* 已加载规则数 */
 static int          g_initialized = 0;        /* 初始化标志 */
 static struct rule_stats g_stats[RULE_MAX];   /* 统计信息 */
+
+/* P1-2（v1.2.11）：保护 g_rules / g_rule_count / g_initialized / g_stats
+ * 的所有运行时读写（evaluate 与 get_stats）。
+ * 静态初始化，进程生命周期内无需 destroy / 重新初始化；
+ * rule_engine_init 重置的是状态数据，锁本身保持可用。 */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ─── 时间戳获取（单调时钟，不受系统时间调整影响）─────── */
 
@@ -204,12 +225,29 @@ int rule_engine_init(const struct node_config *cfg)
 uint8_t rule_engine_evaluate(const struct sensor_data *data,
                               char *alert_msg, int alert_msg_len)
 {
-    if (!g_initialized || !data)
+    if (!data)
         return 0;
 
     int64_t now          = now_ms();
     uint8_t triggered    = 0;
     int     alert_written = 0;
+
+    /* P1-2: 锁内只收集触发日志、锁外打印——临界区内不做任何 I/O
+     * （fprintf 到 stdout 在终端阻塞时会拖住另一个采集线程，
+     * 参考 ota.c "锁内只碰内存" 的做法）。 */
+    struct trigger_log {
+        char    name[RULE_NAME_LEN];
+        int     count;
+        uint8_t mask;
+    } logs[RULE_MAX];
+    int log_count = 0;
+
+    pthread_mutex_lock(&g_lock);
+
+    if (!g_initialized) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
 
     for (int i = 0; i < g_rule_count; i++) {
         struct rule *r = &g_rules[i];
@@ -227,16 +265,28 @@ uint8_t rule_engine_evaluate(const struct sensor_data *data,
             g_stats[i].last_triggered = now;
             triggered |= r->action_mask;
 
-            LOG_INFO("rule triggered: '%s' (count=%d, act=0x%02x)",
-                     r->name, g_stats[i].trigger_count,
-                     r->action_mask);
-
-            /* 仅第一条触发规则生成告警消息 */
+            /* 仅第一条触发规则生成告警消息
+             * （写调用方栈缓冲，纯内存操作，可在锁内进行） */
             if (!alert_written && alert_msg && alert_msg_len > 0) {
                 gen_alert_msg(r, data, alert_msg, alert_msg_len);
                 alert_written = 1;
             }
+
+            /* 日志解锁后统一打印，此处只登记 */
+            if (log_count < RULE_MAX) {
+                memcpy(logs[log_count].name, r->name, RULE_NAME_LEN);
+                logs[log_count].count = g_stats[i].trigger_count;
+                logs[log_count].mask  = r->action_mask;
+                log_count++;
+            }
         }
+    }
+
+    pthread_mutex_unlock(&g_lock);
+
+    for (int i = 0; i < log_count; i++) {
+        LOG_INFO("rule triggered: '%s' (count=%d, act=0x%02x)",
+                 logs[i].name, logs[i].count, logs[i].mask);
     }
 
     return triggered;
@@ -247,10 +297,15 @@ int rule_engine_get_stats(struct rule_stats *stats, int max_count)
     if (!stats || max_count <= 0)
         return E_INVAL;
 
+    /* P1-2: 读侧同样持锁——http_thread 与采集线程的 evaluate 并发，
+     * 无锁 memcpy 会读到半更新的 trigger_count / last_triggered。
+     * 拷贝到调用方缓冲后立即解锁，快照一致。 */
+    pthread_mutex_lock(&g_lock);
     int n = (g_rule_count < max_count) ? g_rule_count : max_count;
     for (int i = 0; i < n; i++) {
         memcpy(&stats[i], &g_stats[i], sizeof(struct rule_stats));
     }
+    pthread_mutex_unlock(&g_lock);
     return n;
 }
 

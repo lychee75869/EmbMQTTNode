@@ -21,7 +21,10 @@
 #include <errno.h>
 #include <unistd.h>
 
-#define EMBMQTTNODE_VERSION "1.2.10"
+/* v1.2.11（P1-2 修复）：规则/异常引擎共享状态数据竞争——
+ * 两引擎各加静态互斥锁，evaluate/get_stats 全程持锁，
+ * 锁内不做 I/O（详见 src/rule_engine.c / src/anomaly_engine.c 头注释） */
+#define EMBMQTTNODE_VERSION "1.2.11"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败

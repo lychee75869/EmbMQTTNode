@@ -60,7 +60,9 @@ static const char *make_tmp_root(void) {
  * contents 可以为 ""（建空文件）或 NULL（只建目录、address 不存在）。
  */
 static void write_addr(const char *root, const char *iface, const char *contents) {
-    char dir[256], path[256];
+    /* path 预留 "/address" 后缀空间，消除 -Wformat-truncation 告警
+     * （v1.2.11 零警告要求） */
+    char dir[256], path[256 + 16];
     snprintf(dir,  sizeof(dir),  "%s/%s", root, iface);
     snprintf(path, sizeof(path), "%s/address", dir);
 

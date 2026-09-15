@@ -72,20 +72,20 @@ static void test_zscore_basic(void)
     /* Phase 1: 建立基线 — 20 个正常值 */
     for (int i = 0; i < 20; i++) {
         struct sensor_data d = make_data(25.0, 55.0, 1013.0);
-        uint8_t act = anomaly_engine_evaluate(&d, NULL, 0);
+        uint8_t act = anomaly_engine_evaluate(&d, NULL, 0, NULL);
         assert(act == 0);  /* 基线稳定，不触发 */
     }
     printf("  baseline built (20 samples of 25.0C): PASS\n");
 
     /* Phase 2: 注入异常 — 温度突跳到 50℃ */
     struct sensor_data anomaly = make_data(50.0, 55.0, 1013.0);
-    uint8_t act = anomaly_engine_evaluate(&anomaly, NULL, 0);
+    uint8_t act = anomaly_engine_evaluate(&anomaly, NULL, 0, NULL);
     assert(act & ACTION_LOG_ONLY);
     printf("  anomaly (50.0C) triggered:            PASS\n");
 
     /* Phase 3: 返回正常值 — 不触发 */
     struct sensor_data normal = make_data(25.0, 55.0, 1013.0);
-    act = anomaly_engine_evaluate(&normal, NULL, 0);
+    act = anomaly_engine_evaluate(&normal, NULL, 0, NULL);
     assert(act == 0);
     printf("  normal (25.0C) not triggered:         PASS\n");
 
@@ -116,7 +116,7 @@ static void test_window_sliding(void)
     /* 填充窗口: 20,22,24,26,28,30,32,34,36,38 */
     for (int i = 0; i < 10; i++) {
         struct sensor_data d = make_data(20.0 + i * 2.0, 55.0, 1013.0);
-        anomaly_engine_evaluate(&d, NULL, 0);
+        anomaly_engine_evaluate(&d, NULL, 0, NULL);
     }
 
     /* 检查统计量 */
@@ -127,7 +127,7 @@ static void test_window_sliding(void)
 
     /* 插入一个偏离值: 50.0 → z ≈ (50-29)/6.06 ≈ 3.46 > 3.0 */
     struct sensor_data outlier = make_data(50.0, 55.0, 1013.0);
-    uint8_t act = anomaly_engine_evaluate(&outlier, NULL, 0);
+    uint8_t act = anomaly_engine_evaluate(&outlier, NULL, 0, NULL);
     assert(act & ACTION_LOG_ONLY);
     printf("  outlier (50.0) triggered:   PASS\n");
 
@@ -159,17 +159,17 @@ static void test_cooldown(void)
     /* 建立基线 */
     for (int i = 0; i < 10; i++) {
         struct sensor_data d = make_data(25.0, 55.0, 1013.0);
-        anomaly_engine_evaluate(&d, NULL, 0);
+        anomaly_engine_evaluate(&d, NULL, 0, NULL);
     }
 
     /* 第一次触发 */
     struct sensor_data d1 = make_data(50.0, 55.0, 1013.0);
-    uint8_t act = anomaly_engine_evaluate(&d1, NULL, 0);
+    uint8_t act = anomaly_engine_evaluate(&d1, NULL, 0, NULL);
     assert(act & ACTION_LOG_ONLY);
     printf("  first trigger:               PASS\n");
 
     /* 立即再评估，应在冷却期内 */
-    act = anomaly_engine_evaluate(&d1, NULL, 0);
+    act = anomaly_engine_evaluate(&d1, NULL, 0, NULL);
     assert(act == 0);
     printf("  cooldown suppressed:         PASS\n");
 
@@ -180,7 +180,7 @@ static void test_cooldown(void)
     }
 
     /* 冷却结束后再次触发 */
-    act = anomaly_engine_evaluate(&d1, NULL, 0);
+    act = anomaly_engine_evaluate(&d1, NULL, 0, NULL);
     assert(act & ACTION_LOG_ONLY);
     printf("  after cooldown triggered:    PASS\n");
 
@@ -206,7 +206,7 @@ static void test_edge_cases(void)
         cfg.anomaly_count   = 0;
         assert(anomaly_engine_init(&cfg) == E_OK);
         struct sensor_data d = make_data(25.0, 50.0, 1013.0);
-        assert(anomaly_engine_evaluate(&d, NULL, 0) == 0);
+        assert(anomaly_engine_evaluate(&d, NULL, 0, NULL) == 0);
         printf("  disabled + empty rules:       PASS\n");
         anomaly_engine_close();
     }
@@ -214,8 +214,8 @@ static void test_edge_cases(void)
     /* 未初始化时调用 evaluate（补全 id/source 字段初始化，消除
      * -Wmissing-field-initializers 告警，v1.2.11 零警告要求） */
     assert(anomaly_engine_evaluate(
-               &(struct sensor_data){25.0, 50.0, 1013.0, 0, 0, 0},
-               NULL, 0) == 0);
+               &(struct sensor_data){25.0, 50.0, 1013.0, 0, 0, 0, 0},
+               NULL, 0, NULL) == 0);
     printf("  evaluate while closed:         PASS\n");
 
     /* NULL data */
@@ -227,7 +227,7 @@ static void test_edge_cases(void)
         make_anomaly(&cfg.anoms[0], "r", "temperature",
                      ANOMALY_ZSCORE, 3.0, ACTION_LOG_ONLY, 0);
         assert(anomaly_engine_init(&cfg) == E_OK);
-        assert(anomaly_engine_evaluate(NULL, NULL, 0) == 0);
+        assert(anomaly_engine_evaluate(NULL, NULL, 0, NULL) == 0);
         printf("  NULL data:                    PASS\n");
         anomaly_engine_close();
     }
@@ -242,7 +242,7 @@ static void test_edge_cases(void)
                      ANOMALY_ZSCORE, 1.0, ACTION_LOG_ONLY, 0);
         assert(anomaly_engine_init(&cfg) == E_OK);
         struct sensor_data d = make_data(100.0, 50.0, 1013.0);
-        uint8_t act = anomaly_engine_evaluate(&d, NULL, 0);
+        uint8_t act = anomaly_engine_evaluate(&d, NULL, 0, NULL);
         assert(act == 0);  /* 仅 1 个样本，窗口不足 */
         printf("  insufficient window (n=1):     PASS\n");
         anomaly_engine_close();
@@ -258,7 +258,7 @@ static void test_edge_cases(void)
                      ANOMALY_ZSCORE, 1.0, ACTION_LOG_ONLY, 0);
         assert(anomaly_engine_init(&cfg) == E_OK);
         struct sensor_data d = make_data(25.0, 50.0, 1013.0);
-        uint8_t act = anomaly_engine_evaluate(&d, NULL, 0);
+        uint8_t act = anomaly_engine_evaluate(&d, NULL, 0, NULL);
         assert(act == 0);  /* 未知字段永不触发 */
         printf("  unknown field:                PASS\n");
         anomaly_engine_close();
@@ -287,19 +287,19 @@ static void test_action_masks(void)
     /* 建立基线 */
     for (int i = 0; i < 10; i++) {
         struct sensor_data d = make_data(25.0, 55.0, 1013.0);
-        anomaly_engine_evaluate(&d, NULL, 0);
+        anomaly_engine_evaluate(&d, NULL, 0, NULL);
     }
 
     /* 只有温度异常 → 只触发 alert_mqtt */
     struct sensor_data d1 = make_data(50.0, 55.0, 1013.0);
-    uint8_t act = anomaly_engine_evaluate(&d1, NULL, 0);
+    uint8_t act = anomaly_engine_evaluate(&d1, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
     assert(!(act & ACTION_GPIO_1));
     printf("  alert_mqtt only:              PASS\n");
 
     /* 湿度和温度都异常 → alert_mqtt + gpio_1 + gpio_2 */
     struct sensor_data d2 = make_data(50.0, 5.0, 1013.0);
-    act = anomaly_engine_evaluate(&d2, NULL, 0);
+    act = anomaly_engine_evaluate(&d2, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
     assert(act & ACTION_GPIO_1);
     assert(act & ACTION_GPIO_2);
@@ -334,13 +334,13 @@ static void test_statistics(void)
     /* 建立基线 */
     for (int i = 0; i < 10; i++) {
         struct sensor_data d = make_data(25.0, 55.0, 1013.0);
-        anomaly_engine_evaluate(&d, NULL, 0);
+        anomaly_engine_evaluate(&d, NULL, 0, NULL);
     }
 
     /* a1 触发 3 次，a2 触发 1 次 */
     for (int i = 0; i < 3; i++) {
         struct sensor_data d = make_data(50.0, 10.0, 1013.0);
-        anomaly_engine_evaluate(&d, NULL, 0);
+        anomaly_engine_evaluate(&d, NULL, 0, NULL);
     }
 
     struct anomaly_stats stats[4];
@@ -410,10 +410,10 @@ static void test_config_parsing(void)
     /* 建立基线后触发 zscore anomaly_1 */
     for (int i = 0; i < 10; i++) {
         struct sensor_data d = make_data(25.0, 55.0, 1013.0);
-        anomaly_engine_evaluate(&d, NULL, 0);
+        anomaly_engine_evaluate(&d, NULL, 0, NULL);
     }
     struct sensor_data d_bad = make_data(60.0, 55.0, 1013.0);
-    uint8_t act = anomaly_engine_evaluate(&d_bad, NULL, 0);
+    uint8_t act = anomaly_engine_evaluate(&d_bad, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
     assert(act & ACTION_GPIO_1);
     printf("  evaluated from parsed config: PASS\n");
@@ -441,7 +441,7 @@ static void test_iforest_model(void)
 
     /* 用正常范围的传感器数据评估 */
     struct sensor_data d_normal = make_data(25.0, 55.0, 1013.0);
-    uint8_t act = anomaly_engine_evaluate(&d_normal, NULL, 0);
+    uint8_t act = anomaly_engine_evaluate(&d_normal, NULL, 0, NULL);
 
     /* 行为取决于模型是否可用 */
     if (IFOREST_AVAILABLE) {
@@ -453,7 +453,7 @@ static void test_iforest_model(void)
 
         /* 极端异常数据应得分 > 阈值 */
         struct sensor_data d_anom = make_data(42.0, 15.0, 985.0);
-        act = anomaly_engine_evaluate(&d_anom, NULL, 0);
+        act = anomaly_engine_evaluate(&d_anom, NULL, 0, NULL);
         /* 注意：stub 模型下 act=0，真实模型下通常触发 */
         printf("  extreme sample: act=0x%02x\n", act);
     } else {
@@ -462,6 +462,44 @@ static void test_iforest_model(void)
         assert(act == 0);
         printf("  stub gracefully returns no-alert: PASS\n");
     }
+
+    anomaly_engine_close();
+}
+
+/* ═══════════════════════════════════════════════════════════
+ * 测试 9: 哨兵回归（P0-0，pressure=SENSOR_VALUE_INVALID）
+ *
+ * Z-score 建基线后喂入哨兵 pressure：修复前会因偏离巨大而误触发；
+ * 统一 SENSOR_VALUE_INVALID 后，该字段永不参与异常判定。
+ * ═══════════════════════════════════════════════════════════ */
+static void test_sentinel_pressure(void)
+{
+    printf("--- test_sentinel_pressure (P0-0) ---\n");
+
+    struct node_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.anomaly_enabled = 1;
+    cfg.anomaly_count   = 1;
+    make_anomaly(&cfg.anoms[0], "a_pres", "pressure",
+                 ANOMALY_ZSCORE, 2.0, ACTION_LOG_ONLY, 0);
+    cfg.anoms[0].window_size = 10;
+    assert(anomaly_engine_init(&cfg) == E_OK);
+
+    /* 建立正常气压基线 */
+    for (int i = 0; i < 10; i++) {
+        struct sensor_data d = make_data(25.0, 55.0, 1013.0);
+        assert(anomaly_engine_evaluate(&d, NULL, 0, NULL) == 0);
+    }
+
+    /* 哨兵：不触发（修复点） */
+    struct sensor_data d_bad = make_data(25.0, 55.0, SENSOR_VALUE_INVALID);
+    assert(anomaly_engine_evaluate(&d_bad, NULL, 0, NULL) == 0);
+    printf("  sentinel pressure not triggered: PASS\n");
+
+    /* 对照：真实越界气压触发 */
+    struct sensor_data d_ok = make_data(25.0, 55.0, 2500.0);
+    assert(anomaly_engine_evaluate(&d_ok, NULL, 0, NULL) & ACTION_LOG_ONLY);
+    printf("  real pressure outlier triggered: PASS\n");
 
     anomaly_engine_close();
 }
@@ -480,6 +518,7 @@ int main(void)
     test_statistics();
     test_config_parsing();
     test_iforest_model();
+    test_sentinel_pressure();
 
     printf("\n=== ALL anomaly engine tests PASSED ===\n");
     return 0;

@@ -41,14 +41,29 @@ typedef enum sensor_source {
     SOURCE_MODBUS = 1, /* Modbus 从站数据 */
 } sensor_source_t;
 
+/* 全项目唯一的"无此字段 / 无效值"哨兵（docs/12 §3.5）。
+ *
+ * 语义：任何字段值 == SENSOR_VALUE_INVALID 一律按"无效值"处理——
+ *   - 引擎（rule/anomaly）判定时该字段永不匹配（不参与规则/异常判定）；
+ *   - huawei builder 侧整体省略该字段不上报（方案 A mask，local 路径不 mask）。
+ *
+ * 历史 bug（本宏统一后消除）：SHT30 无气压测量曾写 -1.0（sensor.c），
+ * 而引擎判定只拦 -999.0 → pressure=-1.0 被当真实气压参与规则/异常判定，
+ * 并被当作有效值上报云端。统一引用本宏后，哨兵赋值点与判定点一致。 */
+#define SENSOR_VALUE_INVALID (-999.0)
+
 /* 传感器数据结构 */
 struct sensor_data {
     double    temperature;   /* 摄氏度 */
-    double    humidity;      /* %RH，无传感器时为 -1 */
-    double    pressure;      /* hPa，无传感器时为 -1 */
-    int64_t   timestamp_ms;  /* 毫秒时间戳 */
+    double    humidity;      /* %RH，无有效读数时 = SENSOR_VALUE_INVALID */
+    double    pressure;      /* hPa，无有效读数时 = SENSOR_VALUE_INVALID */
+    int64_t   timestamp_ms;  /* 毫秒时间戳（采样时刻，事件 event_time 源） */
     int64_t   id;            /* SQLite 自增主键，0 表示未持久化（storage_save 成功后回填） */
     sensor_source_t source;  /* 数据来源（storage_get_pending 读出，供补发时选择 topic） */
+    int       source_id;     /* 数据源实例标识（供 huawei 子设备注册表路由）：
+                              *   SOURCE_LOCAL  恒 0（本地板载传感器）；
+                              *   SOURCE_MODBUS 取从站地址 slave_id 1..247；
+                              *   未来 BLE 等数据源另占位（docs/12 §5 数据源无关键）。 */
 };
 
 /* ─── Modbus 协议配置 ─────────────────────────────────────── */
@@ -204,6 +219,22 @@ struct anomaly_stats {
     int64_t last_triggered;
     double  current_zscore;               /* 最近一次计算的 z-score */
     double  current_score;                /* iForest 异常分数 (0-1) */
+};
+
+/* ─── 结构化告警事件（P1-1；docs/12 §3.2）──────────────────
+ *
+ * rule/anomaly 引擎在触发时，除沿用的 msg 文本外，额外填充本结构，
+ * 供平台层（huawei 物模型事件）消费。local 路径只用 msg 字段，
+ * 行为与 v1.2.11 完全一致（msg 文本逐字节不变）。 */
+struct alert_event {
+    char    rule_name[32];   /* 触发规则/异常名 */
+    char    field[32];       /* 触发字段名 */
+    double  value;           /* 触发时的字段值 */
+    double  threshold;       /* 触发阈值（outside 取区间下界） */
+    char    source_kind[16]; /* "sensor"（source_id==0）/ "modbus"（source_id!=0） */
+    int     source_id;       /* 数据源实例：modbus slave_id / 本地传感器 0 */
+    char    msg[256];        /* 引擎生成文本，与 v1.2.11 相同 */
+    int64_t ts_ms;           /* 采样时刻（事件 event_time 源） */
 };
 
 /* ─── 严格 JSON 字符串字段提取（P1-7/P1-8/P1-6 共用）────────── */
@@ -407,6 +438,19 @@ struct node_config {
     int         anomaly_enabled;
     int         anomaly_count;
     struct      anomaly_config anoms[ANOMALY_MAX];
+
+    /* ─── 华为云 IoTDA 平台接入（v1.3.0 适配层，T01）──────────
+     * platform=local（缺省）时以下字段全部忽略，行为与 v1.2.11 完全一致。
+     * 缓冲尺寸依据 docs/12 §3.1/§5.2（官方 device_id String(256)）。 */
+    char    platform[16];            /* "local"（缺省）/ "huawei" */
+    char    huawei_device_id[260];   /* 网关设备 device_id（官方 String(256)） */
+    char    huawei_secret[128];      /* 设备密钥（永不打日志，config_dump 打码） */
+    int     huawei_auth_type;        /* 签名类型：0=不校验时间戳（缺省）/ 1=校验 */
+    int     huawei_keepalive;        /* MQTT keepalive 秒（钳制 30..1200，缺省 120） */
+    int     huawei_props_interval;   /* 网关属性周期上报间隔秒（缺省 60） */
+    int     subdev_offline_sec;      /* 子设备无数据判离线秒数（缺省 30） */
+    char    subdevices_conf[256];    /* 子设备注册表路径（缺省 config/subdevices.conf） */
+    char    huawei_ca_file[256];     /* 华为预置 CA 证书路径（TLS 锚点） */
 };
 
 /* 简单日志宏 */

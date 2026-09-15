@@ -66,7 +66,7 @@ static double get_field(const struct sensor_data *data, const char *field)
         return data->humidity;
     if (strcmp(field, "pressure") == 0)
         return data->pressure;
-    return -999.0;   /* 未知字段，永不为真 */
+    return SENSOR_VALUE_INVALID;   /* 未知字段，永不为真 */
 }
 
 /* ─── 滑动窗口操作 ─────────────────────────────────────── */
@@ -208,8 +208,8 @@ static int anomaly_match(const struct anomaly_config *a,
                           double *zscore_out)
 {
     double val = get_field(data, a->field);
-    if (val == -999.0)
-        return 0;   /* 未知字段 */
+    if (val == SENSOR_VALUE_INVALID)
+        return 0;   /* 无效值/未知字段 */
 
     /* ── iForest 分支 ── */
     if (a->algo == ANOMALY_IFOREST) {
@@ -344,7 +344,8 @@ int anomaly_engine_init(const struct node_config *cfg)
 }
 
 uint8_t anomaly_engine_evaluate(const struct sensor_data *data,
-                                 char *alert_msg, int alert_msg_len)
+                                 char *alert_msg, int alert_msg_len,
+                                 struct alert_event *out)
 {
     if (!data)
         return 0;
@@ -394,10 +395,26 @@ uint8_t anomaly_engine_evaluate(const struct sensor_data *data,
             g_stats[i].last_triggered = now;
             triggered |= a->action_mask;
 
-            /* 仅第一条触发规则生成告警消息
-             * （写调用方栈缓冲，纯内存操作，可在锁内进行） */
-            if (!alert_written && alert_msg && alert_msg_len > 0) {
-                gen_alert_msg(a, data, score, alert_msg, alert_msg_len);
+            /* 仅第一条触发规则生成告警消息。msg 文本生成逻辑与内容
+             * 与 v1.2.11 完全一致（先写本地 tmp，再按需拷贝到 alert_msg
+             * 与 out->msg）。填充 out 为纯内存操作，不破坏临界区结构。 */
+            if (!alert_written) {
+                char tmp[256] = {0};
+                gen_alert_msg(a, data, score, tmp, (int)sizeof(tmp));
+                if (alert_msg && alert_msg_len > 0)
+                    snprintf(alert_msg, alert_msg_len, "%s", tmp);
+                if (out) {
+                    memset(out, 0, sizeof(*out));
+                    strncpy(out->rule_name, a->name, sizeof(out->rule_name) - 1);
+                    strncpy(out->field, a->field, sizeof(out->field) - 1);
+                    out->value     = get_field(data, a->field);
+                    out->threshold = a->zscore_threshold;
+                    snprintf(out->source_kind, sizeof(out->source_kind), "%s",
+                             (data->source_id == 0) ? "sensor" : "modbus");
+                    out->source_id = data->source_id;
+                    snprintf(out->msg, sizeof(out->msg), "%s", tmp);
+                    out->ts_ms     = data->timestamp_ms;
+                }
                 alert_written = 1;
             }
 

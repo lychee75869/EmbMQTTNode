@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
+#include <sqlite3.h>
 #include "../src/storage.h"
 
 /* ═══════════════════════════════════════════════════════════ */
@@ -68,6 +69,8 @@ int main(void)
     d_local.humidity = 60.0;
     d_local.pressure = 1000.0;
     d_local.timestamp_ms = 2000;
+    d_local.source = SOURCE_LOCAL;
+    d_local.source_id = 0;              /* 本地传感器恒 0 */
     assert(storage_save(&d_local, SOURCE_LOCAL, "test-client") == E_OK);
 
     memset(&d_modbus, 0, sizeof(d_modbus));
@@ -75,6 +78,8 @@ int main(void)
     d_modbus.humidity = 70.0;
     d_modbus.pressure = 1020.0;
     d_modbus.timestamp_ms = 2001;
+    d_modbus.source = SOURCE_MODBUS;
+    d_modbus.source_id = 5;             /* Modbus slave_id */
     assert(storage_save(&d_modbus, SOURCE_MODBUS, "test-client") == E_OK);
 
     n = storage_get_pending(mixed_out, 2);
@@ -83,6 +88,10 @@ int main(void)
     assert(mixed_out[1].source == SOURCE_MODBUS);
     assert(mixed_out[0].temperature == 25.0);
     assert(mixed_out[1].temperature == 30.0);
+    /* source_id 读写回环（v1.3.0 T01） */
+    assert(mixed_out[0].source_id == 0);
+    assert(mixed_out[1].source_id == 5);
+    printf("  source_id round-trip (0 / 5): PASS\n");
 
     /* ── 5. legacy 接口仍可用（按时间戳全删）── */
     assert(storage_delete_sent(2001) == E_OK);
@@ -90,6 +99,43 @@ int main(void)
     assert(n == 0);
 
     storage_close();
+
+    /* ── 6. 旧库迁移：无 source_id 列时 storage_init 应 ALTER 补列（v1.3.0 T01）──
+     * 构造 v1.2.4 时代的表结构（有 source、无 source_id），预置一行，
+     * init 后应能正常读取，且迁移列 DEFAULT 0。 */
+    remove("test_legacy.db");
+    {
+        sqlite3 *db = NULL;
+        assert(sqlite3_open("test_legacy.db", &db) == SQLITE_OK);
+        char *err = NULL;
+        const char *legacy_sql =
+            "CREATE TABLE sensor_data ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " client_id TEXT NOT NULL,"
+            " timestamp_ms INTEGER NOT NULL,"
+            " temperature REAL NOT NULL,"
+            " humidity REAL NOT NULL,"
+            " pressure REAL NOT NULL,"
+            " source TEXT NOT NULL DEFAULT 'local');"
+            "INSERT INTO sensor_data "
+            "(client_id,timestamp_ms,temperature,humidity,pressure,source) "
+            "VALUES ('legacy',42,1.0,2.0,3.0,'local');";
+        assert(sqlite3_exec(db, legacy_sql, NULL, NULL, &err) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    assert(storage_init("test_legacy.db") == E_OK);
+    {
+        struct sensor_data legacy_out[1];
+        int ln = storage_get_pending(legacy_out, 1);
+        assert(ln == 1);
+        assert(legacy_out[0].timestamp_ms == 42);
+        assert(legacy_out[0].source == SOURCE_LOCAL);
+        assert(legacy_out[0].source_id == 0);   /* 迁移列 DEFAULT 0 */
+        printf("  legacy DB ALTER add source_id: PASS\n");
+    }
+    storage_close();
+    remove("test_legacy.db");
+
     printf("storage test passed\n");
     return 0;
 }

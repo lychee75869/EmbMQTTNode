@@ -10,14 +10,10 @@
 
 # 可执行文件
 src/embmqttnode
-tests/test_sensor
-tests/test_storage
-tests/test_modbus_config
-tests/test_rule_engine
-tests/test_ota
-tests/test_anomaly_engine
-tests/test_mqtt_client
-tests/test_mac_addr
+# 测试可执行文件（无扩展名二进制；源码 .c/.h 通过下方否定规则保留）
+tests/test_*
+!tests/test_*.c
+!tests/test_*.h
 
 # 数据库文件
 *.db

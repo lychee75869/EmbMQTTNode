@@ -30,6 +30,8 @@ int main(void)
         int rc = sensor_read(&data);
         assert(rc == E_OK);
         assert(data.timestamp_ms > 0);
+        /* 本地板载传感器数据源实例恒 0（v1.3.0 T01 source_id 契约） */
+        assert(data.source_id == 0);
 
         if ((i + 1) % 4 == 0) {
             /* 异常注入样本：范围外 */

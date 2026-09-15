@@ -26,12 +26,19 @@ static pthread_mutex_t g_db_mutex = PTHREAD_MUTEX_INITIALIZER;
     "    temperature REAL NOT NULL," \
     "    humidity REAL NOT NULL," \
     "    pressure REAL NOT NULL," \
-    "    source TEXT NOT NULL DEFAULT 'local'" \
+    "    source TEXT NOT NULL DEFAULT 'local'," \
+    "    source_id INTEGER NOT NULL DEFAULT 0" \
     ");"
 
 /* v1.2.4 之前旧库的表没有 source 列，需要 ALTER TABLE 补列 */
 #define SQL_MIGRATE_ADD_SOURCE \
     "ALTER TABLE sensor_data ADD COLUMN source TEXT NOT NULL DEFAULT 'local'"
+
+/* v1.3.0（T01）：旧库的表没有 source_id 列，需要 ALTER TABLE 补列。
+ * 复用 source 列的逐列迁移模板（同一套 try-ALTER + 容错风格），
+ * 不引入通用迁移框架（PRAGMA user_version + 幂等 ALTER 清单，列 P2）。 */
+#define SQL_MIGRATE_ADD_SOURCE_ID \
+    "ALTER TABLE sensor_data ADD COLUMN source_id INTEGER NOT NULL DEFAULT 0"
 
 int storage_init(const char *db_path)
 {
@@ -73,6 +80,27 @@ int storage_init(const char *db_path)
         LOG_INFO("storage migrated: added source column to sensor_data");
     }
 
+    /* ── migration：旧库表无 source_id 列时补列（v1.3.0 T01）──
+     * 与 source 列同一套探列模板。 */
+    sqlite3_stmt *ck_sid = NULL;
+    int has_source_id = 0;
+    if (sqlite3_prepare_v2(g_db, "SELECT source_id FROM sensor_data LIMIT 0",
+                           -1, &ck_sid, NULL) == SQLITE_OK) {
+        has_source_id = 1;
+        sqlite3_finalize(ck_sid);
+    }
+    if (!has_source_id) {
+        rc = sqlite3_exec(g_db, SQL_MIGRATE_ADD_SOURCE_ID, NULL, NULL, &err);
+        if (rc != SQLITE_OK) {
+            LOG_ERROR("migrate add source_id column failed: %s", err);
+            sqlite3_free(err);
+            sqlite3_close(g_db);
+            g_db = NULL;
+            return E_IO;
+        }
+        LOG_INFO("storage migrated: added source_id column to sensor_data");
+    }
+
     LOG_INFO("storage init ok: %s", db_path);
     return E_OK;
 }
@@ -83,8 +111,8 @@ int storage_save(const struct sensor_data *data, sensor_source_t source,
     if (!g_db || !data || !client_id) return E_INVAL;
 
     const char *sql = "INSERT INTO sensor_data "
-                      "(client_id, timestamp_ms, temperature, humidity, pressure, source) "
-                      "VALUES (?, ?, ?, ?, ?, ?);";
+                      "(client_id, timestamp_ms, temperature, humidity, pressure, source, source_id) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?);";
     sqlite3_stmt *stmt = NULL;
 
     pthread_mutex_lock(&g_db_mutex);
@@ -99,6 +127,7 @@ int storage_save(const struct sensor_data *data, sensor_source_t source,
     sqlite3_bind_text(stmt, 6,
                       (source == SOURCE_MODBUS) ? "modbus" : "local",
                       -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 7, data->source_id);
 
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_DONE) {
@@ -126,7 +155,7 @@ int storage_get_pending(struct sensor_data *out, int count)
 {
     if (!g_db || !out || count <= 0) return E_INVAL;
 
-    const char *sql = "SELECT id, timestamp_ms, temperature, humidity, pressure, source "
+    const char *sql = "SELECT id, timestamp_ms, temperature, humidity, pressure, source, source_id "
                       "FROM sensor_data ORDER BY timestamp_ms ASC, id ASC LIMIT ?;";
     sqlite3_stmt *stmt = NULL;
 
@@ -146,6 +175,7 @@ int storage_get_pending(struct sensor_data *out, int count)
         const unsigned char *src = sqlite3_column_text(stmt, 5);
         out[n].source = (src && strcmp((const char *)src, "modbus") == 0)
                             ? SOURCE_MODBUS : SOURCE_LOCAL;
+        out[n].source_id     = sqlite3_column_int(stmt, 6);
         n++;
     }
     sqlite3_finalize(stmt);

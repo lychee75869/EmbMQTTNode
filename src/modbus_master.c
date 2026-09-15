@@ -132,9 +132,10 @@ static int mock_poll(struct sensor_data *data, int max_count)
 
         data[n].timestamp_ms = (int64_t)ts.tv_sec * 1000
                                + ts.tv_nsec / 1000000;
-        data[n].temperature = -999.0;   /* 未定义标记 */
-        data[n].humidity    = -999.0;
-        data[n].pressure    = -999.0;
+        data[n].temperature = SENSOR_VALUE_INVALID;   /* 未映射字段 = 无效值 */
+        data[n].humidity    = SENSOR_VALUE_INVALID;
+        data[n].pressure    = SENSOR_VALUE_INVALID;
+        data[n].source_id   = reg->slave_id;   /* 数据源实例 = 从站地址 */
 
         /* 根据 field_name 填入模拟值 */
         double raw;
@@ -308,9 +309,10 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
         memset(&data[n], 0, sizeof(data[n]));
         data[n].timestamp_ms = (int64_t)ts.tv_sec * 1000
                                + ts.tv_nsec / 1000000;
-        data[n].temperature = -999.0;
-        data[n].humidity    = -999.0;
-        data[n].pressure    = -999.0;
+        data[n].temperature = SENSOR_VALUE_INVALID;
+        data[n].humidity    = SENSOR_VALUE_INVALID;
+        data[n].pressure    = SENSOR_VALUE_INVALID;
+        data[n].source_id   = reg->slave_id;   /* 数据源实例 = 从站地址 */
         set_field(&data[n], reg->field_name, physical);
 
         n++;

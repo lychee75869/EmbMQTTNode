@@ -29,10 +29,13 @@ int anomaly_engine_init(const struct node_config *cfg);
  * data:         传感器数据
  * alert_msg:    输出缓冲区（告警描述），可为 NULL
  * alert_msg_len: 缓冲区长度
+ * out:          可选结构化告警事件（P1-1）；NULL 表示调用方不需要。
+ *               非 NULL 时在触发首条规则时填充（msg 文本与 alert_msg 一致）
  * 返回: 触发的动作位掩码（OR 组合），0 表示无异常
  */
 uint8_t anomaly_engine_evaluate(const struct sensor_data *data,
-                                 char *alert_msg, int alert_msg_len);
+                                 char *alert_msg, int alert_msg_len,
+                                 struct alert_event *out);
 
 /*
  * 获取异常检测统计信息

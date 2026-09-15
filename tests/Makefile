@@ -13,7 +13,7 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client
+TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry
 
 .PHONY: all clean distclean
 
@@ -25,7 +25,12 @@ test_sensor: test_sensor.c ../src/sensor.c
 test_storage: test_storage.c ../src/storage.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
-test_modbus_config: test_modbus_config.c ../src/config.c
+# v1.3.0 T01：追加链接 modbus_master.c，覆盖 mock 路径哨兵 + source_id 打标
+test_modbus_config: test_modbus_config.c ../src/config.c ../src/modbus_master.c
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
+
+# v1.3.0 T01：子设备注册表解析/校验纯函数单测
+test_subdev_registry: test_subdev_registry.c ../src/subdev_registry.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
 test_rule_engine: test_rule_engine.c ../src/rule_engine.c ../src/config.c
@@ -52,7 +57,7 @@ test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c ../src/http_server.c \
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
 
 clean:
-	rm -f $(TESTS) test_data.db test_modbus_tmp.conf
+	rm -f $(TESTS) test_data.db test_modbus_tmp.conf test_legacy.db
 	rm -rf test_mac_root*
 
 distclean: clean

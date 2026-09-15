@@ -74,6 +74,19 @@ static void set_default_config(struct node_config *cfg)
     /* 异常检测引擎默认：关闭 */
     cfg->anomaly_enabled = 0;
     cfg->anomaly_count = 0;
+
+    /* ── 华为云 IoTDA 接入（v1.3.0，T01）──
+     * platform 缺省 "local"：保持 v1.2.11 行为，华为字段全部忽略。 */
+    strncpy(cfg->platform, "local", sizeof(cfg->platform) - 1);
+    cfg->huawei_device_id[0]     = '\0';
+    cfg->huawei_secret[0]        = '\0';
+    cfg->huawei_auth_type        = 0;
+    cfg->huawei_keepalive        = 120;   /* 华为推荐 120s */
+    cfg->huawei_props_interval   = 60;
+    cfg->subdev_offline_sec      = 30;
+    strncpy(cfg->subdevices_conf, "config/subdevices.conf",
+            sizeof(cfg->subdevices_conf) - 1);
+    cfg->huawei_ca_file[0]       = '\0';
 }
 
 int config_load(const char *path, struct node_config *cfg)
@@ -86,7 +99,9 @@ int config_load(const char *path, struct node_config *cfg)
 
     set_default_config(cfg);
 
-    char line[256];
+    /* v1.3.0：行/值缓冲扩容——huawei_device_id/subdevices_conf/huawei_ca_file
+     * 最大 256 字符，旧的 line[256]/value[128] 会把长值静默截断。 */
+    char line[512];
     while (fgets(line, sizeof(line), fp)) {
         char *p = trim(line);
         if (*p == '\0' || *p == '#' || *p == ';') continue;
@@ -94,8 +109,8 @@ int config_load(const char *path, struct node_config *cfg)
         /* 跳过段标记 [xxx]，不作为 key=value 解析 */
         if (*p == '[') continue;
 
-        char key[64] = {0}, value[128] = {0};
-        if (sscanf(p, "%63[^=]=%127[^\n]", key, value) != 2) continue;
+        char key[64] = {0}, value[320] = {0};
+        if (sscanf(p, "%63[^=]=%319[^\n]", key, value) != 2) continue;
 
         char *k = trim(key);
         char *v = trim(value);
@@ -453,6 +468,54 @@ int config_load(const char *path, struct node_config *cfg)
                      a->algo == ANOMALY_ZSCORE ? "zscore" : "iforest",
                      a->zscore_threshold, a->action_mask);
         }
+
+        /* ── 华为云 IoTDA 接入（v1.3.0，T01）── */
+        else if (strcmp(k, "platform") == 0) {
+            if (strcmp(v, "local") == 0 || strcmp(v, "huawei") == 0) {
+                strncpy(cfg->platform, v, sizeof(cfg->platform) - 1);
+                cfg->platform[sizeof(cfg->platform) - 1] = '\0';
+            } else {
+                LOG_WARN("config: platform '%s' invalid (local|huawei), "
+                         "falling back to 'local'", v);
+                strncpy(cfg->platform, "local", sizeof(cfg->platform) - 1);
+            }
+        }
+        else if (strcmp(k, "huawei_device_id") == 0)
+            strncpy(cfg->huawei_device_id, v,
+                    sizeof(cfg->huawei_device_id) - 1);
+        else if (strcmp(k, "huawei_secret") == 0)
+            strncpy(cfg->huawei_secret, v, sizeof(cfg->huawei_secret) - 1);
+        else if (strcmp(k, "huawei_auth_type") == 0) {
+            int at = atoi(v);
+            if (at == 0 || at == 1) {
+                cfg->huawei_auth_type = at;
+            } else {
+                /* fail-closed：非法签名类型丢弃用缺省 + WARN */
+                LOG_WARN("config: huawei_auth_type %d invalid (need 0 or 1), "
+                         "using default 0", at);
+                cfg->huawei_auth_type = 0;
+            }
+        }
+        else if (strcmp(k, "huawei_keepalive") == 0) {
+            int ka = atoi(v);
+            if (ka < 30 || ka > 1200) {
+                int clamped = (ka < 30) ? 30 : 1200;
+                LOG_WARN("config: huawei_keepalive %d out of range 30-1200, "
+                         "clamped to %d", ka, clamped);
+                cfg->huawei_keepalive = clamped;
+            } else {
+                cfg->huawei_keepalive = ka;
+            }
+        }
+        else if (strcmp(k, "huawei_props_interval") == 0)
+            cfg->huawei_props_interval = atoi(v);
+        else if (strcmp(k, "subdev_offline_sec") == 0)
+            cfg->subdev_offline_sec = atoi(v);
+        else if (strcmp(k, "subdevices_conf") == 0)
+            strncpy(cfg->subdevices_conf, v,
+                    sizeof(cfg->subdevices_conf) - 1);
+        else if (strcmp(k, "huawei_ca_file") == 0)
+            strncpy(cfg->huawei_ca_file, v, sizeof(cfg->huawei_ca_file) - 1);
     }
 
     fclose(fp);
@@ -561,5 +624,22 @@ void config_dump(const struct node_config *cfg)
                  a->name, a->field, algo_name,
                  a->zscore_threshold, a->action_mask,
                  a->cooldown_ms, a->window_size);
+    }
+
+    LOG_INFO("--- Huawei IoTDA ---");
+    LOG_INFO("platform           = %s", cfg->platform);
+    if (strcmp(cfg->platform, "huawei") == 0) {
+        LOG_INFO("huawei_device_id   = %s",
+                 cfg->huawei_device_id[0] ? cfg->huawei_device_id : "(unset)");
+        /* 安全：secret 永不打明文，仅显示是否已配置 */
+        LOG_INFO("huawei_secret      = %s",
+                 cfg->huawei_secret[0] ? "(configured)" : "(unset)");
+        LOG_INFO("huawei_auth_type   = %d", cfg->huawei_auth_type);
+        LOG_INFO("huawei_keepalive   = %d", cfg->huawei_keepalive);
+        LOG_INFO("huawei_props_interval = %d", cfg->huawei_props_interval);
+        LOG_INFO("subdev_offline_sec = %d", cfg->subdev_offline_sec);
+        LOG_INFO("subdevices_conf    = %s", cfg->subdevices_conf);
+        LOG_INFO("huawei_ca_file     = %s",
+                 cfg->huawei_ca_file[0] ? cfg->huawei_ca_file : "(unset)");
     }
 }

@@ -184,7 +184,8 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
 
     /* ── 规则引擎评估 ── */
     char alert_msg[256] = {0}; // 告警消息缓冲区
-    uint8_t actions = rule_engine_evaluate(data, alert_msg, sizeof(alert_msg));
+    uint8_t actions = rule_engine_evaluate(data, alert_msg, sizeof(alert_msg),
+                                           NULL);
     if (actions) {
         LOG_INFO("%s: rule actions triggered: 0x%02x", src, actions);
 
@@ -205,7 +206,7 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
     /* ── 异常检测引擎评估  ── */
     char anomaly_msg[256] = {0};
     uint8_t a_actions =
-        anomaly_engine_evaluate(data, anomaly_msg, sizeof(anomaly_msg));
+        anomaly_engine_evaluate(data, anomaly_msg, sizeof(anomaly_msg), NULL);
     if (a_actions) {
         LOG_INFO("%s: anomaly actions triggered: 0x%02x", src, a_actions);
 

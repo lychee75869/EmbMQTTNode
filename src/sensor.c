@@ -192,7 +192,9 @@ static int sht30_sensor_read(struct sensor_data *data)
     /* 数据手册换算公式（高重复性） */
     data->temperature = -45.0 + 175.0 * (double)raw_t / 65535.0;
     data->humidity    = 100.0 * (double)raw_h / 65535.0;
-    data->pressure    = -1.0; /* SHT30 无气压测量 */
+    /* SHT30 无气压测量 → 统一无效值哨兵（原写 -1.0，与引擎判定的
+     * -999.0 不一致，导致 pressure=-1.0 被当真实气压参与规则/异常判定） */
+    data->pressure    = SENSOR_VALUE_INVALID;
     return E_OK;
 }
 
@@ -254,6 +256,9 @@ int sensor_read(struct sensor_data *data)
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     data->timestamp_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    /* 本地板载传感器数据源实例恒 0（docs/12 §3.2 source_id 语义）；
+     * Modbus 路径由 modbus_master 赋 slave_id。 */
+    data->source_id = 0;
 
     if (strcmp(g_sensor_type, SENSOR_TYPE_MOCK) == 0) {
         /* 模拟数据：正常基线 + 每第 4 次采样注入异常 */

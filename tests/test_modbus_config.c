@@ -14,6 +14,7 @@
 #include <assert.h>
 #include "../src/common.h"
 #include "../src/config.h"
+#include "../src/modbus_master.h"
 
 /* ═══════════════════════════════════════════════════════════ */
 
@@ -134,6 +135,42 @@ int main(void)
     /* 被拒条目不得残留（reg_count 之后的内容未定义，只验证数量语义） */
     remove(bad_path);
     printf("P1-4 modbus validation test PASSED\n");
+
+    /* ═════════════════════════════════════════════════════════ */
+    /* v1.3.0 T01：modbus mock 路径哨兵统一 + source_id 打标。
+     * modbus_enabled=0 → 未连接 → mock_poll。未映射字段必须为
+     * SENSOR_VALUE_INVALID；source_id 必须 = reg->slave_id（mock 场景
+     * 若不打标，数据会被误路由成本地传感器）。 */
+    {
+        struct modbus_config mcfg;
+        memset(&mcfg, 0, sizeof(mcfg));
+        mcfg.enabled   = 0;          /* 强制 mock 路径 */
+        mcfg.reg_count = 2;
+        mcfg.regs[0].slave_id = 2;
+        strncpy(mcfg.regs[0].field_name, "temperature",
+                sizeof(mcfg.regs[0].field_name) - 1);
+        mcfg.regs[1].slave_id = 9;
+        strncpy(mcfg.regs[1].field_name, "pressure",
+                sizeof(mcfg.regs[1].field_name) - 1);
+
+        assert(modbus_master_init(&mcfg) == E_OK);
+        assert(!modbus_master_is_connected());
+
+        struct sensor_data md[4];
+        memset(md, 0, sizeof(md));
+        int cnt = modbus_master_poll(md, 4);
+        assert(cnt == 2);
+        /* source_id = slave_id（reg[0]=2, reg[1]=9） */
+        assert(md[0].source_id == 2);
+        assert(md[1].source_id == 9);
+        /* 未映射字段 = 哨兵 */
+        assert(md[0].humidity == SENSOR_VALUE_INVALID);
+        assert(md[0].pressure == SENSOR_VALUE_INVALID);
+        assert(md[1].temperature == SENSOR_VALUE_INVALID);
+        assert(md[1].humidity == SENSOR_VALUE_INVALID);
+        modbus_master_close();
+        printf("  modbus mock sentinel + source_id: PASS\n");
+    }
 
     /* 清理 */
     remove(tmp_path);

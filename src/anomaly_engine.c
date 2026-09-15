@@ -31,6 +31,7 @@
 
 #include "anomaly_engine.h"
 #include "iforest_model.h"
+#include "sensor_fields.h"   /* 字段描述表（单一事实源，docs/12 §3.4） */
 #include <math.h>
 #include <pthread.h>
 
@@ -58,16 +59,11 @@ static int64_t now_ms(void)
 
 /* ─── 从 sensor_data 读取字段值 ────────────────────────── */
 
-static double get_field(const struct sensor_data *data, const char *field)
-{
-    if (strcmp(field, "temperature") == 0)
-        return data->temperature;
-    if (strcmp(field, "humidity") == 0)
-        return data->humidity;
-    if (strcmp(field, "pressure") == 0)
-        return data->pressure;
-    return SENSOR_VALUE_INVALID;   /* 未知字段，永不为真 */
-}
+/*
+ * 字段取值统一走字段描述表（sensor_fields.h）：sensor_get_field 命中返回
+ * 字段值，未知字段返回 SENSOR_VALUE_INVALID（与"永不匹配"语义兼容）。
+ * 本模块不再维护 strcmp 链，新增字段时消费侧零改动。
+ */
 
 /* ─── 滑动窗口操作 ─────────────────────────────────────── */
 
@@ -207,7 +203,7 @@ static int anomaly_match(const struct anomaly_config *a,
                           const struct sensor_data *data,
                           double *zscore_out)
 {
-    double val = get_field(data, a->field);
+    double val = sensor_get_field(data, a->field);
     if (val == SENSOR_VALUE_INVALID)
         return 0;   /* 无效值/未知字段 */
 
@@ -264,7 +260,7 @@ static void gen_alert_msg(const struct anomaly_config *a,
                            double score,
                            char *msg, int msg_len)
 {
-    double val = get_field(data, a->field);
+    double val = sensor_get_field(data, a->field);
 
     if (a->algo == ANOMALY_IFOREST) {
         snprintf(msg, msg_len,
@@ -407,7 +403,7 @@ uint8_t anomaly_engine_evaluate(const struct sensor_data *data,
                     memset(out, 0, sizeof(*out));
                     strncpy(out->rule_name, a->name, sizeof(out->rule_name) - 1);
                     strncpy(out->field, a->field, sizeof(out->field) - 1);
-                    out->value     = get_field(data, a->field);
+                    out->value     = sensor_get_field(data, a->field);
                     out->threshold = a->zscore_threshold;
                     snprintf(out->source_kind, sizeof(out->source_kind), "%s",
                              (data->source_id == 0) ? "sensor" : "modbus");

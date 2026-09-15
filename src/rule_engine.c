@@ -26,6 +26,7 @@
  */
 
 #include "rule_engine.h"
+#include "sensor_fields.h"   /* 字段描述表（单一事实源，docs/12 §3.4） */
 #include <math.h>
 #include <pthread.h>
 
@@ -53,16 +54,11 @@ static int64_t now_ms(void)
 
 /* ─── 从 sensor_data 读取字段值 ────────────────────────── */
 
-static double get_field(const struct sensor_data *data, const char *field)
-{
-    if (strcmp(field, "temperature") == 0)
-        return data->temperature;
-    if (strcmp(field, "humidity") == 0)
-        return data->humidity;
-    if (strcmp(field, "pressure") == 0)
-        return data->pressure;
-    return SENSOR_VALUE_INVALID;   /* 未知字段，永不为真 */
-}
+/*
+ * 字段取值统一走字段描述表（sensor_fields.h）：sensor_get_field 命中返回
+ * 字段值，未知字段返回 SENSOR_VALUE_INVALID（与"永不匹配"语义兼容）。
+ * 本模块不再维护 strcmp 链，新增字段时消费侧零改动。
+ */
 
 /* ─── 变化率环形缓冲区操作 ─────────────────────────────── */
 
@@ -102,7 +98,7 @@ static double rate_calculate(const struct rule *r,
 static int rule_match(const struct rule *r,
                       const struct sensor_data *data, int64_t now)
 {
-    double val = get_field(data, r->field);
+    double val = sensor_get_field(data, r->field);
     if (val == SENSOR_VALUE_INVALID)
         return 0;   /* 无效值/未知字段，永不匹配 */
 
@@ -142,7 +138,7 @@ static void gen_alert_msg(const struct rule *r,
                           const struct sensor_data *data,
                           char *msg, int msg_len)
 {
-    double val = get_field(data, r->field);
+    double val = sensor_get_field(data, r->field);
     const char *op_str = "?";
 
     switch (r->op) {
@@ -279,7 +275,7 @@ uint8_t rule_engine_evaluate(const struct sensor_data *data,
                     memset(out, 0, sizeof(*out));
                     strncpy(out->rule_name, r->name, sizeof(out->rule_name) - 1);
                     strncpy(out->field, r->field, sizeof(out->field) - 1);
-                    out->value     = get_field(data, r->field);
+                    out->value     = sensor_get_field(data, r->field);
                     out->threshold = (r->op == OP_OUT) ? r->threshold_lo
                                                        : r->threshold;
                     snprintf(out->source_kind, sizeof(out->source_kind), "%s",

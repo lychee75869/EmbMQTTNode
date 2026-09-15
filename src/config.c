@@ -5,6 +5,7 @@
  * 覆盖 MQTT / TLS / Modbus / 规则引擎 / OTA / 异常检测 六大配置段
  */
 #include "config.h"
+#include "sensor_fields.h"   /* 字段描述表：rule/anomaly 字段名校验（docs/12 §3.4） */
 
 static char *trim(char *str)
 {
@@ -277,7 +278,12 @@ int config_load(const char *path, struct node_config *cfg)
                 continue;
             }
 
-            /* 字段名 */
+            /* 字段名：必须命中字段描述表，否则丢弃该规则（fail-closed） */
+            if (sensor_find_field(field) == NULL) {
+                LOG_WARN("config: %s unknown field '%s', rule dropped",
+                         k, field);
+                continue;
+            }
             strncpy(r->field, field, sizeof(r->field));
             r->field[sizeof(r->field) - 1] = '\0';
 
@@ -409,7 +415,12 @@ int config_load(const char *path, struct node_config *cfg)
                 continue;
             }
 
-            /* 字段名 */
+            /* 字段名：必须命中字段描述表，否则丢弃该规则（fail-closed） */
+            if (sensor_find_field(field) == NULL) {
+                LOG_WARN("config: %s unknown field '%s', anomaly dropped",
+                         k, field);
+                continue;
+            }
             strncpy(a->field, field, sizeof(a->field) - 1);
             a->field[sizeof(a->field) - 1] = '\0';
 

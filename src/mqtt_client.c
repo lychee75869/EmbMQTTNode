@@ -5,6 +5,7 @@
  * OTA 升级指令订阅
  */
 #include "mqtt_client.h"
+#include "sensor_fields.h"   /* 字段描述表（单一事实源，docs/12 §3.4） */
 #include <mosquitto.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -372,21 +373,24 @@ int mqtt_build_data_payload(const struct node_config *cfg,
 {
     if (!cfg || !data || !buf || buf_len <= 0) return E_INVAL;
 
+    /* 前缀 + 逐字段追加 + 收尾。字段序 == SENSOR_FIELDS 表序 ==
+     * v1.2.11 payload 序（temperature,humidity,pressure），故 local
+     * 路径输出与重构前逐字节一致（见 sensor_fields.h 表序不变式）。 */
     int n = snprintf(buf, (size_t)buf_len,
-                     "{\"client_id\":\"%s\","
-                     "\"timestamp\":%lld,"
-                     "\"temperature\":%.2f,"
-                     "\"humidity\":%.2f,"
-                     "\"pressure\":%.2f}",
+                     "{\"client_id\":\"%s\",\"timestamp\":%lld",
                      cfg->client_id,
-                     (long long)data->timestamp_ms,
-                     data->temperature,
-                     data->humidity,
-                     data->pressure);
+                     (long long)data->timestamp_ms);
+    if (n < 0 || n >= buf_len) return E_IO;
 
-    /* snprintf 返回"本应写入"的长度：n < 0 编码失败，
-     * n >= buf_len 说明缓冲不足被截断——两种情况都拒绝，
-     * 不发布半截 JSON。 */
+    for_each_field(f) {
+        if (n < 0 || n >= buf_len) return E_IO;
+        n += snprintf(buf + n, (size_t)(buf_len - n),
+                      ",\"%s\":%.2f", f->name,
+                      sensor_get_field(data, f->name));
+    }
+    if (n < 0 || n >= buf_len) return E_IO;
+
+    n += snprintf(buf + n, (size_t)(buf_len - n), "}");
     if (n < 0 || n >= buf_len) return E_IO;
 
     return E_OK;

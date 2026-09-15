@@ -13,7 +13,7 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry
+TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields
 
 .PHONY: all clean distclean
 
@@ -26,20 +26,27 @@ test_storage: test_storage.c ../src/storage.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
 # v1.3.0 T01：追加链接 modbus_master.c，覆盖 mock 路径哨兵 + source_id 打标
-test_modbus_config: test_modbus_config.c ../src/config.c ../src/modbus_master.c
+# v1.3.0 T06：config.c / modbus_master.c 依赖字段描述表 → 链接 sensor_fields.c
+test_modbus_config: test_modbus_config.c ../src/config.c ../src/modbus_master.c \
+                    ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
 # v1.3.0 T01：子设备注册表解析/校验纯函数单测
 test_subdev_registry: test_subdev_registry.c ../src/subdev_registry.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
-test_rule_engine: test_rule_engine.c ../src/rule_engine.c ../src/config.c
+# v1.3.0 T06：rule_engine.c / config.c 依赖字段描述表 → 链接 sensor_fields.c
+test_rule_engine: test_rule_engine.c ../src/rule_engine.c ../src/config.c \
+                  ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
-test_ota: test_ota.c ../src/ota.c ../src/config.c
+# v1.3.0 T06：config.c 依赖字段描述表 → 链接 sensor_fields.c
+test_ota: test_ota.c ../src/ota.c ../src/config.c ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lcrypto -lssl
 
-test_anomaly_engine: test_anomaly_engine.c ../src/anomaly_engine.c ../src/config.c
+# v1.3.0 T06：anomaly_engine.c / config.c 依赖字段描述表 → 链接 sensor_fields.c
+test_anomaly_engine: test_anomaly_engine.c ../src/anomaly_engine.c \
+                     ../src/config.c ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
 test_mac_addr: test_mac_addr.c ../src/mac_addr.c
@@ -53,8 +60,18 @@ test_mac_addr: test_mac_addr.c ../src/mac_addr.c
 # mqtt_client.c 其余符号。
 test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c ../src/http_server.c \
                   ../src/storage.c ../src/rule_engine.c ../src/anomaly_engine.c \
-                  ../src/ota.c
+                  ../src/ota.c ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
+
+# v1.3.0 T06：字段描述表跨层重构单测（表序/存取/黄金 payload/config 校验）。
+# 链接收敛为最小闭包：只用到 mqtt_build_data_payload（mqtt_client.c）与
+# config_load（config.c）；mqtt_client.c 对 ota/storage/http/引擎零引用
+# （OTA 走回调指针）。LOG_* 是 common.h 里的 #define 宏（header-only，
+# 无独立 log.c TU），故无需额外链入。-lmosquitto 仅为解析 mqtt_client.c
+# 其余符号；http_server.c 引 netinet/in.h，已从依赖中移除以保可移植性。
+test_sensor_fields: test_sensor_fields.c ../src/sensor_fields.c \
+                    ../src/mqtt_client.c ../src/config.c
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto
 
 clean:
 	rm -f $(TESTS) test_data.db test_modbus_tmp.conf test_legacy.db

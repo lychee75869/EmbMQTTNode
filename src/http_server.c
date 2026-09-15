@@ -20,6 +20,7 @@
 #include "rule_engine.h"
 #include "anomaly_engine.h"
 #include "ota.h"
+#include "sensor_fields.h"   /* 字段描述表（单一事实源，docs/12 §3.4） */
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -339,6 +340,17 @@ static void handle_api_status(int fd)
     http_send_json(fd, 200, buf);
 }
 
+/*
+ * T06 增量拼接越界守卫：written 是 snprintf 返回的"本应写入"长度，
+ * 为负表示编码失败、>= cap 表示缓冲不足被截断——两种情况都不允许继续用
+ * `cap - written` 计算剩余空间（size_t 下溢成巨大值 → 越界写，T06 引入的
+ * 回归面；旧单次 snprintf 只会安全截断）。返回 1 = 溢出，调用方走 500。
+ */
+static int json_buf_overflow(int written, size_t cap)
+{
+    return (written < 0 || (size_t)written >= cap);
+}
+
 /* GET /api/data/latest */
 static void handle_api_data_latest(int fd)
 {
@@ -354,16 +366,30 @@ static void handle_api_data_latest(int fd)
         return;
     }
 
+    /* 字段按 SENSOR_FIELDS 表序输出，与 v1.2.11 逐字节一致：
+     * {"temperature":..,"humidity":..,"pressure":..,"timestamp_ms":..} */
     char buf[320];
-    snprintf(buf, sizeof(buf),
-             "{"
-             "\"temperature\":%.2f,"
-             "\"humidity\":%.2f,"
-             "\"pressure\":%.2f,"
-             "\"timestamp_ms\":%lld"
-             "}",
-             d.temperature, d.humidity, d.pressure,
-             (long long)d.timestamp_ms);
+    int n = snprintf(buf, sizeof(buf), "{");
+    for_each_field(f) {
+        if (json_buf_overflow(n, sizeof(buf))) {
+            http_send_error(fd, 500, "payload overflow");
+            return;
+        }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      "%s\"%s\":%.2f",
+                      (f == SENSOR_FIELDS) ? "" : ",",
+                      f->name, sensor_get_field(&d, f->name));
+    }
+    if (json_buf_overflow(n, sizeof(buf))) {
+        http_send_error(fd, 500, "payload overflow");
+        return;
+    }
+    n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                  ",\"timestamp_ms\":%lld}", (long long)d.timestamp_ms);
+    if (json_buf_overflow(n, sizeof(buf))) {
+        http_send_error(fd, 500, "payload overflow");
+        return;
+    }
 
     http_send_json(fd, 200, buf);
 }
@@ -382,7 +408,8 @@ static void handle_api_data_history(int fd, const char *path)
     pthread_mutex_unlock(&g_mutex);
 
     /* 手动构造 JSON 数组 */
-    char *buf = malloc(count * 256 + 32);
+    int  cap = count * 256 + 32;   /* 单条记录预算 256B，与 v1.2.11 一致 */
+    char *buf = malloc((size_t)cap);
     if (!buf) {
         http_send_error(fd, 500, "malloc failed");
         return;
@@ -391,18 +418,42 @@ static void handle_api_data_history(int fd, const char *path)
     int pos = 0;
     pos += snprintf(buf + pos, 4, "[\n");
     for (int i = 0; i < count; i++) {
-        pos += snprintf(buf + pos, 256,
-                        "  {\"temperature\":%.2f,"
-                        "\"humidity\":%.2f,"
-                        "\"pressure\":%.2f,"
-                        "\"timestamp_ms\":%lld}%s\n",
-                        records[i].temperature,
-                        records[i].humidity,
-                        records[i].pressure,
+        if (json_buf_overflow(pos, (size_t)cap)) {
+            free(buf);
+            http_send_error(fd, 500, "payload overflow");
+            return;
+        }
+        /* 字段按 SENSOR_FIELDS 表序输出，逐字节等价于 v1.2.11：
+         *   {"temperature":..,"humidity":..,"pressure":..,"timestamp_ms":..} */
+        pos += snprintf(buf + pos, (size_t)(cap - pos), "  {");
+        for_each_field(f) {
+            if (json_buf_overflow(pos, (size_t)cap)) {
+                free(buf);
+                http_send_error(fd, 500, "payload overflow");
+                return;
+            }
+            pos += snprintf(buf + pos, (size_t)(cap - pos),
+                            "%s\"%s\":%.2f",
+                            (f == SENSOR_FIELDS) ? "" : ",",
+                            f->name, sensor_get_field(&records[i], f->name));
+        }
+        if (json_buf_overflow(pos, (size_t)cap)) {
+            free(buf);
+            http_send_error(fd, 500, "payload overflow");
+            return;
+        }
+        pos += snprintf(buf + pos, (size_t)(cap - pos),
+                        ",\"timestamp_ms\":%lld}%s\n",
                         (long long)records[i].timestamp_ms,
                         (i < count - 1) ? "," : "");
+        if (json_buf_overflow(pos, (size_t)cap)) {
+            free(buf);
+            http_send_error(fd, 500, "payload overflow");
+            return;
+        }
     }
-    pos += snprintf(buf + pos, 4, "]");
+    /* 循环内守卫已保证 pos < cap；用真实剩余空间写 "]"（同越界类收敛） */
+    pos += snprintf(buf + pos, (size_t)(cap - pos), "]");
 
     http_send_json(fd, 200, buf);
     free(buf);

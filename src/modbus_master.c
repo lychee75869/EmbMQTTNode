@@ -9,6 +9,7 @@
  */
 
 #include "modbus_master.h"
+#include "sensor_fields.h"   /* 字段描述表（单一事实源，docs/12 §3.4） */
 
 #ifdef BUILD_WITH_MODBUS
 #include <modbus/modbus.h>
@@ -26,21 +27,10 @@ static modbus_t *g_mb_ctx = NULL;             /* libmodbus 上下文 */
 /* ─── 字段映射辅助 ─────────────────────────────────────── */
 
 /*
- * 将寄存器值写入 sensor_data 的指定字段
- * raw: 原始值（已做 scale+offset 转换）
+ * 寄存器 → sensor_data 字段写入统一走字段描述表（sensor_fields.h）：
+ * 字段名/偏移以 SENSOR_FIELDS 为单一事实源，本模块不再维护 strcmp 链。
+ * 未知字段由 sensor_set_field 返回 E_INVAL，调用处 WARN（沿用旧行为）。
  */
-static void set_field(struct sensor_data *data,
-                      const char *field_name, double raw)
-{
-    if (strcmp(field_name, "temperature") == 0)
-        data->temperature = raw;
-    else if (strcmp(field_name, "humidity") == 0)
-        data->humidity = raw;
-    else if (strcmp(field_name, "pressure") == 0)
-        data->pressure = raw;
-    else
-        LOG_WARN("modbus: unknown field '%s'", field_name);
-}
 
 #ifdef BUILD_WITH_MODBUS
 
@@ -148,7 +138,8 @@ static int mock_poll(struct sensor_data *data, int max_count)
         else
             raw = (rand() % 10000) / 100.0;  /* 通用随机值 */
 
-        set_field(&data[n], reg->field_name, raw);
+        if (sensor_set_field(&data[n], reg->field_name, raw) != E_OK)
+            LOG_WARN("modbus: unknown field '%s'", reg->field_name);
         n++;
     }
     return n;
@@ -313,7 +304,8 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
         data[n].humidity    = SENSOR_VALUE_INVALID;
         data[n].pressure    = SENSOR_VALUE_INVALID;
         data[n].source_id   = reg->slave_id;   /* 数据源实例 = 从站地址 */
-        set_field(&data[n], reg->field_name, physical);
+        if (sensor_set_field(&data[n], reg->field_name, physical) != E_OK)
+            LOG_WARN("modbus: unknown field '%s'", reg->field_name);
 
         n++;
     }

@@ -21,20 +21,21 @@ strip:
 install:
 	$(MAKE) -C src install
 
+# ── 测试用例清单（runner 单一事实源）──
+# 与 tests/Makefile 的 TESTS 保持一致。用例数由 $(words $(TESTS)) 动态得出，
+# 杜绝「编译了 N 个、runner 只跑 N-1 个、结尾计数还写死」的假绿复发。
+TESTS = test_sensor test_storage test_modbus_config test_rule_engine test_ota \
+        test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry \
+        test_sensor_fields
+
 test:
 	$(MAKE) -C tests
 	@echo "=== Running all tests ==="
-	@cd tests && \
-		./test_sensor && \
-		./test_storage && \
-		./test_modbus_config && \
-		./test_rule_engine && \
-		./test_ota && \
-		./test_anomaly_engine && \
-		./test_mac_addr && \
-		./test_mqtt_client && \
-		./test_subdev_registry
-	@echo "=== All 9 tests passed ==="
+	@cd tests && for t in $(TESTS); do \
+		echo "--- $$t"; \
+		./$$t || exit 1; \
+	done
+	@echo "=== All $(words $(TESTS)) tests passed ==="
 
 clean:
 	$(MAKE) -C src clean

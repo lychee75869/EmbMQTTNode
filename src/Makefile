@@ -18,10 +18,12 @@ ifeq ($(BUILD_WITH_MODBUS),1)
 endif
 
 #源文件列表 + 自动推导
+# v1.3.0 T02：追加 platform.c（分发器）+ platform_local.c（local 实现）
 TARGET   = embmqttnode
 SRCS     = main.c config.c sensor.c storage.c mqtt_client.c \
             modbus_master.c rule_engine.c gpio_hal.c ota.c http_server.c \
-            anomaly_engine.c mac_addr.c subdev_registry.c sensor_fields.c
+            anomaly_engine.c mac_addr.c subdev_registry.c sensor_fields.c \
+            platform.c platform_local.c
 OBJS     = $(SRCS:.c=.o)
 DEPS     = $(OBJS:.o=.d) #字符串替换语法：$(变量:旧后缀=新后缀)
 

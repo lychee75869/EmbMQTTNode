@@ -21,6 +21,15 @@
  * 未覆盖路径（需集成环境，手动验证步骤见文件尾注释）：
  *   - on_connect 与 libmosquitto 网络线程的挂接（mqtt_init 全链路）
  *   - 回调内 mosquitto_publish/subscribe 的真实网络行为
+ *
+ * v1.3.0 T02：mqtt_client 的 on_connect/on_message 改走平台分发器——
+ *   mqtt_handle_connack 现调用 platform_on_connected()/platform_on_disconnected()，
+ *   on_message 现调用 platform_dispatch_message()。故本测试的链接行追加了
+ *   platform.c + platform_local.c（见 tests/Makefile）。本文件不直接使用
+ *   mqtt_init/mqtt_set_ota_callback（后者已随 T02 移除），用例源码无需改动；
+ *   单测未 mqtt_init 时 g_cfg==NULL → platform_on_connected(NULL) 走安全空路径，
+ *   connack 用例语义不变。mqtt_init 新签名（const struct node_config *cfg）
+ *   的纯函数行为改由 tests/test_platform_local.c 经 platform_connect_params 覆盖。
  */
 
 #include <stdio.h>

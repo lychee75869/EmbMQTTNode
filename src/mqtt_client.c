@@ -5,6 +5,7 @@
  * OTA 升级指令订阅
  */
 #include "mqtt_client.h"
+#include "platform.h"        /* T02：连接参数/下行消息走平台分发器 */
 #include "sensor_fields.h"   /* 字段描述表（单一事实源，docs/12 §3.4） */
 #include <mosquitto.h>
 #include <stdio.h>
@@ -18,6 +19,13 @@
 static struct mosquitto *g_mosq = NULL;
 
 /*
+ * T02：mqtt_init 时缓存 cfg 只读指针（g_cfg 生命周期 = main 的 g_cfg 静态全局）。
+ * 供 on_connect（网络线程）调用 platform_on_connected(cfg) 使用；
+ * 未 mqtt_init 时（纯单测）为 NULL，platform_on_connected(NULL) 走安全空路径。
+ */
+static const struct node_config *g_cfg = NULL;
+
+/*
  * P1-3: 跨线程同步。
  * 这些变量在 libmosquitto 网络线程（on_connect/on_disconnect/on_message）
  * 与业务线程（publish/subscribe/主循环）之间共享。volatile 只阻止
@@ -26,10 +34,9 @@ static struct mosquitto *g_mosq = NULL;
  * 原子操作并附带正确的同步语义。
  */
 static _Atomic int g_connected = 0;
-/* 回调指针：注册（业务线程）与触发（网络线程）可能并发，
- * 指针本身的读写也必须是原子的 */
-static _Atomic(mqtt_ota_callback) g_ota_cb = NULL;
-/* P1-13/P2-19: "连接成功"回调，由 on_connect 在每次 CONNACK 成功时调用 */
+/* P1-13/P2-19: "连接成功"观测 hook，CONNACK 成功时触发（生产不注册；
+ * 主要供单测覆盖重连重订语义）。生产侧"连接成功后做什么"已由
+ * platform_on_connected 承担。 */
 static _Atomic(mqtt_connected_callback) g_connected_cb = NULL;
 
 /* ─── 回调 ─────────────────────────────────────────────────── */
@@ -50,8 +57,9 @@ int mqtt_handle_connack(int rc)
     if (rc == 0) {
         atomic_store(&g_connected, 1);
         LOG_INFO("mqtt connected");
-        /* 先置 g_connected 再调回调：回调内的 publish/subscribe
+        /* 先置 g_connected 再触发平台/回调：其内的 publish/subscribe
          * 依赖 g_connected==1 的前置检查（见各函数开头） */
+        platform_on_connected(g_cfg);
         mqtt_connected_callback cb = atomic_load(&g_connected_cb);
         if (cb) {
             cb();
@@ -60,6 +68,7 @@ int mqtt_handle_connack(int rc)
     }
 
     atomic_store(&g_connected, 0);
+    platform_on_disconnected();
     switch (rc) {
     case 1:  LOG_ERROR("mqtt connect refused: protocol version"); break;
     case 2:  LOG_ERROR("mqtt connect refused: identifier rejected"); break;
@@ -88,6 +97,8 @@ static void on_disconnect(struct mosquitto *mosq, void *obj, int rc)
         LOG_INFO("mqtt disconnected (clean)");
     else
         LOG_WARN("mqtt disconnected unexpectedly, code: %d", rc);
+    /* T02：通知平台层（local 无副作用；huawei 用于 churn 检测，§8） */
+    platform_on_disconnected();
 }
 
 static void on_message(struct mosquitto *mosq, void *obj,
@@ -99,67 +110,80 @@ static void on_message(struct mosquitto *mosq, void *obj,
     LOG_INFO("mqtt message received on topic '%s': %d bytes",
              msg->topic, msg->payloadlen);
 
-    /* 如果是 OTA 升级指令，交给 ota 回调处理（P1-3: 原子快照后调用，
-     * 避免触发瞬间回调被另一线程清除的竞态） */
-    mqtt_ota_callback ota_cb = atomic_load(&g_ota_cb);
-    if (ota_cb && msg->topic && msg->payload) {
-        if (strstr(msg->topic, "/ota/cmd")) {
-            ota_cb((const char *)msg->payload, msg->payloadlen);
-        }
-    }
+    /* T02：不再判 topic、不再分发到 ota 回调——全量转发平台分发器。
+     * 唯一路由：local → platform_local.on_message（ota/cmd）。
+     * msg->payload 为非 NUL 结尾字节序列，故必须带 payloadlen 转发。 */
+    if (msg->topic && msg->payload)
+        platform_dispatch_message(msg->topic, (const char *)msg->payload,
+                                  msg->payloadlen);
 }
 
 /* ─── 初始化（含 TLS）────────────────────────────────────────── */
 
-int mqtt_init(const char *host, int port,
-              const char *client_id,
-              const struct tls_config *tls,
-              const char *will_topic,
-              const char *will_payload)
+int mqtt_init(const struct node_config *cfg)
 {
-    int rc;
+    int rc;   /* 覆盖后续 mosquitto_* 返回码 */
+
+    if (!cfg)
+        return E_INVAL;
 
     mosquitto_lib_init();
 
-    g_mosq = mosquitto_new(client_id, true, NULL);
+    /* T02：连接参数经平台分发器取得（local 静态取值；huawei 现算鉴权） */
+    struct platform_connect_params p;
+    if (platform_connect_params(cfg, &p) != E_OK) {
+        LOG_ERROR("platform_connect_params failed");
+        mosquitto_lib_cleanup();
+        return E_INVAL;
+    }
+
+    /* 缓存 cfg 只读指针，供 on_connect 触发 platform_on_connected(cfg) */
+    g_cfg = cfg;
+
+    g_mosq = mosquitto_new(p.client_id, true, NULL);
     if (!g_mosq) {
         LOG_ERROR("mosquitto_new failed");
+        mosquitto_lib_cleanup();
         return E_NET;
     }
 
-    /* ── Last Will 遗嘱消息 ──────────────────────────────── */
-    if (will_topic && will_payload) {
-        rc = mosquitto_will_set(g_mosq, will_topic,
-                                (int)strlen(will_payload),
-                                will_payload, 1, 1);
+    /* ── Last Will 遗嘱消息（use_will && topic 非空）────────── */
+    if (p.use_will && p.will_topic[0] != '\0') {
+        rc = mosquitto_will_set(g_mosq, p.will_topic,
+                                (int)strlen(p.will_payload),
+                                p.will_payload, 1, 1);
         if (rc != MOSQ_ERR_SUCCESS) {
             LOG_ERROR("mosquitto_will_set failed: %s",
                       mosquitto_strerror(rc));
             goto fail;
         }
-        LOG_INFO("mqtt will set: topic=%s", will_topic);
+        LOG_INFO("mqtt will set: topic=%s", p.will_topic);
     }
 
-    /* ── TLS 配置 ─────────────────────────────────────── */
-    if (tls && tls->enabled) {
-        LOG_INFO("mqtt tls mode: %s",
-                 tls->enabled == 2 ? "mutual" : "server-only");
+    /* ── TLS 配置 ─────────────────────────────────────────────
+     * T02：由 force_tls（huawei 恒 1）或 cfg->tls.enabled（local）
+     * 驱动——修复旧落点"TLS 仅依赖用户配置 tls_enabled"（§3.1/§8）。
+     * CA 锚点：force_tls 时取 p.ca_file（华为 CA），否则 cfg->tls.ca_file。 */
+    if (p.force_tls || cfg->tls.enabled) {
+        const char *ca = p.force_tls ? p.ca_file : cfg->tls.ca_file;
+        int mutual = (!p.force_tls && cfg->tls.enabled == 2);
+
+        LOG_INFO("mqtt tls mode: %s", mutual ? "mutual" : "server-only");
 
         /* 单向认证：加载 CA 证书验证 Broker */
-        rc = mosquitto_tls_set(g_mosq, tls->ca_file,
-                               NULL, NULL, NULL, NULL);
+        rc = mosquitto_tls_set(g_mosq, ca, NULL, NULL, NULL, NULL);
         if (rc != MOSQ_ERR_SUCCESS) {
             LOG_ERROR("mosquitto_tls_set ca failed: %s (ca_file=%s)",
-                      mosquitto_strerror(rc), tls->ca_file);
+                      mosquitto_strerror(rc), ca);
             goto fail;
         }
 
-        /* 双向认证：加载客户端证书和私钥 */
-        if (tls->enabled == 2) {
-            rc = mosquitto_tls_set(g_mosq, tls->ca_file,
+        /* 双向认证：加载客户端证书和私钥（仅 local tls_enabled==2） */
+        if (mutual) {
+            rc = mosquitto_tls_set(g_mosq, ca,
                                    NULL, /* capath */
-                                   tls->cert_file,
-                                   tls->key_file,
+                                   cfg->tls.cert_file,
+                                   cfg->tls.key_file,
                                    NULL  /* pw_callback */);
             if (rc != MOSQ_ERR_SUCCESS) {
                 LOG_ERROR("mosquitto_tls_set mutual failed: %s",
@@ -177,11 +201,9 @@ int mqtt_init(const char *host, int port,
         LOG_INFO("mqtt tls configured ok");
     }
 
-    /* 用户名/密码认证 */
-    if (tls && tls->username[0] != '\0') {
-        rc = mosquitto_username_pw_set(g_mosq,
-                                       tls->username,
-                                       tls->password);
+    /* 用户名/密码认证（仅当 username 非空，等价 v1.2.11 行为） */
+    if (p.username[0] != '\0') {
+        rc = mosquitto_username_pw_set(g_mosq, p.username, p.password);
         if (rc != MOSQ_ERR_SUCCESS) {
             LOG_ERROR("mosquitto_username_pw_set failed: %s",
                       mosquitto_strerror(rc));
@@ -195,11 +217,12 @@ int mqtt_init(const char *host, int port,
     mosquitto_disconnect_callback_set(g_mosq, on_disconnect);
     mosquitto_message_callback_set(g_mosq, on_message);
 
-    /* 连接 Broker */
-    rc = mosquitto_connect(g_mosq, host, port, 60);
+    /* 连接 Broker（keepalive 由平台参数给出：local 恒 60） */
+    rc = mosquitto_connect(g_mosq, cfg->broker_host, cfg->broker_port,
+                           p.keepalive);
     if (rc != MOSQ_ERR_SUCCESS) {
         LOG_ERROR("mosquitto_connect to %s:%d failed: %s",
-                  host, port, mosquitto_strerror(rc));
+                  cfg->broker_host, cfg->broker_port, mosquitto_strerror(rc));
         goto fail;
     }
 
@@ -211,7 +234,8 @@ int mqtt_init(const char *host, int port,
         goto fail;
     }
 
-    LOG_INFO("mqtt init ok: %s:%d client=%s", host, port, client_id);
+    LOG_INFO("mqtt init ok: %s:%d client=%s", cfg->broker_host,
+             cfg->broker_port, p.client_id);
     return E_OK;
 
 fail:
@@ -331,12 +355,21 @@ int mqtt_subscribe_ota(const char *client_id)
     return E_OK;
 }
 
-/* ─── OTA 回调注册 ───────────────────────────────────────── */
+/* ─── 订阅任意主题（T02：供平台实现重订/订阅命令主题）────────── */
 
-void mqtt_set_ota_callback(mqtt_ota_callback cb)
+int mqtt_subscribe_topic(const char *topic, int qos)
 {
-    atomic_store(&g_ota_cb, cb);
-    LOG_INFO("mqtt ota callback %s", cb ? "registered" : "cleared");
+    if (!g_mosq || !atomic_load(&g_connected) || !topic) return E_INVAL;
+
+    int rc = mosquitto_subscribe(g_mosq, NULL, topic, qos);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        LOG_ERROR("mosquitto_subscribe '%s' failed: %s",
+                  topic, mosquitto_strerror(rc));
+        return E_NET;
+    }
+
+    LOG_INFO("topic subscribed: %s (qos=%d)", topic, qos);
+    return E_OK;
 }
 
 /* ─── 连接成功回调注册（P1-13/P2-19）───────────────────── */

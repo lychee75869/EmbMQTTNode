@@ -22,6 +22,7 @@
 #include "modbus_master.h"
 #include "mqtt_client.h"
 #include "ota.h"
+#include "platform.h"        /* T02：平台分发器（publish/告警/下行均经此） */
 #include "rule_engine.h"
 #include "sensor.h"
 #include "storage.h"
@@ -150,50 +151,30 @@ static void auto_client_id(struct node_config *cfg,
 /* ─── 传感器数据处理 ────────────────────────────────────── */
 
 /*
- * 按数据来源发布到对应 topic：
- *   - local  → mqtt_publish（默认主题）
- *   - modbus → topic/modbus（JSON，QoS 1）
- * 在线直发与断网补发（upload_thread）共用，保证补发时 topic 一致。
+ * T02：数据/告警上报全部经平台分发器（main 不再直调 mqtt_* 数据路径）。
+ *   - 告警：platform_publish_alert(cfg,&evt)  （local: %s/alert 原文本 QoS1）
+ *   - 数据：platform_publish_data(cfg,data)   （local: local→默认主题；
+ *            modbus→topic/modbus JSON QoS1；不 mask 哨兵）
+ * 在线直发与断网补发（upload_thread）共用同一平台路径，topic 一致。
  */
-static int publish_by_source(const struct sensor_data *data,
-                             sensor_source_t source) {
-    if (source == SOURCE_LOCAL) {
-        /* 本地传感器：使用原有 mqtt_publish，发布到默认主题 */
-        return mqtt_publish(&g_cfg, data);
-    }
-
-    /* Modbus 数据：发布到 topic/modbus，以 JSON 格式发送。
-     * P1-9: 复用 mqtt_build_data_payload 构造（截断返回 E_IO，
-     * 拒绝发布半截 JSON），不再手写无检查的 snprintf。 */
-    char modbus_topic[256];
-    snprintf(modbus_topic, sizeof(modbus_topic), "%s/modbus", g_cfg.topic);
-
-    char payload[512];
-    int build_rc = mqtt_build_data_payload(&g_cfg, data,
-                                           payload, (int)sizeof(payload));
-    if (build_rc != E_OK)
-        return build_rc;
-    return mqtt_publish_raw(modbus_topic, payload, 1);
-}
-
 static void process_sensor_data(const struct sensor_data *data, sensor_source_t source) {
     const char *src = (source == SOURCE_LOCAL) ? "local" : "modbus";
 
     /* ── Dashboard 数据更新 ── */
     http_server_update_data(data);
 
-    /* ── 规则引擎评估 ── */
+    /* ── 规则引擎评估（out 产出结构化告警事件，msg 文本与 v1.2.11 相同）── */
     char alert_msg[256] = {0}; // 告警消息缓冲区
+    struct alert_event evt;
+    memset(&evt, 0, sizeof(evt));
     uint8_t actions = rule_engine_evaluate(data, alert_msg, sizeof(alert_msg),
-                                           NULL);
+                                           &evt);
     if (actions) {
         LOG_INFO("%s: rule actions triggered: 0x%02x", src, actions);
 
-        /* MQTT 告警上报 */
+        /* MQTT 告警上报（经平台；本地平台发 %s/alert 原文本） */
         if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
-            char alert_topic[256];
-            snprintf(alert_topic, sizeof(alert_topic), "%s/alert", g_cfg.topic);
-            mqtt_publish_raw(alert_topic, alert_msg, 1);
+            platform_publish_alert(&g_cfg, &evt);
         }
 
         /* GPIO 输出 */
@@ -205,15 +186,15 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
 
     /* ── 异常检测引擎评估  ── */
     char anomaly_msg[256] = {0};
+    struct alert_event a_evt;
+    memset(&a_evt, 0, sizeof(a_evt));
     uint8_t a_actions =
-        anomaly_engine_evaluate(data, anomaly_msg, sizeof(anomaly_msg), NULL);
+        anomaly_engine_evaluate(data, anomaly_msg, sizeof(anomaly_msg), &a_evt);
     if (a_actions) {
         LOG_INFO("%s: anomaly actions triggered: 0x%02x", src, a_actions);
 
         if ((a_actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
-            char alert_topic[256];
-            snprintf(alert_topic, sizeof(alert_topic), "%s/alert", g_cfg.topic);
-            mqtt_publish_raw(alert_topic, anomaly_msg, 1);
+            platform_publish_alert(&g_cfg, &a_evt);
         }
 
         if (a_actions & ACTION_GPIO_1)
@@ -223,13 +204,11 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
     }
 
     if (mqtt_is_connected()) {
-        publish_by_source(data, source);
+        platform_publish_data(&g_cfg, data);
     } else {
-        /* MQTT 离线：按来源入队（断网续传），补发时走各自 topic */
+        /* MQTT 离线：按来源入队（断网续传），补发时走同一平台路径 */
         storage_save(data, source, g_cfg.client_id);
     }
-
-
 }
 
 /* ─── 采集线程 ────────────────────────────────────────── */
@@ -306,8 +285,8 @@ static void *upload_thread(void *arg) {
             int n = storage_get_pending(pending, 16);
             int sent = 0;
             for (int i = 0; i < n; i++) {
-                /* 按来源补发到对应 topic，发布成功才按主键删除 */
-                if (publish_by_source(&pending[i], pending[i].source) == E_OK) {
+                /* 按来源补发到对应 topic（经平台路径），发布成功才按主键删除 */
+                if (platform_publish_data(&g_cfg, &pending[i]) == E_OK) {
                     storage_delete_by_id(pending[i].id);
                     sent++;
                 }
@@ -359,39 +338,22 @@ static void usage(const char *prog) {
     printf("  -h          显示帮助\n");
 }
 
-/* ─── MQTT 连接成功回调（P1-13/P2-19 修复）──────────────── */
+/* ─── 平台重启请求回调（T02：供 huawei reboot 命令，T05 启用）───────── */
 
 /*
- * v1.2.8（P1-13/P2-19）："连接成功后要做的事"从 main 的定时猜测
- * （旧实现：mqtt_init 返回后 usleep(500000)，再一次性 publish
- * online + subscribe ota，返回值不接、失败不重试）改为 on_connect
- * 事件驱动。本回调由 mqtt_handle_connack 在 libmosquitto 网络线程
- * 中、每次成功 CONNACK 时调用——首次连接与断网自动重连（loop_start
- * 内置重连）都会触发，天然覆盖两个缺陷：
+ * v1.2.8（P1-13/P2-19）的"连接成功后要做的事"（重订 OTA + 重发 online）
+ * 已从 main 的 mqtt_set_connected_callback 迁入平台层：
+ *   mqtt_handle_connack → platform_on_connected → platform_local.on_connected
+ *   （local_on_connected 内重订 OTA 主题 + 重发 online）。
+ * 语义不变：每次 CONNACK 成功都会重新订阅 OTA 主题并重发 online。
  *
- *   P1-13: clean_session=true 下 broker 断连即清空订阅，旧实现仅在
- *          启动订阅一次，一次断网重连后 OTA 升级通道永久失效；
- *          现在每次重连成功都会重新订阅。
- *   P2-19: 连接异步建立（on_connect 才置 g_connected），旧实现固定
- *          sleep 0.5s 后调用，慢网/认证慢的 broker 下静默失败且永不
- *          重试；现在由 CONNACK 事件驱动，不存在时序竞态。
- *
- * 有意的语义改进：online 状态随每次重连重发。旧实现只在启动时发
- * 一次，断网期间 broker 侧由遗嘱消息标记 offline，重连后不再刷新；
- * 现在每次重连都会重发 online，broker 侧状态与真实连接保持一致。
- *
- * 线程说明：回调运行在 libmosquitto 网络线程，从回调内调用
- * mosquitto_publish / mosquitto_subscribe 是官方文档允许的用法
- * （与 loop_start 配合的线程安全接口）。
+ * 本回调仅用于平台的"重启请求"（huawei reboot 命令）：优雅停机置
+ * g_running=0，交由 systemd Restart=always 拉起（决策⑤配置生效路径）。
+ * local 无命令入口，本轮注册以备 T05。
  */
-static void on_mqtt_connected(void) {
-    /* online 状态随每次连接/重连成功重发（语义改进，见函数头注释） */
-    if (mqtt_publish_status(&g_cfg, &g_dev, "online") != E_OK)
-        LOG_WARN("publish online status failed on connect");
-
-    /* P1-13 核心：clean session 下 broker 已清订阅，必须重订 */
-    if (mqtt_subscribe_ota(g_cfg.client_id) != E_OK)
-        LOG_WARN("subscribe ota topic failed on connect");
+static void platform_reboot_request_cb(void) {
+    LOG_INFO("platform requested reboot, shutting down gracefully");
+    g_running = 0;
 }
 
 /* ─── 入口 ────────────────────────────────────────────── */
@@ -423,6 +385,13 @@ int main(int argc, char *argv[]) {
     auto_client_id(&g_cfg, &g_dev);
     config_dump(&g_cfg);
 
+    /* 2.5 T02：装配平台分发器（在任何线程创建之前写定 g_active）。
+     * 注入 device_info 供平台 on_connected 发 online 状态；
+     * 注册"重启请求"回调（huawei reboot 命令，T05 启用）。 */
+    platform_set_device_info(&g_dev);
+    platform_select(&g_cfg);
+    platform_set_reboot_request(platform_reboot_request_cb);
+
     /* 3. 初始化传感器 */
     if (sensor_init(g_cfg.sensor_type, g_cfg.sensor_i2c_dev) != E_OK) {
         fprintf(stderr, "FATAL: sensor_init failed\n");
@@ -446,34 +415,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* 5. 初始化 MQTT（含 TLS + 遗嘱消息） */
-    /* 5a. 构造遗嘱消息 */
-    char will_payload[256];
-    snprintf(will_payload, sizeof(will_payload),
-             "{\"client_id\":\"%s\",\"status\":\"offline\","
-             "\"timestamp\":%lld}",
-             g_cfg.client_id, (long long)time(NULL) * 1000LL);
-
-    char will_topic[256];
-    snprintf(will_topic, sizeof(will_topic), "%s/status", g_cfg.topic);
-
-    /*
-     * 5b. P2-19: 注册"连接成功"回调。必须在 mqtt_init 之前注册：
-     * mqtt_init 内部 mosquitto_connect + loop_start 返回后，CONNACK
-     * 随时可能先于 main 的下一条语句到达（连接由网络线程异步建立），
-     * 若注册在 mqtt_init 之后，存在"首次 CONNACK 已到但回调未注册"
-     * 的窗口，online 上报与 OTA 订阅会静默丢失。提前注册则该窗口不
-     * 存在；mqtt_init 失败（E_NET）路径下连接从未建立，on_connect
-     * 不会触发，离线模式行为不受影响。
-     */
-    mqtt_set_connected_callback(on_mqtt_connected);
-
-    /* 5c. MQTT 连接（传入遗嘱 topic + payload）。
-     * P1-13/P2-19: 旧的 5c/5d（usleep(500000) + 一次性 publish
-     * online / subscribe ota）已删除——online 上报与 OTA 订阅移入
-     * on_mqtt_connected 回调，由每次 CONNACK 成功事件驱动。 */
-    if (mqtt_init(g_cfg.broker_host, g_cfg.broker_port, g_cfg.client_id,
-                  &g_cfg.tls, will_topic, will_payload) != E_OK) {
+    /* 5. 初始化 MQTT（T02：连接参数与遗嘱消息由平台层组装，main 不再拼装）。
+     *
+     * P1-13/P2-19 的"连接成功要做的事"（重订 OTA + 重发 online）已迁入
+     * 平台层：mqtt_handle_connack → platform_on_connected →
+     * platform_local.on_connected。语义不变——每次 CONNACK 成功都会重订
+     * OTA 主题并重发 online；且该回调在 mqtt_init 内部由 CONNACK 事件驱动，
+     * 不再存在"回调晚于首个 CONNACK 注册"的窗口（原 P2-19 问题在平台层
+     * 天然规避）。故 main 不再注册 mqtt_set_connected_callback。 */
+    if (mqtt_init(&g_cfg) != E_OK) {
         LOG_WARN("mqtt_init failed, running in offline mode");
     }
 
@@ -506,10 +456,14 @@ int main(int argc, char *argv[]) {
     /* 10. 初始化 OTA 远程升级（阶段四） */
     if (g_cfg.ota.enabled) {
         ota_init(&g_cfg.ota, g_cfg.client_id, EMBMQTTNODE_VERSION);
-        /* 注入 MQTT 发布回调（用于 OTA 状态上报） */
+        /* 注入 MQTT 发布回调（用于 OTA 状态上报）。
+         * 注：这是 main.c 中唯一保留的直连 mqtt_* 数据路径（验收项④），
+         * 用于把 OTA 状态注入点交给 ota.c；下行路由已全部经平台层。 */
         ota_set_mqtt_publish(mqtt_publish_raw);
-        /* 注册 OTA 消息回调（来自 MQTT 的升级指令） */
-        mqtt_set_ota_callback(ota_handle_message);
+        /* T02：OTA 下行消息路由由平台层唯一持有（docs/12 §3.1）。
+         * mqtt_client.on_message 全量转发 platform_dispatch_message，
+         * local 平台 on_message 命中 /ota/cmd 后直连 ota_handle_message；
+         * 故此处不再注册 mqtt_set_ota_callback。 */
 
         /* OTA 启动后检查：本地安全机制，不依赖 MQTT 连接。
          * 必须在 ota_init 之后调用（需要 slot_dir/配置就绪）。
@@ -566,8 +520,8 @@ int main(int argc, char *argv[]) {
     /* 13. 优雅退出 */
     LOG_INFO("shutting down...");
 
-    /* 发布离线状态（best-effort，遗嘱消息兜底） */
-    mqtt_publish_status(&g_cfg, &g_dev, "offline");
+    /* 发布离线状态（经平台层；best-effort，遗嘱消息兜底） */
+    platform_publish_status(&g_cfg, &g_dev, "offline");
     usleep(200000); /* 给网络线程一点时间发出 */
 
     mqtt_close();

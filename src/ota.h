@@ -61,7 +61,11 @@ int ota_check_and_handle(void);
  *   - boot_count == 0：已确认健康，正常启动
  *   - 0 < boot_count < max：递增计数，继续试用
  *   - boot_count >= max：试用期内反复失败 → 切回旧槽，exit(42)
- * 必须在 ota_init() 与 ota_set_mqtt_publish() 之后、mqtt_set_ota_callback()
+ * 必须在 ota_init() 与 ota_set_mqtt_publish() 之后调用（需要槽位目录/
+ * 配置就绪）。注：T02 起 OTA 下行指令路由由平台层唯一持有
+ * （mqtt_client.on_message → platform_dispatch_message →
+ *   platform_local.on_message → 本文件的 ota_handle_message），
+ * 不再需要 mqtt_set_ota_callback 注册步骤。
  */
 void ota_post_boot_check(void);
 

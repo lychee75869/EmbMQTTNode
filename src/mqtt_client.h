@@ -2,18 +2,25 @@
  * mqtt_client.h / mqtt_client.c
  * MQTT 客户端封装，基于 libmosquitto
  * 阶段一增强：MQTT over TLS、设备身份、Last Will 遗嘱
+ *
+ * v1.3.0（T02）：传输层与平台解耦——
+ *   - mqtt_init 经 platform_connect_params 取连接参数（client_id/
+ *     username/password/keepalive/use_will/TLS 落点/CA）；
+ *   - TLS 分支由 connect_params.force_tls || cfg->tls.enabled 驱动；
+ *   - on_message 全量转发 platform_dispatch_message（不再判 topic）；
+ *   - on_connect 触发 platform_on_connected（重订/重发状态由平台实现）。
  */
 #ifndef MQTT_CLIENT_H
 #define MQTT_CLIENT_H
 
 #include "common.h"
 
-/* 初始化 MQTT 连接（含 TLS + 遗嘱支持） */
-int mqtt_init(const char *host, int port,
-              const char *client_id,
-              const struct tls_config *tls,
-              const char *will_topic,
-              const char *will_payload);
+/*
+ * 初始化 MQTT 连接（含 TLS + 遗嘱支持）。
+ * 连接参数（client_id/username/password/keepalive/遗嘱/TLS 锚点）经
+ * platform_connect_params(cfg,&p) 取得；host/port 取 cfg->broker_host/port。
+ */
+int mqtt_init(const struct node_config *cfg);
 
 /* 发布 JSON 格式传感器数据 */
 int mqtt_publish(const struct node_config *cfg, const struct sensor_data *data);
@@ -26,20 +33,14 @@ int mqtt_publish_status(const struct node_config *cfg,
                         const struct device_info *dev,
                         const char *status);
 
-/* 订阅 OTA 升级指令主题 */
+/* 订阅 OTA 升级指令主题（local 重订用："embmqttnode/<client_id>/ota/cmd"） */
 int mqtt_subscribe_ota(const char *client_id);
 
 /*
- * OTA 消息回调类型
- * payload:     消息体
- * payload_len: 消息长度
+ * 订阅任意主题（薄封装 mosquitto_subscribe + 日志）。
+ * 供 platform_local 重订 OTA、platform_huawei 订阅 commands/#。
  */
-typedef void (*mqtt_ota_callback)(const char *payload, int payload_len);
-
-/*
- * 注册 OTA 消息回调（收到 ota/cmd 消息时调用）
- */
-void mqtt_set_ota_callback(mqtt_ota_callback cb);
+int mqtt_subscribe_topic(const char *topic, int qos);
 
 /*
  * P1-13/P2-19: "连接成功"回调类型（无参数，无返回值）。
@@ -60,8 +61,9 @@ void mqtt_set_connected_callback(mqtt_connected_callback cb);
 
 /*
  * P1-13/P2-19: CONNACK 处理逻辑（on_connect 回调的函数体）。
- * rc==0: 置连接标志并调用已注册的连接成功回调（重订阅/重发状态）；
- * rc!=0: 清连接标志并按返回码打日志，返回 E_NET。
+ * rc==0: 置连接标志 → platform_on_connected(cfg)（重订阅/重发状态由平台
+ *        实现）→ 触发已注册的连接成功回调（观测/扩展 hook）；
+ * rc!=0: 清连接标志 → platform_on_disconnected() → 按返回码打日志，返回 E_NET。
  * 从 on_connect（网络线程）调用；单独导出供单元测试覆盖
  * 回调注册/判空/重连重复触发逻辑（无需真实 broker）。
  */

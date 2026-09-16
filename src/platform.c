@@ -35,9 +35,11 @@ int platform_select(struct node_config *cfg)
     if (strcmp(want, "local") == 0) {
         g_active = &platform_local_ops;
     } else if (strcmp(want, "huawei") == 0) {
-        /* TODO(T03): 校验 huawei_device_id/secret 非空 + subdev_load(path)；
+        /* TODO(T04): 校验 huawei_device_id/secret 非空 + subdev_load(path);
          *            成功后 g_active = &platform_huawei_ops;
-         * fail-safe：未实现前回落 local（保运行能力）。 */
+         * fail-safe：未实现前回落 local（保运行能力）。
+         * 注：hw_* 纯函数（含 hw_connect_params 的凭据非空校验）已在
+         *     T03 交付于 platform_huawei.c。 */
         LOG_WARN("platform='huawei' not implemented yet, "
                  "falling back to local (T03/T04/T05 pending)");
         g_active = &platform_local_ops;

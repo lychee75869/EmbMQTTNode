@@ -13,7 +13,7 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields test_platform_local
+TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields test_platform_local test_platform_huawei
 
 .PHONY: all clean distclean
 
@@ -92,6 +92,14 @@ test_platform_local: test_platform_local.c ../src/platform.c ../src/platform_loc
                      ../src/mqtt_client.c ../src/ota.c ../src/config.c \
                      ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
+
+# v1.3.0 T03：huawei 纯函数单测（client_id/password(HMAC)/keepalive/时间/
+# 主题分类/payload builders/connect_params）。纯函数无外部依赖：仅需
+# platform_huawei.c + sensor_fields.c（字段表 for_each_field）与 libcrypto
+# （HMAC-SHA256）；不链接 mqtt/ota/sqlite。
+test_platform_huawei: test_platform_huawei.c ../src/platform_huawei.c \
+                      ../src/sensor_fields.c
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lcrypto
 
 clean:
 	rm -f $(TESTS) test_data.db test_modbus_tmp.conf test_legacy.db

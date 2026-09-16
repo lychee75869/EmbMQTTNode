@@ -61,7 +61,7 @@ struct platform_ops {
 
 /* 各平台 ops 表（由 platform_select 装配） */
 extern const struct platform_ops platform_local_ops;
-/* TODO(T03): extern const struct platform_ops platform_huawei_ops; */
+/* TODO(T04): extern const struct platform_ops platform_huawei_ops; */
 
 /* ─── 分发器 API（均薄转发 g_active，启动后只读无锁）─────────── */
 

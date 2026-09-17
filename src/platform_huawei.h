@@ -143,4 +143,45 @@ int hw_build_command_response(const char *request_id, int result_code,
 int hw_connect_params(const struct node_config *cfg,
                       struct platform_connect_params *out);
 
+/* ── 子设备管理运行期（platform_huawei_subdev.c，T04）────────────── */
+
+/*
+ * 装配子设备运行期状态：加载注册表（subdev_load）并按 subdev_count()/
+ * subdev_at() 构建 g_subdev_rt[] 对齐表（注册表条目只有一份事实源）。
+ * 必须在任何线程创建之前（platform_select 内）调用一次。
+ *   返回: 成功加载的条目数（≥0）；cfg==NULL → E_INVAL。
+ * 注意：注册表 0 条**不**返回错误——这是合法的「纯网关」模式（打醒目 WARN）。
+ */
+int hw_subdev_init(const struct node_config *cfg);
+
+/* 运行期槽数量（= hw_subdev_init 对齐的条目数；只读，线程创建后不变） */
+int hw_subdev_rt_count(void);
+
+/* 运行期子设备状态快照（只读；供单测/诊断，不改变运行语义） */
+struct hw_subdev_stat {
+    char    device_id[SUBDEV_DEVICE_ID_LEN];
+    int     registered;
+    int     online;
+    int     reg_fail_cnt;
+    int     empty_skip_cnt;
+    int64_t last_seen_ms;   /* CLOCK_MONOTONIC 毫秒 */
+    int64_t next_reg_ms;    /* CLOCK_MONOTONIC 毫秒 */
+};
+/* 返回 idx 槽快照；越界（idx<0 || idx>=hw_subdev_rt_count()）→ E_INVAL */
+int hw_subdev_stat_get(int idx, struct hw_subdev_stat *out);
+
+/*
+ * 注册重试退避（纯函数，可单测）：min(30s * fail_cnt, 300s)。
+ * fail_cnt<=0 视为 1。单调不减、300s 封顶。
+ */
+int64_t hw_subdev_backoff_ms(int fail_cnt);
+
+/*
+ * 可注入发布后端（默认 mqtt_publish_raw）。仅供单测注入桩，使
+ * 「publish_data 命中 → E_OK」等返回码契约可在**无 broker**下单测；
+ * 生产路径 g_pub==NULL → 恒用 mqtt_publish_raw。传 NULL 复位。
+ */
+typedef int (*hw_pub_fn)(const char *topic, const char *payload, int qos);
+void hw_subdev_set_publisher(hw_pub_fn fn);
+
 #endif /* PLATFORM_HUAWEI_H */

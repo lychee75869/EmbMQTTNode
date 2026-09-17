@@ -11,6 +11,8 @@
  * 回落 local，保运行能力，并留清晰 TODO 锚点。
  */
 #include "platform.h"
+#include "platform_huawei.h"   /* hw_connect_params / hw_subdev_init */
+#include "subdev_registry.h"
 #include <string.h>
 
 /* 选定的平台 ops。默认 local——保证未调用 platform_select 的单元测试
@@ -35,14 +37,23 @@ int platform_select(struct node_config *cfg)
     if (strcmp(want, "local") == 0) {
         g_active = &platform_local_ops;
     } else if (strcmp(want, "huawei") == 0) {
-        /* TODO(T04): 校验 huawei_device_id/secret 非空 + subdev_load(path);
-         *            成功后 g_active = &platform_huawei_ops;
-         * fail-safe：未实现前回落 local（保运行能力）。
-         * 注：hw_* 纯函数（含 hw_connect_params 的凭据非空校验）已在
-         *     T03 交付于 platform_huawei.c。 */
-        LOG_WARN("platform='huawei' not implemented yet, "
-                 "falling back to local (T03/T04/T05 pending)");
-        g_active = &platform_local_ops;
+        /* Q2 裁定：两条互斥规则——
+         *  ① 凭据缺失/非法（hw_connect_params != E_OK）→ 硬回落 local（连不上华为）；
+         *  ② 注册表 0 条 → 不回落（合法「纯网关」模式，仅醒目 WARN）。
+         * 先校验凭据（避免在不可用配置上加载注册表），再装配运行期状态。 */
+        struct platform_connect_params tmp;
+        if (hw_connect_params(cfg, &tmp) != E_OK) {
+            LOG_ERROR("platform='huawei' but credentials invalid "
+                      "(huawei_device_id/huawei_secret empty or bad) — "
+                      "falling back to local (cannot connect to IoTDA)");
+            g_active = &platform_local_ops;
+        } else {
+            int n = hw_subdev_init(cfg);
+            if (n < 0)
+                LOG_WARN("platform='huawei': subdevice init returned %d", n);
+            LOG_INFO("platform selected: huawei (subdevice slots=%d)", n < 0 ? 0 : n);
+            g_active = &platform_huawei_ops;
+        }
     } else {
         LOG_WARN("platform='%s' unknown, falling back to local", want);
         g_active = &platform_local_ops;

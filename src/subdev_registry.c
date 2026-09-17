@@ -257,6 +257,22 @@ int subdev_load(const char *path, struct subdev_entry *out, int max)
     return g_count;
 }
 
+/* ─── 只读枚举（T04）───────────────────────────────────── */
+
+int subdev_count(void)
+{
+    return g_count;
+}
+
+const struct subdev_entry *subdev_at(int idx)
+{
+    if (idx < 0 || idx >= g_count)
+        return NULL;
+    return &g_entries[idx];
+}
+
+/* ─── 查询 ─────────────────────────────────────────────── */
+
 const struct subdev_entry *subdev_find_sensor(const char *sensor_type)
 {
     if (!sensor_type) return NULL;

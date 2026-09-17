@@ -85,7 +85,10 @@ static void set_default_config(struct node_config *cfg)
     cfg->huawei_keepalive        = 120;   /* 华为推荐 120s */
     cfg->huawei_props_interval   = 60;
     cfg->subdev_offline_sec      = 30;
-    strncpy(cfg->subdevices_conf, "config/subdevices.conf",
+    /* P1-16：默认绝对路径（与 node.conf 同目录）。原相对默认 "config/subdevices.conf"
+     * 在板上 systemd WorkingDirectory=/var/lib/embmqttnode 下解析到不存在的路径 →
+     * subdev_load 静默失败。此处逐字消费绝对路径，不做 cwd/config_dir 相对解析。 */
+    strncpy(cfg->subdevices_conf, "/etc/embmqttnode/subdevices.conf",
             sizeof(cfg->subdevices_conf) - 1);
     cfg->huawei_ca_file[0]       = '\0';
 }

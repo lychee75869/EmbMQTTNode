@@ -43,6 +43,15 @@ struct subdev_entry {
  */
 int subdev_load(const char *path, struct subdev_entry *out, int max);
 
+/*
+ * 只读枚举（T04）：遍历已加载条目而不复制第二份数组。
+ * subdev_count: 已加载条目数，0..SUBDEVICE_MAX。
+ * subdev_at   : idx∈[0,count) → 条目首地址（指向模块静态 g_entries，只读）；
+ *               越界 → NULL。
+ */
+int subdev_count(void);
+const struct subdev_entry *subdev_at(int idx);
+
 /* 按 sensor_type 查询本地传感器子设备条目；未命中返回 NULL */
 const struct subdev_entry *subdev_find_sensor(const char *sensor_type);
 

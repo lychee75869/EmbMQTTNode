@@ -26,7 +26,8 @@ install:
 # 杜绝「编译了 N 个、runner 只跑 N-1 个、结尾计数还写死」的假绿复发。
 TESTS = test_sensor test_storage test_modbus_config test_rule_engine test_ota \
         test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry \
-        test_sensor_fields test_platform_local test_platform_huawei
+        test_sensor_fields test_platform_local test_platform_huawei \
+        test_platform_huawei_subdev
 
 test:
 	$(MAKE) -C tests
@@ -51,5 +52,5 @@ dist: all strip
 	mkdir -p dist; \
 	tar czf dist/embmqttnode_$${VER}_$${ARCH}.tar.gz \
 		src/embmqttnode config/node.conf config/embmqttnode.service \
-		config/embmqttnode-launcher; \
+		config/embmqttnode-launcher config/subdevices.conf; \
 	echo "=== Release: dist/embmqttnode_$${VER}_$${ARCH}.tar.gz ==="

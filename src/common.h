@@ -21,10 +21,14 @@
 #include <errno.h>
 #include <unistd.h>
 
-/* v1.2.11（P1-2 修复）：规则/异常引擎共享状态数据竞争——
- * 两引擎各加静态互斥锁，evaluate/get_stats 全程持锁，
- * 锁内不做 I/O（详见 src/rule_engine.c / src/anomaly_engine.c 头注释） */
-#define EMBMQTTNODE_VERSION "1.2.11"
+/* v1.3.0：华为云 IoTDA 接入（新增平台适配层 platform = local | huawei）。
+ * 交付链：T01 数据层（哨兵统一 / source_id / 子设备注册表）→ T06 字段描述表单一事实源
+ *        → T02 平台抽象 + local 等价回归 → T03 华为鉴权/属性/事件纯函数
+ *        → T04 子设备管理 → T05 命令闭环与集成联调。
+ * 不变式：platform=local 路径行为与 v1.2.11 **逐字节等价**（各测试即回归基线）。
+ * 历史：v1.2.11 = P1-2 规则/异常引擎共享状态数据竞争修复（两引擎各加静态互斥锁，
+ *       evaluate/get_stats 全程持锁，锁内不做 I/O；见 rule_engine.c / anomaly_engine.c）。 */
+#define EMBMQTTNODE_VERSION "1.3.0"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败

@@ -27,7 +27,7 @@ install:
 TESTS = test_sensor test_storage test_modbus_config test_rule_engine test_ota \
         test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry \
         test_sensor_fields test_platform_local test_platform_huawei \
-        test_platform_huawei_subdev
+        test_platform_huawei_subdev test_platform_huawei_cmd
 
 test:
 	$(MAKE) -C tests

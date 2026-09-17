@@ -327,6 +327,74 @@ static void test_consttime_token_equal(void) {
     printf("  empty==empty -> 1:         PASS\n");
 }
 
+/* ─── T05 Q4：mqtt_rebuild_needed 窗口判定（纯函数）──────────── */
+
+static void test_rebuild_needed(void)
+{
+    printf("--- test_rebuild_needed (T05 Q4) ---\n");
+
+    const int64_t base = 1000000;   /* 任意 epoch 秒 */
+    /* 0 / 1799 → 不重建；1800 / 1801 → 重建 */
+    assert(mqtt_rebuild_needed(base, base) == 0);
+    assert(mqtt_rebuild_needed(base + 1799, base) == 0);
+    assert(mqtt_rebuild_needed(base + 1800, base) == 1);
+    assert(mqtt_rebuild_needed(base + 1801, base) == 1);
+    /* built_ts<=0（未生成）→ 不重建 */
+    assert(mqtt_rebuild_needed(base, 0) == 0);
+    assert(mqtt_rebuild_needed(base, -1) == 0);
+
+    /* 跨桶反例：分桶式 now/1800 != built_ts/1800 在桶边界会误判；
+     * 本式（流逝时间）不误判。取 built 在桶末尾、now 在下一桶开头，
+     * 实际仅隔 2s → 不应重建 */
+    int64_t built = 10 * 1800 - 1;   /* 17999：桶 9 末尾 */
+    int64_t now   = 10 * 1800 + 1;   /* 18001：桶 10 开头 */
+    assert((now / 1800) != (built / 1800));        /* 分桶式确实判不同桶 */
+    assert(mqtt_rebuild_needed(now, built) == 0);  /* 本式：仅隔 2s → 不重建 */
+    printf("  0/1799/1800/1801 + cross-bucket: PASS\n");
+}
+
+/* ─── T05 Q5：会话丢失去重（非阻塞-12）───────────────────────── */
+
+static void test_link_dedup(void)
+{
+    printf("--- test_link_dedup (T05 Q5) ---\n");
+    mqtt_set_connected_callback(NULL);
+
+    /* 清残留旗标（前序 connack 用例可能置位） */
+    (void)mqtt_on_link_lost();
+    /* 从未连上 → 不触发 */
+    assert(mqtt_on_link_lost() == 0);
+
+    /* 连上（置旗标）→ 一次丢失恰触发一次，再去重不触发 */
+    assert(mqtt_handle_connack(0) == E_OK);
+    assert(mqtt_on_link_lost() == 1);
+    assert(mqtt_on_link_lost() == 0);
+
+    /* 先连后断（on_disconnect 路径）恰一次 */
+    assert(mqtt_handle_connack(0) == E_OK);
+    assert(mqtt_on_link_lost() == 1);
+    assert(mqtt_on_link_lost() == 0);
+    printf("  never-up no-fire; up->lost once: PASS\n");
+
+    /* 另一触发点（CONNACK 失败）在连过后经去重恰一次 */
+    assert(mqtt_handle_connack(0) == E_OK);
+    assert(mqtt_handle_connack(3) == E_NET);   /* 触发点#1，消费旗标 */
+    assert(mqtt_on_link_lost() == 0);          /* 旗标已清 → 不再触发 */
+    printf("  connack-fail after up -> single fire: PASS\n");
+}
+
+/* ─── T05 Q4：supervisor 在 rebuild_on_hour==0 为 no-op ──────── */
+
+static void test_supervisor_noop(void)
+{
+    printf("--- test_supervisor_noop (T05 Q4) ---\n");
+    /* 本文件未 mqtt_init → g_rebuild_on_hour==0（local / auth_type=0 语义）
+     * → mqtt_start_supervisor 不创建线程（no-op），stop 亦安全 no-op */
+    assert(mqtt_start_supervisor() == E_OK);
+    mqtt_stop_supervisor();
+    printf("  no-op when rebuild_on_hour==0: PASS\n");
+}
+
 /* ─── 入口 ─────────────────────────────────────────────── */
 
 int main(void) {
@@ -350,6 +418,11 @@ int main(void) {
     test_build_data_payload_defensive();
     test_build_status_payload();
     test_consttime_token_equal();
+
+    /* v1.3.0 T05 用例 */
+    test_rebuild_needed();
+    test_link_dedup();
+    test_supervisor_noop();
 
     printf("\n=== ALL mqtt_client tests PASSED ===\n");
     return 0;

@@ -13,9 +13,10 @@
  *   - 条数 > SUBDEVICE_MAX(16) → 超出丢弃 + WARN
  *   - data_source ∉ {sensor, modbus} → 丢弃 + WARN
  *   - sensor: source_key 必须是合法 sensor_type；modbus: 1..247 整数 → 否则丢弃
- *   - device_id 非空、≤256、不含空格与 $ # +（MQTT 通配符）→ 否则丢弃
+ *   - device_id 非空、≤256、不含空格与 $ # +（MQTT 通配符）以及
+ *     JSON 逸出字符 `"` `\` 与裸控制字符（T05 审计补）→ 否则丢弃
  *   - device_id 全表唯一；(data_source, source_key) 全表唯一 → 重复丢弃
- *   - service_id 含非法字符 → 回落缺省 "SensorData" + WARN
+ *   - service_id / name 含非法字符（同上集合）→ 回落缺省 + WARN
  *   - 文件不存在 / 0 条 → WARN + 空表（不 crash）
  */
 #include "subdev_registry.h"
@@ -48,11 +49,19 @@ static int valid_sensor_type(const char *t)
            strcmp(t, "mock") == 0;
 }
 
-/* device_id / service_id 的非法字符集：空白 与 MQTT 通配符分隔符 $ # + */
+/* device_id / service_id 的非法字符集：
+ *   - 空白 与 MQTT 通配符分隔符 $ # +
+ *   - JSON 字符串逸出字符 `"` `\` 与任意裸控制字符（< 0x20）
+ *     （T05 审计补：device_id/service_id 会被插值进 $oc JSON payload） */
 static int has_illegal_char(const char *s)
 {
-    for (const char *p = s; *p; p++) {
-        if (*p == ' ' || *p == '\t' || *p == '$' || *p == '#' || *p == '+')
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        unsigned char c = *p;
+        if (c < 0x20)                          /* 裸控制字符 */
+            return 1;
+        if (c == ' ' || c == '$' || c == '#' || c == '+')
+            return 1;
+        if (c == '"' || c == '\\')             /* JSON 逸出 */
             return 1;
     }
     return 0;
@@ -158,7 +167,7 @@ int subdev_load(const char *path, struct subdev_entry *out, int max)
         }
         if (has_illegal_char(did)) {
             LOG_WARN("subdev: '%s' device_id contains illegal char "
-                     "(space/$/#/+), entry dropped", k);
+                     "(space/$/#/+/\"/\\\\ or control), entry dropped", k);
             continue;
         }
         strncpy(e.device_id, did, sizeof(e.device_id) - 1);
@@ -199,8 +208,8 @@ int subdev_load(const char *path, struct subdev_entry *out, int max)
             continue;
         }
 
-        /* ── name（展示名，日志用；空则回落 device_id） ── */
-        if (name[0] != '\0')
+        /* ── name（展示名，日志/注册 payload 用；空或含非法字符则回落 device_id） ── */
+        if (name[0] != '\0' && !has_illegal_char(name))
             strncpy(e.name, name, sizeof(e.name) - 1);
         else
             strncpy(e.name, did, sizeof(e.name) - 1);

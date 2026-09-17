@@ -46,6 +46,30 @@ static int ap(char *buf, int len, int pos, const char *fmt, ...)
     return pos + n;
 }
 
+/* ─── 0. JSON 字符串插值安全谓词（T05 R3）──────────────────── */
+
+/*
+ * 判定字符串 s 是否可安全地以 "%s" 形式插值进 JSON 字符串字面量。
+ * 安全 = 不含双引号、反斜杠、任意裸控制字符（字节值 < 0x20，含 \n \r \t）；
+ * 其余字节（含空格 0x20、UTF-8 ≥0x80 多字节）均可直接原样写入。
+ *   - NULL → 0（不安全，避免空指针/漏判）
+ *   - 空串 → 1（安全：无可插值内容）
+ * 设计为 fail-closed 拒绝依据：调用方在插值前校验，不安全即拒绝（不回退转义）。
+ */
+int hw_json_str_safe(const char *s)
+{
+    if (!s)
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        unsigned char c = *p;
+        if (c < 0x20)          /* 裸控制字符：JSON 规范禁止 */
+            return 0;
+        if (c == '"' || c == '\\')
+            return 0;
+    }
+    return 1;
+}
+
 /* ─── 1. 鉴权 ─────────────────────────────────────────────────── */
 
 int hw_build_client_id(const char *device_id, int auth_type,

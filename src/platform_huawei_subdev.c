@@ -17,8 +17,10 @@
  *     **或** 永久不可路由而丢弃）；非 E_OK（E_NET/E_IO/E_INVAL）= 瞬态可重试。
  *     据此 main.c 续传逻辑（==E_OK → delete）零改动即正确丢弃「子设备已不存在」
  *     的陈旧记录，且不新增错误码（§8）。
- *   - on_disconnected 空实现（非阻塞-12：规避 CONNACK 失败 + 真实断连双触发虚高）。
- *   - on_message 的 CMD_REQUEST 分支仅留 TODO(T05) seam，本轮不执行命令。
+ *   - on_disconnected 做 churn（flapping）日志（T05；非阻塞-12 去重已在
+ *     mqtt_client.c 的 mqtt_on_link_lost 收敛，本函数每会话丢失恰一次）。
+ *   - on_message 的 CMD_REQUEST 分支一行委派 hw_cmd_handle（T05 命令闭环），
+ *     命令实现位于 platform_huawei_cmd.c。
  */
 #include "platform.h"
 #include "platform_huawei.h"
@@ -218,13 +220,42 @@ static int hw_on_connected(const struct node_config *cfg)
     return E_OK;
 }
 
-/* ─── Q4-3：on_disconnected（网络线程；空实现）─────────────── */
+/* ─── Q4-3：on_disconnected（网络线程；T05 churn 日志）─────── */
+
+/* churn（flapping）观测：mono_ms 窗口内连续断连计数。
+ * 相邻断连间隔 < HW_CHURN_WINDOW_MS 视为 flapping，累计到阈值打一条 WARN。
+ * 仅日志，不改协议行为、**不改 registered/online**（§8）。时钟用单调钟。 */
+#define HW_CHURN_WINDOW_MS 30000   /* 30s 内的连续断连视为 churn */
+#define HW_CHURN_WARN_AT   3       /* 连续 flapping 达到该次数打 WARN */
+static _Atomic int64_t g_last_disc_ms = 0;
+static _Atomic int     g_churn_cnt    = 0;
+
+int hw_churn_count(void)
+{
+    return atomic_load(&g_churn_cnt);
+}
 
 static void hw_on_disconnected(void)
 {
-    /* 非阻塞-12：CONNACK 失败与真实断连两处都会触发，任何计数都会虚高。
-     * 故不广播 OFFLINE、不做 churn 计数、不复位 registered（平台侧注册
-     * 长期有效，§4.1）。churn 日志统一留 T05。 */
+    /* 非阻塞-12：CONNACK 失败与真实断连两处都会触发——去重已在 mqtt_client.c
+     * 的 mqtt_on_link_lost() 收敛（g_link_was_up），故本函数每会话丢失恰一次。 */
+    int64_t now = mono_ms();
+    int64_t last = atomic_load(&g_last_disc_ms);
+
+    int cnt;
+    if (last != 0 && now - last < HW_CHURN_WINDOW_MS)
+        cnt = atomic_fetch_add(&g_churn_cnt, 1) + 1;
+    else
+        cnt = 0;
+    if (cnt == 0)
+        atomic_store(&g_churn_cnt, 0);
+    atomic_store(&g_last_disc_ms, now);
+
+    if (cnt >= HW_CHURN_WARN_AT)
+        LOG_WARN("huawei: reconnect churn detected (%d disconnects within %ds)",
+                 cnt, HW_CHURN_WINDOW_MS / 1000);
+
+    /* 平台侧注册长期有效（§4.1）：不复位 registered、不广播 OFFLINE */
 }
 
 /* ─── Q4-4：on_message（网络线程）───────────────────────────── */
@@ -281,15 +312,11 @@ static void hw_on_message(const char *topic, const char *payload, int len)
             LOG_WARN("huawei: register response before platform_select (cfg NULL)");
         break;
 
-    case HW_KIND_CMD_REQUEST: {
-        char rid[64];
-        int rc = hw_extract_request_id(topic, rid, sizeof(rid));
-        LOG_INFO("huawei: command request received (rid=%s) -- deferred to T05",
-                 rc == E_OK ? rid : "?");
-        /* TODO(T05): 委派 platform_huawei_cmd：解析 paras → ota_handle_message/reboot
-         *            → hw_build_command_response 回执。本轮仅日志，不执行命令。 */
+    case HW_KIND_CMD_REQUEST:
+        /* T05 Q1：一行委派命令闭环（解析 → 执行 → 回执），实现于新文件
+         * platform_huawei_cmd.c。本文件不再含任何命令处理逻辑。 */
+        hw_cmd_handle(topic, payload, len);
         break;
-    }
 
     default:
         /* 低频丢弃日志（如需更静默可加节流） */

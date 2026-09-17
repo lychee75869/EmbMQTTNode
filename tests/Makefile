@@ -13,7 +13,7 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields test_platform_local test_platform_huawei test_platform_huawei_subdev
+TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields test_platform_local test_platform_huawei test_platform_huawei_subdev test_platform_huawei_cmd
 
 .PHONY: all clean distclean
 
@@ -67,11 +67,14 @@ test_mac_addr: test_mac_addr.c ../src/mac_addr.c
 # platform_huawei_subdev.c（ops 表 + 其依赖 subdev_registry.c 的
 # subdev_load/at/find）。三者符号均已满足：mqtt_client.c（publish 桩）、
 # sensor_fields.c（builders 字段表）、-lcrypto（HMAC）已在链上。
+# v1.3.0 T05：platform_huawei_subdev.c 现引用 hw_cmd_handle → 追加
+# platform_huawei_cmd.c（其依赖 ota.c/platform_huawei.c 均已在链上）。
 test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c ../src/http_server.c \
                   ../src/storage.c ../src/rule_engine.c ../src/anomaly_engine.c \
                   ../src/ota.c ../src/sensor_fields.c ../src/platform.c \
                   ../src/platform_local.c ../src/platform_huawei.c \
-                  ../src/platform_huawei_subdev.c ../src/subdev_registry.c
+                  ../src/platform_huawei_subdev.c ../src/platform_huawei_cmd.c \
+                  ../src/subdev_registry.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
 
 # v1.3.0 T06：字段描述表跨层重构单测（表序/存取/黄金 payload/config 校验）。
@@ -85,11 +88,12 @@ test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c ../src/http_server.c \
 # 故闭包追加 platform.c + platform_local.c；platform_local.c 又引用
 # ota_handle_message → 追加 ota.c 及其 -lcrypto -lssl。
 # v1.3.0 T04：同理补 huawei 闭包（platform_huawei.c + _subdev.c + subdev_registry.c）。
+# v1.3.0 T05：platform_huawei_subdev.c 引 hw_cmd_handle → 再补 platform_huawei_cmd.c。
 test_sensor_fields: test_sensor_fields.c ../src/sensor_fields.c \
                     ../src/mqtt_client.c ../src/config.c \
                     ../src/platform.c ../src/platform_local.c ../src/ota.c \
                     ../src/platform_huawei.c ../src/platform_huawei_subdev.c \
-                    ../src/subdev_registry.c
+                    ../src/platform_huawei_cmd.c ../src/subdev_registry.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
 
 # v1.3.0 T02：平台适配层单测（connect_params 纯函数 + select 装配 +
@@ -100,7 +104,8 @@ test_sensor_fields: test_sensor_fields.c ../src/sensor_fields.c \
 test_platform_local: test_platform_local.c ../src/platform.c ../src/platform_local.c \
                      ../src/mqtt_client.c ../src/ota.c ../src/config.c \
                      ../src/sensor_fields.c ../src/platform_huawei.c \
-                     ../src/platform_huawei_subdev.c ../src/subdev_registry.c
+                     ../src/platform_huawei_subdev.c ../src/platform_huawei_cmd.c \
+                     ../src/subdev_registry.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
 
 # v1.3.0 T03：huawei 纯函数单测（client_id/password(HMAC)/keepalive/时间/
@@ -119,12 +124,30 @@ test_platform_huawei: test_platform_huawei.c ../src/platform_huawei.c \
 # subscribe 桩，测试用 hw_subdev_set_publisher 注入免 broker 发布器）/
 # ota.c（platform_local.c 下行终点）/ config.c + sensor_fields.c（字段表）。
 # 不触碰真实网络：无 broker 时 mqtt_subscribe_topic 安全返回 E_INVAL。
+# v1.3.0 T05：platform_huawei_subdev.c 现引 hw_cmd_handle → 追加 platform_huawei_cmd.c。
 test_platform_huawei_subdev: test_platform_huawei_subdev.c \
                      ../src/platform.c ../src/platform_local.c \
                      ../src/platform_huawei.c ../src/platform_huawei_subdev.c \
-                     ../src/subdev_registry.c ../src/mqtt_client.c \
-                     ../src/ota.c ../src/config.c ../src/sensor_fields.c
+                     ../src/platform_huawei_cmd.c ../src/subdev_registry.c \
+                     ../src/mqtt_client.c ../src/ota.c ../src/config.c \
+                     ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl
+
+# v1.3.0 T05：命令闭环单测（hw_cmd_parse 完整性矩阵 / 回执码与主题拼接 /
+# hw_build_ota_status_event / hw_ota_status_shim 映射 / reboot 先回执后停机）。
+# 链接：platform.c（node_config/reboot_request/ota_status_publish）+ 两 ops 实现
+# （platform_local.c / platform_huawei_subdev.c 由 platform.c 引用）+ 
+# platform_huawei_cmd.c（被测）+ huawei 纯函数 + subdev_registry.c + mqtt_client.c
+# （发布桩，测试用 hw_cmd_set_publisher 注入免 broker 发布器）+ ota.c（桥接终点，
+# 受理判定用 ota_state_string）+ config.c + sensor_fields.c。
+test_platform_huawei_cmd: test_platform_huawei_cmd.c \
+                     ../src/platform.c ../src/platform_local.c \
+                     ../src/platform_huawei.c ../src/platform_huawei_subdev.c \
+                     ../src/platform_huawei_cmd.c ../src/subdev_registry.c \
+                     ../src/mqtt_client.c ../src/ota.c ../src/config.c \
+                     ../src/sensor_fields.c
+	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lmosquitto -lcrypto -lssl \
+	    -Wl,--wrap=ota_handle_message
 
 clean:
 	rm -f $(TESTS) test_data.db test_modbus_tmp.conf test_legacy.db

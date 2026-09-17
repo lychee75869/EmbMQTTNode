@@ -10,6 +10,8 @@
 #include <mosquitto.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
 
 /* OpenSSL 常量（避免引入 libssl-dev 依赖） */
 #ifndef SSL_VERIFY_PEER
@@ -39,7 +41,51 @@ static _Atomic int g_connected = 0;
  * platform_on_connected 承担。 */
 static _Atomic(mqtt_connected_callback) g_connected_cb = NULL;
 
+/*
+ * T05 Q5 / 非阻塞-12：会话"曾建立"旗标（去重）。
+ * CONNACK rc==0 置 1；两个断连触发点（CONNACK 失败、on_disconnect）经
+ * mqtt_on_link_lost() 以 atomic_exchange 一次性消费——保证
+ * platform_on_disconnected() 每次真实会话丢失恰好触发一次：
+ *   - 从未连上（旗标 0）的 CONNACK 失败不触发；
+ *   - 先连上再断/再连失败，只有首个触发点生效。
+ */
+static _Atomic int g_link_was_up = 0;
+
+/*
+ * T05 Q4：auth_type=1 超窗重连监督。
+ *   g_rebuild_on_hour：由 mqtt_init 从 platform_connect_params 缓存；
+ *     仅 auth_type=1 为 1（local / auth_type=0 恒 0 → 不创建线程）。
+ *   g_built_ts：生成 client_id 的 UTC epoch（重建后由 mqtt_init 刷新）。
+ *   g_rebuild_lock：与 mqtt_close 共享同一把——销毁/重建 与 关停 互斥。
+ */
+#define MQTT_REBUILD_WINDOW_SEC 1800   /* 30min：距生成 ≥1800s 视为超窗 */
+static _Atomic int     g_rebuild_on_hour = 0;
+static _Atomic int64_t g_built_ts        = 0;
+static pthread_mutex_t g_rebuild_lock    = PTHREAD_MUTEX_INITIALIZER;
+
+/* 监督线程：仅 rebuild_on_hour==1 时由 mqtt_start_supervisor 创建 */
+static pthread_t  g_supervisor_tid;
+static _Atomic int g_supervisor_run = 0;
+static int         g_supervisor_started = 0;   /* 仅 main 线程访问 */
+
 /* ─── 回调 ─────────────────────────────────────────────────── */
+
+/*
+ * T05 Q5 / 非阻塞-12：会话丢失去重分发。
+ * CONNACK 失败（rc!=0）与 on_disconnect 两个触发点共用本函数；
+ * 仅当本次会话曾成功建立（g_link_was_up==1）时通知平台一次，
+ * 否则为 no-op（从未连上不触发）。atomic_exchange 保证并发下恰好一次。
+ *   返回：1 = 本次真实触发 platform_on_disconnected；0 = 去重/从未连上。
+ * 导出供单测覆盖去重语义（同 mqtt_handle_connack 的导出理由）。
+ */
+int mqtt_on_link_lost(void)
+{
+    if (atomic_exchange(&g_link_was_up, 0)) {
+        platform_on_disconnected();
+        return 1;
+    }
+    return 0;
+}
 
 /*
  * P1-13/P2-19: CONNACK 处理逻辑从 on_connect 抽出为独立函数。
@@ -56,6 +102,7 @@ int mqtt_handle_connack(int rc)
 {
     if (rc == 0) {
         atomic_store(&g_connected, 1);
+        atomic_store(&g_link_was_up, 1);   /* T05：标记会话已建立，供断连去重 */
         LOG_INFO("mqtt connected");
         /* 先置 g_connected 再触发平台/回调：其内的 publish/subscribe
          * 依赖 g_connected==1 的前置检查（见各函数开头） */
@@ -68,7 +115,8 @@ int mqtt_handle_connack(int rc)
     }
 
     atomic_store(&g_connected, 0);
-    platform_on_disconnected();
+    /* T05 Q5：去重后通知平台（从未连上不触发；先连后断只触发一次） */
+    mqtt_on_link_lost();
     switch (rc) {
     case 1:  LOG_ERROR("mqtt connect refused: protocol version"); break;
     case 2:  LOG_ERROR("mqtt connect refused: identifier rejected"); break;
@@ -97,8 +145,9 @@ static void on_disconnect(struct mosquitto *mosq, void *obj, int rc)
         LOG_INFO("mqtt disconnected (clean)");
     else
         LOG_WARN("mqtt disconnected unexpectedly, code: %d", rc);
-    /* T02：通知平台层（local 无副作用；huawei 用于 churn 检测，§8） */
-    platform_on_disconnected();
+    /* T02：通知平台层（local 无副作用；huawei 用于 churn 检测，§8）。
+     * T05 Q5：经 mqtt_on_link_lost 去重，避免与 CONNACK 失败双触发。 */
+    mqtt_on_link_lost();
 }
 
 static void on_message(struct mosquitto *mosq, void *obj,
@@ -139,6 +188,11 @@ int mqtt_init(const struct node_config *cfg)
 
     /* 缓存 cfg 只读指针，供 on_connect 触发 platform_on_connected(cfg) */
     g_cfg = cfg;
+
+    /* T05 Q4：缓存本次 client_id 生成时刻与是否需要超窗重建
+     * （重建后 mqtt_init 再次执行 → 新 built_ts 生效，监督循环续判） */
+    atomic_store(&g_built_ts, (int64_t)p.built_ts);
+    atomic_store(&g_rebuild_on_hour, p.rebuild_on_hour);
 
     g_mosq = mosquitto_new(p.client_id, true, NULL);
     if (!g_mosq) {
@@ -491,8 +545,41 @@ void mqtt_loop(int timeout_ms)
     /* 网络线程已在后台运行 */
 }
 
-void mqtt_close(void)
+/* ─── T05 Q4：auth_type=1 超窗重连监督 + 实例重建 ─────────────── */
+
+/*
+ * 窗口判定（纯函数，可单测）：距 client_id 生成是否已达/超 30min。
+ * 语义：built_ts>0 且 (now_epoch - built_ts) >= 1800。
+ * 注：docs/12 §4.1 原式 now/1800 != built_ts/1800 为分桶式——跨 30min
+ * 桶边界处（如 built=10:59:59、now=11:00:01，实际仅隔 2s）会误判超窗，
+ * 造成无谓重建抖动；docs/14 Q4-(2) 已裁定改用「已流逝时间」。此函数即该裁定。
+ */
+int mqtt_rebuild_needed(int64_t now_epoch, int64_t built_ts)
 {
+    if (built_ts <= 0)
+        return 0;
+    return (now_epoch - built_ts) >= MQTT_REBUILD_WINDOW_SEC;
+}
+
+/*
+ * 实例重建（监督线程调用）：销毁旧实例 → 按新 ts 重建。
+ *   - 与 mqtt_close 共享 g_rebuild_lock → 销毁/重建 与 关停 互斥；
+ *   - 先 mosquitto_loop_stop(mosq,true) 再 destroy：确保 on_* 回调
+ *     不再在途（杜绝 use-after-free）；
+ *   - 持锁范围仅覆盖「销毁→重建」，不含睡眠/loop；锁内唯一 I/O 为
+ *     mqtt_init 内 mosquitto_connect（libmosquitto 连接超时界定、亚秒级）
+ *     ——显式标注为「锁内有界 I/O」例外，竞争者仅关停路径；
+ *   - lib_cleanup 与 mqtt_init 内 lib_init 对称，避免引用计数累积。
+ */
+int mqtt_rebuild(void)
+{
+    pthread_mutex_lock(&g_rebuild_lock);
+
+    if (!g_cfg) {
+        pthread_mutex_unlock(&g_rebuild_lock);
+        return E_INVAL;
+    }
+
     if (g_mosq) {
         mosquitto_loop_stop(g_mosq, true);
         mosquitto_disconnect(g_mosq);
@@ -501,5 +588,95 @@ void mqtt_close(void)
     }
     mosquitto_lib_cleanup();
     atomic_store(&g_connected, 0);
+
+    int rc = mqtt_init(g_cfg);   /* 内部现算新 client_id → 回写 g_built_ts */
+
+    pthread_mutex_unlock(&g_rebuild_lock);
+
+    if (rc == E_OK)
+        LOG_INFO("mqtt instance rebuilt with fresh credentials");
+    else
+        LOG_WARN("mqtt rebuild failed: %d", rc);
+    return rc;
+}
+
+static void *mqtt_supervisor_thread(void *arg)
+{
+    (void)arg;
+    while (atomic_load(&g_supervisor_run)) {
+        /* 1s 粒度睡眠 10 次（周期 10s），可及时响应退出 */
+        for (int i = 0; i < 10; i++) {
+            if (!atomic_load(&g_supervisor_run))
+                return NULL;
+            usleep(1000 * 1000);
+        }
+        if (!atomic_load(&g_supervisor_run))
+            break;
+
+        /* 仅在断开时判定：连接正常说明凭据已被服务端接受，无需重建 */
+        if (!mqtt_is_connected()) {
+            int64_t now = (int64_t)time(NULL);
+            int64_t built = atomic_load(&g_built_ts);
+            if (mqtt_rebuild_needed(now, built)) {
+                LOG_WARN("mqtt: auth_type=1 window exceeded "
+                         "(built_ts=%lld, now=%lld) — rebuilding instance",
+                         (long long)built, (long long)now);
+                (void)mqtt_rebuild();
+            }
+        }
+    }
+    return NULL;
+}
+
+/*
+ * 启动监督线程：**仅 rebuild_on_hour==1**（huawei auth_type=1）才创建；
+ * local 与 auth_type=0 → 直接返回 E_OK（no-op，零影响）。
+ */
+int mqtt_start_supervisor(void)
+{
+    if (atomic_load(&g_rebuild_on_hour) != 1)
+        return E_OK;   /* no-op：不创建任何线程 */
+
+    if (g_supervisor_started)
+        return E_OK;
+
+    atomic_store(&g_supervisor_run, 1);
+    if (pthread_create(&g_supervisor_tid, NULL, mqtt_supervisor_thread,
+                       NULL) != 0) {
+        atomic_store(&g_supervisor_run, 0);
+        LOG_ERROR("mqtt supervisor thread create failed");
+        return E_NET;
+    }
+    g_supervisor_started = 1;
+    LOG_INFO("mqtt supervisor started (period 10s, rebuild window %ds)",
+             MQTT_REBUILD_WINDOW_SEC);
+    return E_OK;
+}
+
+void mqtt_stop_supervisor(void)
+{
+    if (!g_supervisor_started)
+        return;
+    atomic_store(&g_supervisor_run, 0);
+    pthread_join(g_supervisor_tid, NULL);
+    g_supervisor_started = 0;
+    LOG_INFO("mqtt supervisor stopped");
+}
+
+/* ─── 关闭 ────────────────────────────────────────────────── */
+
+void mqtt_close(void)
+{
+    /* 与 mqtt_rebuild 共享 g_rebuild_lock：避免关停与在途重建竞态 */
+    pthread_mutex_lock(&g_rebuild_lock);
+    if (g_mosq) {
+        mosquitto_loop_stop(g_mosq, true);
+        mosquitto_disconnect(g_mosq);
+        mosquitto_destroy(g_mosq);
+        g_mosq = NULL;
+    }
+    mosquitto_lib_cleanup();
+    atomic_store(&g_connected, 0);
+    pthread_mutex_unlock(&g_rebuild_lock);
     LOG_INFO("mqtt closed");
 }

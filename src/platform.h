@@ -76,6 +76,16 @@ int  platform_publish_status(const struct node_config *cfg,
                              const struct device_info *dev, const char *status);
 int  platform_publish_alert(const struct node_config *cfg,
                             const struct alert_event *evt);
+
+/*
+ * T05 Q3：OTA 状态发布注入点（main 经 ota_set_mqtt_publish 注入）。
+ * huawei 激活 → hw_ota_status_shim（OTA 状态转物模型事件，发 events/report）；
+ * 其它平台 → mqtt_publish_raw（local 与 v1.2.11 逐字节等价）。
+ * 签名与 ota 的 publish 回调一致。
+ */
+int  platform_ota_status_publish(const char *topic, const char *payload,
+                                 int qos);
+
 void platform_dispatch_message(const char *topic, const char *payload, int len);
 void platform_on_connected(const struct node_config *cfg);
 void platform_on_disconnected(void);

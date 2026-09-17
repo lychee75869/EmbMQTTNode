@@ -427,6 +427,11 @@ int main(int argc, char *argv[]) {
         LOG_WARN("mqtt_init failed, running in offline mode");
     }
 
+    /* 5b. T05 Q4：启动 auth_type=1 超窗重连监督线程。
+     * 仅 rebuild_on_hour==1（huawei auth_type=1）才真正创建线程；
+     * local 与 auth_type=0 → no-op（零影响）。 */
+    mqtt_start_supervisor();
+
     /* 6. 初始化 Modbus（可选模块） */
     if (modbus_master_init(&g_cfg.modbus) != E_OK) {
         LOG_WARN("modbus init failed, modbus module disabled");
@@ -457,9 +462,11 @@ int main(int argc, char *argv[]) {
     if (g_cfg.ota.enabled) {
         ota_init(&g_cfg.ota, g_cfg.client_id, EMBMQTTNODE_VERSION);
         /* 注入 MQTT 发布回调（用于 OTA 状态上报）。
-         * 注：这是 main.c 中唯一保留的直连 mqtt_* 数据路径（验收项④），
-         * 用于把 OTA 状态注入点交给 ota.c；下行路由已全部经平台层。 */
-        ota_set_mqtt_publish(mqtt_publish_raw);
+         * T05 Q3：改注入**平台分发器**的单一回调（不再直连 mqtt_publish_raw）——
+         * huawei 激活时经 hw_ota_status_shim 把 OTA 状态转物模型事件发到
+         * $oc/.../sys/events/report；local 时转发 mqtt_publish_raw，与
+         * v1.2.11 逐字节等价。这是 main.c 中唯一保留的 OTA 状态注入点。 */
+        ota_set_mqtt_publish(platform_ota_status_publish);
         /* T02：OTA 下行消息路由由平台层唯一持有（docs/12 §3.1）。
          * mqtt_client.on_message 全量转发 platform_dispatch_message，
          * local 平台 on_message 命中 /ota/cmd 后直连 ota_handle_message；
@@ -524,6 +531,8 @@ int main(int argc, char *argv[]) {
     platform_publish_status(&g_cfg, &g_dev, "offline");
     usleep(200000); /* 给网络线程一点时间发出 */
 
+    /* T05 Q4：先停监督线程（join），再关连接——避免关停与在途重建竞态 */
+    mqtt_stop_supervisor();
     mqtt_close();
     modbus_master_close();
     rule_engine_close();

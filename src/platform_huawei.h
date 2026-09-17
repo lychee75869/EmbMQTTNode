@@ -97,6 +97,16 @@ enum hw_topic_kind hw_classify_topic(const char *topic);
  */
 int hw_extract_request_id(const char *topic, char *buf, int len);
 
+/* ── JSON 字符串插值安全谓词（T05 R3，共享）────────────────────── */
+
+/*
+ * 判定 s 是否可安全地以 "%s" 插值进 JSON 字符串字面量：
+ *   安全 = 不含 `"`、`\`、任意裸控制字符（< 0x20）。NULL → 0（不安全）；
+ *   空串 → 1（安全）。供 hw_cmd_parse / hw_build_ota_status_event 等
+ *   插值前 fail-closed 校验复用（拒绝而非转义）。
+ */
+int hw_json_str_safe(const char *s);
+
 /* ── payload builders（截断拒绝：n<0 || n>=len → E_IO）────────── */
 
 /*
@@ -183,5 +193,46 @@ int64_t hw_subdev_backoff_ms(int fail_cnt);
  */
 typedef int (*hw_pub_fn)(const char *topic, const char *payload, int qos);
 void hw_subdev_set_publisher(hw_pub_fn fn);
+
+/* ── T05：命令闭环 / OTA 状态 shim / churn（platform_huawei_cmd.c）────── */
+
+/*
+ * 下行命令处理（平台命令闭环）。由 platform_huawei_subdev.c 的
+ * hw_on_message 在 HW_KIND_CMD_REQUEST 分支**一行委派**（Q1 seam）。
+ * 运行于 libmosquitto 网络线程：内部仅「解析 + 同步 QoS1 回执」；
+ * ota_handle_message 只改状态不做 I/O，reboot 不在网络线程内等待 → 不阻塞。
+ */
+void hw_cmd_handle(const char *topic, const char *payload, int len);
+
+/*
+ * OTA 状态 → 物模型事件 shim（**非 static**：platform.c 的
+ * platform_ota_status_publish 在 huawei 模式下调用它）。
+ * 签名与 ota_set_mqtt_publish 回调一致；把 OTA 状态 JSON 解析后重建为
+ * ota_status 事件，发到 $oc/.../sys/events/report（QoS1）。其输出经
+ * mqtt_publish_raw → 不回灌本 shim（无递归）。
+ */
+int hw_ota_status_shim(const char *topic, const char *payload, int qos);
+
+/*
+ * OTA 状态事件 payload builder（纯函数；schema 单点，§9-3）：
+ *   {"services":[{"service_id":"Gateway","event_type":"ota_status",
+ *     "event_time":"<UTC>","paras":{"state":"<s>","version":"<v>"}}]}
+ *   now_ms 取 publish 时刻（OTA 状态是实时事件，非历史采样）。
+ */
+int hw_build_ota_status_event(const char *state, const char *version,
+                              int64_t now_ms, char *buf, int len);
+
+/*
+ * 可注入发布后端（默认 mqtt_publish_raw）。仅供单测注入桩，使
+ * 命令回执 / OTA 事件在**无 broker**下可断言（与 hw_subdev_set_publisher
+ * 同理由）；生产路径 g_cmd_pub==NULL → 恒用 mqtt_publish_raw。传 NULL 复位。
+ */
+void hw_cmd_set_publisher(hw_pub_fn fn);
+
+/*
+ * churn（flapping）观察计数：mono_ms 30s 窗口内连续断连累计（诊断/单测）。
+ * hw_on_disconnected 维护；只读，不改变协议行为（§8）。
+ */
+int hw_churn_count(void);
 
 #endif /* PLATFORM_HUAWEI_H */

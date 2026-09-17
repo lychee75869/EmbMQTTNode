@@ -388,6 +388,23 @@ static void test_register_response(void)
     printf("  OTHER/NULL no-crash: PASS\n");
 }
 
+/* ─── ⑧ T05 Q5：on_disconnected churn（flapping）计数 ──────── */
+
+static void test_churn(void)
+{
+    printf("--- test_churn (T05 ⑧) ---\n");
+
+    /* 首次断连：last==0 → 计数重置为 0 */
+    platform_huawei_ops.on_disconnected();
+    assert(hw_churn_count() == 0);
+
+    /* 同窗口内连续断连 → 计数累计（相邻间隔 < 30s 视为 flapping） */
+    for (int i = 0; i < 4; i++)
+        platform_huawei_ops.on_disconnected();
+    assert(hw_churn_count() >= 3);
+    printf("  flapping count accumulates (>=3): PASS\n");
+}
+
 /* ─── 入口 ─────────────────────────────────────────────────── */
 
 int main(void)
@@ -401,6 +418,7 @@ int main(void)
     test_tick_backoff();
     test_select_assembly();
     test_register_response();
+    test_churn();
 
     hw_subdev_set_publisher(NULL);   /* 复位 */
 

@@ -108,6 +108,25 @@ int mqtt_is_connected(void);
 /* 循环处理网络事件（非阻塞，需定期调用） */
 void mqtt_loop(int timeout_ms);
 
+/*
+ * T05 Q5 / 非阻塞-12：会话丢失去重分发（CONNACK 失败 / on_disconnect 共用）。
+ * 仅当本次会话曾成功建立时通知 platform_on_disconnected() 一次，否则 no-op。
+ * 返回 1=真实触发；0=去重/从未连上。导出供单测覆盖去重语义。
+ */
+int mqtt_on_link_lost(void);
+
+/*
+ * T05 Q4：auth_type=1 超窗重连监督线程。
+ *   - mqtt_start_supervisor：仅 rebuild_on_hour==1 才创建线程；否则 no-op（E_OK）。
+ *   - mqtt_stop_supervisor：置 0 并 join（未启动时为 no-op）。
+ *   - mqtt_rebuild：销毁→按新 ts 重建实例（与 mqtt_close 共享锁，互斥）。
+ *   - mqtt_rebuild_needed：纯函数窗口判定——built_ts>0 且 now-built_ts>=1800。
+ */
+int  mqtt_start_supervisor(void);
+void mqtt_stop_supervisor(void);
+int  mqtt_rebuild(void);
+int  mqtt_rebuild_needed(int64_t now_epoch, int64_t built_ts);
+
 /* 关闭 MQTT 连接 */
 void mqtt_close(void);
 

@@ -11,8 +11,9 @@
  * 回落 local，保运行能力，并留清晰 TODO 锚点。
  */
 #include "platform.h"
-#include "platform_huawei.h"   /* hw_connect_params / hw_subdev_init */
+#include "platform_huawei.h"   /* hw_connect_params / hw_subdev_init / hw_ota_status_shim */
 #include "subdev_registry.h"
+#include "mqtt_client.h"       /* T05 Q3：platform_ota_status_publish → mqtt_publish_raw */
 #include <string.h>
 
 /* 选定的平台 ops。默认 local——保证未调用 platform_select 的单元测试
@@ -121,6 +122,19 @@ int platform_publish_alert(const struct node_config *cfg,
     if (!g_active || !g_active->publish_alert)
         return E_INVAL;
     return g_active->publish_alert(cfg, evt);
+}
+
+/*
+ * T05 Q3：OTA 状态发布注入点。
+ * huawei 激活 → hw_ota_status_shim（OTA 状态 JSON → ota_status 事件）；
+ * 其它平台（含 local）→ mqtt_publish_raw（与 v1.2.11 注入 raw 逐字节等价）。
+ * 不新增 ops 成员（9 成员签名冻结）：此处按 g_active 判定，装配收敛在平台层。
+ */
+int platform_ota_status_publish(const char *topic, const char *payload, int qos)
+{
+    if (g_active == &platform_huawei_ops)
+        return hw_ota_status_shim(topic, payload, qos);
+    return mqtt_publish_raw(topic, payload, qos);
 }
 
 void platform_dispatch_message(const char *topic, const char *payload, int len)

@@ -172,6 +172,39 @@ int main(void)
         printf("  modbus mock sentinel + source_id: PASS\n");
     }
 
+    /* ═════════════════════════════════════════════════════════ */
+    /* v1.3.0 P2-28：subdev_offline_sec 解析期钳制。
+     * 0 / 负数 / typo（atoi 得 0）→ 回退缺省 30；超上限 86400 → 钳回；
+     * 正常区间（含两侧边界 30 / 86400）原样通过。 */
+    {
+        const char *vals[]   = { "0",     "-5",    "abc",   "30",
+                                 "45",    "86400", "86401", "999999" };
+        const int   expect[] = {  30,      30,      30,      30,
+                                  45,      86400,   86400,   86400 };
+        const int ncase = (int)(sizeof(vals) / sizeof(vals[0]));
+
+        for (int i = 0; i < ncase; i++) {
+            const char *p228_path = "test_p228_tmp.conf";
+            FILE *f = fopen(p228_path, "w");
+            assert(f != NULL);
+            fprintf(f, "subdev_offline_sec = %s\n", vals[i]);
+            fclose(f);
+
+            struct node_config c;
+            memset(&c, 0, sizeof(c));
+            assert(config_load(p228_path, &c) == E_OK);
+            if (c.subdev_offline_sec != expect[i]) {
+                fprintf(stderr, "P2-28 FAIL: '%s' -> %d (expect %d)\n",
+                        vals[i], c.subdev_offline_sec, expect[i]);
+                assert(0);
+            }
+            remove(p228_path);
+        }
+        printf("P2-28 subdev_offline_sec clamp "
+               "(0/neg/typo -> 30, oversize -> 86400, valid passthrough): "
+               "PASS\n");
+    }
+
     /* 清理 */
     remove(tmp_path);
     printf("\nmodbus config test PASSED\n");

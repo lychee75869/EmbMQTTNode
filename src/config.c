@@ -523,8 +523,23 @@ int config_load(const char *path, struct node_config *cfg)
         }
         else if (strcmp(k, "huawei_props_interval") == 0)
             cfg->huawei_props_interval = atoi(v);
-        else if (strcmp(k, "subdev_offline_sec") == 0)
-            cfg->subdev_offline_sec = atoi(v);
+        else if (strcmp(k, "subdev_offline_sec") == 0) {
+            /* P2-28：解析期钳制（与 huawei_keepalive 同风格）。
+             * 0/负数/typo（atoi 解析失败得 0）若放行，离线判定
+             * `now - last_seen > offline_ms` 恒真 → 5s tick 里
+             * 子设备 OFFLINE/ONLINE 反复抖动刷屏。fail-safe 回退缺省 30；
+             * 上限 86400（24h，与 keepalive 的钳制对称：低值下限 30）。
+             * 任何情况下 0/负值不得进入运行期。 */
+            int sec = atoi(v);
+            if (sec < 30 || sec > 86400) {
+                int clamped = (sec < 30) ? 30 : 86400;
+                LOG_WARN("config: subdev_offline_sec %d out of range "
+                         "30-86400, clamped to %d", sec, clamped);
+                cfg->subdev_offline_sec = clamped;
+            } else {
+                cfg->subdev_offline_sec = sec;
+            }
+        }
         else if (strcmp(k, "subdevices_conf") == 0)
             strncpy(cfg->subdevices_conf, v,
                     sizeof(cfg->subdevices_conf) - 1);

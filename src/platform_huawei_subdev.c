@@ -68,7 +68,7 @@ struct subdev_runtime {
     _Atomic int     online;            /* 0 已报/未知 OFFLINE / 1 已报 ONLINE */
     _Atomic int64_t last_seen_ms;      /* CLOCK_MONOTONIC 毫秒（离线判定专用） */
     _Atomic int64_t next_reg_ms;       /* CLOCK_MONOTONIC 毫秒：下次注册重试最早时刻 */
-    int             reg_fail_cnt;      /* 仅 upload_thread(tick) 访问 */
+    _Atomic int     reg_fail_cnt;      /* P2-30 原子化：tick(upload 线程)写 / hw_subdev_stat_get(HTTP 统计线程)读 */
     _Atomic int     empty_skip_cnt;    /* publish_data（采样+续传两线程）→ 原子 */
 };
 
@@ -138,7 +138,7 @@ int hw_subdev_stat_get(int idx, struct hw_subdev_stat *out)
         snprintf(out->device_id, sizeof(out->device_id), "%s", rt->e->device_id);
     out->registered     = atomic_load(&rt->registered);
     out->online         = atomic_load(&rt->online);
-    out->reg_fail_cnt   = rt->reg_fail_cnt;
+    out->reg_fail_cnt   = atomic_load(&rt->reg_fail_cnt);
     out->empty_skip_cnt = atomic_load(&rt->empty_skip_cnt);
     out->last_seen_ms   = atomic_load(&rt->last_seen_ms);
     out->next_reg_ms    = atomic_load(&rt->next_reg_ms);
@@ -465,7 +465,8 @@ static void hw_tick(const struct node_config *cfg)
             report_status(cfg, rt, 0);
     }
 
-    /* ③ 注册退避重试（仅 registered==0；reg_fail_cnt 仅本线程） */
+    /* ③ 注册退避重试（仅 registered==0；reg_fail_cnt 原子：
+     *     本线程写、HTTP 统计线程读——P2-30） */
     for (int i = 0; i < g_subdev_rt_count; i++) {
         struct subdev_runtime *rt = &g_subdev_rt[i];
         if (!rt->e)
@@ -476,12 +477,12 @@ static void hw_tick(const struct node_config *cfg)
             continue;
 
         if (send_register(cfg, rt) != E_OK) {
-            rt->reg_fail_cnt++;
-            int64_t off = hw_subdev_backoff_ms(rt->reg_fail_cnt);
+            int fails = atomic_fetch_add(&rt->reg_fail_cnt, 1) + 1;
+            int64_t off = hw_subdev_backoff_ms(fails);
             atomic_store(&rt->next_reg_ms, now + off);
             LOG_WARN("huawei: register retry for %s failed "
                      "(fail=%d, next in %lldms)",
-                     rt->e->device_id, rt->reg_fail_cnt, (long long)off);
+                     rt->e->device_id, fails, (long long)off);
         } else {
             /* 已重发，等待 REGISTER_RESP；下轮退避 30s 后再评估 */
             atomic_store(&rt->next_reg_ms, now + hw_subdev_backoff_ms(1));

@@ -398,6 +398,54 @@ static void test_build_gateway_props(void)
     printf("  version/status/hostname/mac + trunc/defensive: PASS\n");
 }
 
+static void test_build_gateway_props_injection(void)
+{
+    printf("--- test_build_gateway_props_injection (P2-29) ---\n");
+
+    struct node_config cfg; memset(&cfg, 0, sizeof(cfg));
+    struct device_info dev; make_dev(&dev);
+
+    char buf[512], golden[512];
+
+    /* 正常值：输出与既有构造逐字节一致（golden 兼容） */
+    assert(hw_build_gateway_props(&cfg, &dev, "online", buf, sizeof(buf)) == E_OK);
+    snprintf(golden, sizeof(golden),
+        "{\"services\":[{\"service_id\":\"Gateway\",\"properties\":"
+        "{\"version\":\"%s\",\"status\":\"online\",\"hostname\":\"e2ehost\","
+        "\"mac\":\"aa:bb:cc:dd:ee:ff\",\"cpu\":\"e2ecpu\","
+        "\"kernel\":\"6.6.0-e2e\",\"mem_kb\":1024}}]}",
+        EMBMQTTNODE_VERSION);
+    assert(strcmp(buf, golden) == 0);
+    printf("  normal values byte-exact (golden): PASS\n");
+
+    /* 含引号/反斜杠的 hostname → 置空 ""，其余字段不受影响，JSON 恒合法 */
+    snprintf(dev.hostname, sizeof(dev.hostname), "bad\"host\\x");
+    assert(hw_build_gateway_props(&cfg, &dev, "online", buf, sizeof(buf)) == E_OK);
+    assert(strstr(buf, "\"hostname\":\"\"") != NULL);
+    assert(strstr(buf, "bad") == NULL);            /* 注入原文不得出现 */
+    assert(strstr(buf, "\"mac\":\"aa:bb:cc:dd:ee:ff\"") != NULL);
+    assert(strstr(buf, "\"cpu\":\"e2ecpu\"") != NULL);
+    assert(strstr(buf, "\"kernel\":\"6.6.0-e2e\"") != NULL);
+    assert(strstr(buf, "}}]}") != NULL);           /* 结构收尾完整 */
+    int q = 0;
+    for (const char *p = buf; *p; p++)
+        if (*p == '"') q++;
+    assert(q % 2 == 0);                            /* 引号配对 = 未打断结构 */
+    printf("  unsafe hostname -> empty string, JSON intact: PASS\n");
+
+    /* 其余三个字段同批覆盖：mac/cpu/kernel 各自置空、互不影响 */
+    make_dev(&dev);
+    snprintf(dev.mac_addr,   sizeof(dev.mac_addr),   "aa\"bb");
+    snprintf(dev.cpu_model,  sizeof(dev.cpu_model),  "x\\y");
+    snprintf(dev.kernel_ver, sizeof(dev.kernel_ver), "6\"6");
+    assert(hw_build_gateway_props(&cfg, &dev, "online", buf, sizeof(buf)) == E_OK);
+    assert(strstr(buf, "\"mac\":\"\"") != NULL);
+    assert(strstr(buf, "\"cpu\":\"\"") != NULL);
+    assert(strstr(buf, "\"kernel\":\"\"") != NULL);
+    assert(strstr(buf, "\"hostname\":\"e2ehost\"") != NULL);
+    printf("  unsafe mac/cpu/kernel -> empty, hostname intact: PASS\n");
+}
+
 static void test_build_batch_report(void)
 {
     printf("--- test_build_batch_report (T03 ⑥) ---\n");
@@ -493,6 +541,59 @@ static void test_build_event_alert(void)
     printf("  alert event fields + event_time + guards: PASS\n");
 }
 
+static void test_build_event_alert_injection(void)
+{
+    printf("--- test_build_event_alert_injection (P2-29) ---\n");
+
+    struct alert_event evt;
+    memset(&evt, 0, sizeof(evt));
+    snprintf(evt.field, sizeof(evt.field), "temperature");
+    evt.value = 88.50;
+    evt.threshold = 80.00;
+    snprintf(evt.source_kind, sizeof(evt.source_kind), "sensor");
+    evt.source_id = 0;
+    evt.ts_ms = 1694793600000LL;   /* 2023-09-15T16:00:00Z */
+
+    char buf[768], golden[768];
+
+    /* 正常值：输出与既有构造逐字节一致（golden 兼容） */
+    snprintf(evt.rule_name, sizeof(evt.rule_name), "high-temp");
+    snprintf(evt.msg, sizeof(evt.msg), "temperature above threshold");
+    snprintf(golden, sizeof(golden),
+        "{\"services\":[{\"service_id\":\"Gateway\",\"event_type\":\"alert\","
+        "\"event_time\":\"20230915T160000Z\",\"paras\":{"
+        "\"rule_name\":\"high-temp\",\"field\":\"temperature\","
+        "\"value\":88.50,\"threshold\":80.00,\"source\":\"sensor\","
+        "\"source_id\":\"sub-0001\",\"msg\":\"temperature above threshold\"}}]}");
+    assert(hw_build_event_alert(&evt, "sub-0001", buf, sizeof(buf)) == E_OK);
+    assert(strcmp(buf, golden) == 0);
+    printf("  normal values byte-exact (golden): PASS\n");
+
+    /* ① 仅 rule_name 不安全（含引号+反斜杠）→ 置空；msg 正常保留 */
+    snprintf(evt.rule_name, sizeof(evt.rule_name), "bad\"rule\\\\x");
+    assert(hw_build_event_alert(&evt, "sub-0001", buf, sizeof(buf)) == E_OK);
+    assert(strstr(buf, "\"rule_name\":\"\"") != NULL);
+    assert(strstr(buf, "bad") == NULL);            /* 注入原文不得出现 */
+    assert(strstr(buf, "\"msg\":\"temperature above threshold\"") != NULL);
+    assert(strstr(buf, "\"field\":\"temperature\"") != NULL);
+    assert(strstr(buf, "\"value\":88.50") != NULL);
+    assert(strstr(buf, "\"source\":\"sensor\"") != NULL);
+    printf("  unsafe rule_name -> empty, msg/field intact: PASS\n");
+
+    /* ② msg 亦不安全 → 置空；结构仍完整（引号配对 + 收尾闭合） */
+    snprintf(evt.msg, sizeof(evt.msg), "over \"80C\\\"");
+    assert(hw_build_event_alert(&evt, "sub-0001", buf, sizeof(buf)) == E_OK);
+    assert(strstr(buf, "\"rule_name\":\"\"") != NULL);
+    assert(strstr(buf, "\"msg\":\"\"") != NULL);
+    assert(strstr(buf, "over") == NULL);
+    assert(strstr(buf, "}}]}") != NULL);
+    int q = 0;
+    for (const char *p = buf; *p; p++)
+        if (*p == '"') q++;
+    assert(q % 2 == 0);
+    printf("  unsafe msg -> empty, JSON intact: PASS\n");
+}
+
 static void test_build_command_response(void)
 {
     printf("--- test_build_command_response (T03 ⑥) ---\n");
@@ -585,9 +686,11 @@ int main(void)
     test_extract_request_id();
 
     test_build_gateway_props();
+    test_build_gateway_props_injection();
     test_build_batch_report();
     test_build_register_status();
     test_build_event_alert();
+    test_build_event_alert_injection();
     test_build_command_response();
 
     test_connect_params();

@@ -70,6 +70,23 @@ int hw_json_str_safe(const char *s)
     return 1;
 }
 
+/*
+ * P2-29：payload 构造器的 JSON 字符串插值守卫。
+ * 不安全值（含 " \ 或裸控制符）替换为空串 ""——保持输出 JSON 恒合法、
+ * 不丢整条上报，并打 WARN（字段名可见，便于定位配置源头）。
+ * 安全值原样返回：正常字符串的输出逐字节不变（golden 兼容）。
+ * 与 T05 裁定一致：拒绝而非转义；因 device_info/alert_event 属本地源
+ * 字段（无「丢整条」语义），「拒绝」在此退化为置空该字段。
+ */
+static const char *hw_json_field(const char *field_name, const char *v)
+{
+    if (hw_json_str_safe(v))
+        return v;
+    LOG_WARN("huawei: %s contains unsafe JSON chars, reported as empty string",
+             field_name);
+    return "";
+}
+
 /* ─── 1. 鉴权 ─────────────────────────────────────────────────── */
 
 int hw_build_client_id(const char *device_id, int auth_type,
@@ -247,8 +264,12 @@ int hw_build_gateway_props(const struct node_config *cfg,
         "{\"services\":[{\"service_id\":\"Gateway\",\"properties\":{"
         "\"version\":\"%s\",\"status\":\"%s\",\"hostname\":\"%s\","
         "\"mac\":\"%s\",\"cpu\":\"%s\",\"kernel\":\"%s\",\"mem_kb\":%lld}}]}",
-        EMBMQTTNODE_VERSION, status, dev->hostname, dev->mac_addr,
-        dev->cpu_model, dev->kernel_ver, (long long)dev->total_mem_kb);
+        EMBMQTTNODE_VERSION, status,
+        hw_json_field("hostname", dev->hostname),
+        hw_json_field("mac_addr", dev->mac_addr),
+        hw_json_field("cpu_model", dev->cpu_model),
+        hw_json_field("kernel_ver", dev->kernel_ver),
+        (long long)dev->total_mem_kb);
 
     return (pos < 0) ? E_IO : E_OK;
 }
@@ -336,8 +357,13 @@ int hw_build_event_alert(const struct alert_event *evt, const char *source_id,
         "\"rule_name\":\"%s\",\"field\":\"%s\",\"value\":%.2f,"
         "\"threshold\":%.2f,\"source\":\"%s\",\"source_id\":\"%s\","
         "\"msg\":\"%s\"}}]}",
-        et, evt->rule_name, evt->field, evt->value, evt->threshold,
-        evt->source_kind, source_id ? source_id : "", evt->msg);
+        et,
+        hw_json_field("rule_name", evt->rule_name),
+        hw_json_field("field", evt->field),
+        evt->value, evt->threshold,
+        hw_json_field("source_kind", evt->source_kind),
+        source_id ? source_id : "",
+        hw_json_field("msg", evt->msg));
 
     return (pos < 0) ? E_IO : E_OK;
 }

@@ -471,16 +471,25 @@ static void handle_api_rules(int fd)
     }
 
     /* 手动构造 JSON 数组 */
-    char *buf = malloc(n * 256 + 32);
+    int cap = n * 256 + 32;
+    char *buf = malloc((size_t)cap);
     if (!buf) {
         http_send_error(fd, 500, "malloc failed");
         return;
     }
 
+    /* P2-31：收敛到 T06 守卫写法——旧式固定 256 上限的 snprintf 不感知
+     * malloc 剩余空间（长 name 截断后 pos 仍前进 → 越界写）。
+     * 行为等价：正常数据输出逐字节不变（现有 golden 保等价）。 */
     int pos = 0;
     pos += snprintf(buf + pos, 4, "[\n");
     for (int i = 0; i < n; i++) {
-        pos += snprintf(buf + pos, 256,
+        if (json_buf_overflow(pos, (size_t)cap)) {
+            free(buf);
+            http_send_error(fd, 500, "payload overflow");
+            return;
+        }
+        pos += snprintf(buf + pos, (size_t)(cap - pos),
                         "  {\"name\":\"%s\","
                         "\"trigger_count\":%d,"
                         "\"last_triggered_ms\":%lld}%s\n",
@@ -489,7 +498,12 @@ static void handle_api_rules(int fd)
                         (long long)stats[i].last_triggered,
                         (i < n - 1) ? "," : "");
     }
-    pos += snprintf(buf + pos, 4, "]");
+    if (json_buf_overflow(pos, (size_t)cap)) {
+        free(buf);
+        http_send_error(fd, 500, "payload overflow");
+        return;
+    }
+    pos += snprintf(buf + pos, (size_t)(cap - pos), "]");
 
     http_send_json(fd, 200, buf);
     free(buf);
@@ -506,16 +520,25 @@ static void handle_api_anomaly(int fd)
         return;
     }
 
-    char *buf = malloc(n * 320 + 32);
+    int cap = n * 320 + 32;
+    char *buf = malloc((size_t)cap);
     if (!buf) {
         http_send_error(fd, 500, "malloc failed");
         return;
     }
 
+    /* P2-31：同 handle_api_rules，收敛到 T06 json_buf_overflow 守卫写法
+     * （旧式固定 320 上限的 snprintf 不感知剩余空间）。行为等价：
+     * 正常数据输出逐字节不变（现有 golden 保等价）。 */
     int pos = 0;
     pos += snprintf(buf + pos, 4, "[\n");
     for (int i = 0; i < n; i++) {
-        pos += snprintf(buf + pos, 320,
+        if (json_buf_overflow(pos, (size_t)cap)) {
+            free(buf);
+            http_send_error(fd, 500, "payload overflow");
+            return;
+        }
+        pos += snprintf(buf + pos, (size_t)(cap - pos),
                         "  {\"name\":\"%s\","
                         "\"trigger_count\":%d,"
                         "\"last_triggered_ms\":%lld,"
@@ -528,7 +551,12 @@ static void handle_api_anomaly(int fd)
                         stats[i].current_score,
                         (i < n - 1) ? "," : "");
     }
-    pos += snprintf(buf + pos, 4, "]");
+    if (json_buf_overflow(pos, (size_t)cap)) {
+        free(buf);
+        http_send_error(fd, 500, "payload overflow");
+        return;
+    }
+    pos += snprintf(buf + pos, (size_t)(cap - pos), "]");
 
     http_send_json(fd, 200, buf);
     free(buf);

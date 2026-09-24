@@ -3,7 +3,7 @@
  * 规则引擎 + 本地告警模块（阶段三）
  *
  * 从配置文件加载阈值/趋势/窗口规则，对传感器数据实时评估，
- * 触发时返回动作掩码，由 main 线程执行 MQTT 告警 / GPIO 控制。
+ * 触发时返回动作掩码，由 main 线程执行 MQTT 告警 / 日志记录。
  */
 #ifndef RULE_ENGINE_H
 #define RULE_ENGINE_H

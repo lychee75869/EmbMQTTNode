@@ -279,8 +279,10 @@ static void test_action_masks(void)
 
     make_anomaly(&cfg.anoms[0], "a_mqtt", "temperature",
                  ANOMALY_ZSCORE, 2.0, ACTION_ALERT_MQTT, 0);
-    make_anomaly(&cfg.anoms[1], "a_gpio", "humidity",
-                 ANOMALY_ZSCORE, 2.0, ACTION_GPIO_1 | ACTION_GPIO_2, 0);
+    /* 原 a_gpio（ACTION_GPIO_1|GPIO_2）已随 GPIO 执行层移除，
+     * 改用 ALERT_MQTT|LOG_ONLY 组合保持「双字段异常多动作位」意图 */
+    make_anomaly(&cfg.anoms[1], "a_log", "humidity",
+                 ANOMALY_ZSCORE, 2.0, ACTION_ALERT_MQTT | ACTION_LOG_ONLY, 0);
 
     assert(anomaly_engine_init(&cfg) == E_OK);
 
@@ -294,16 +296,15 @@ static void test_action_masks(void)
     struct sensor_data d1 = make_data(50.0, 55.0, 1013.0);
     uint8_t act = anomaly_engine_evaluate(&d1, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
-    assert(!(act & ACTION_GPIO_1));
+    assert(!(act & ACTION_LOG_ONLY));
     printf("  alert_mqtt only:              PASS\n");
 
-    /* 湿度和温度都异常 → alert_mqtt + gpio_1 + gpio_2 */
+    /* 湿度和温度都异常 → alert_mqtt + log_only（双规则同时触发） */
     struct sensor_data d2 = make_data(50.0, 5.0, 1013.0);
     act = anomaly_engine_evaluate(&d2, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
-    assert(act & ACTION_GPIO_1);
-    assert(act & ACTION_GPIO_2);
-    printf("  mqtt + gpio_1 + gpio_2:       PASS\n");
+    assert(act & ACTION_LOG_ONLY);
+    printf("  mqtt + log_only (multi-rule): PASS\n");
 
     anomaly_engine_close();
 }
@@ -366,7 +367,7 @@ static void test_config_parsing(void)
         "broker_host = 127.0.0.1\n"
         "broker_port = 1883\n"
         "anomaly_enabled = 1\n"
-        "anomaly_1 = temperature,zscore,3.0,alert_mqtt+gpio_1\n"
+        "anomaly_1 = temperature,zscore,3.0,alert_mqtt+log_only\n"
         "anomaly_2 = humidity,zscore,2.5,alert_mqtt\n"
         "anomaly_3 = pressure,iforest,0.65,log_only\n";
 
@@ -387,7 +388,7 @@ static void test_config_parsing(void)
     assert(strcmp(cfg.anoms[0].field, "temperature") == 0);
     assert(cfg.anoms[0].algo == ANOMALY_ZSCORE);
     assert(cfg.anoms[0].zscore_threshold == 3.0);
-    assert(cfg.anoms[0].action_mask == (ACTION_ALERT_MQTT | ACTION_GPIO_1));
+    assert(cfg.anoms[0].action_mask == (ACTION_ALERT_MQTT | ACTION_LOG_ONLY));
 
     /* anomaly_2 */
     assert(strcmp(cfg.anoms[1].field, "humidity") == 0);
@@ -415,7 +416,6 @@ static void test_config_parsing(void)
     struct sensor_data d_bad = make_data(60.0, 55.0, 1013.0);
     uint8_t act = anomaly_engine_evaluate(&d_bad, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
-    assert(act & ACTION_GPIO_1);
     printf("  evaluated from parsed config: PASS\n");
 
     anomaly_engine_close();

@@ -151,8 +151,6 @@ enum rule_op {
 /* 告警动作位掩码 */
 #define ACTION_LOG_ONLY   0x01
 #define ACTION_ALERT_MQTT 0x02
-#define ACTION_GPIO_1     0x04
-#define ACTION_GPIO_2     0x08
 
 /* 单条规则定义 */
 struct rule {
@@ -180,10 +178,8 @@ struct rule_stats {
     int64_t     last_triggered;     /*上次触发时间戳(ms)*/
 };
 
-/* ─── GPIO 常量 ───────────────────────────────────────────── */
-#define GPIO_PIN_MAX 4
 
-/* ─── 异常检测引擎配置（方向 B）─────────────────────────── */
+/* ─── 异常检测引擎配置─────────────────────────── */
 
 #define ANOMALY_MAX            16
 #define ANOMALY_WINDOW_SIZE    128

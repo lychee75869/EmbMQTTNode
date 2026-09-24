@@ -184,25 +184,25 @@ static void test_action_masks(void)
 
     make_rule(&cfg.rules[0], "r_mqtt", "temperature", OP_GT, 30.0, 0, 0,
               ACTION_ALERT_MQTT, 0);
-    make_rule(&cfg.rules[1], "r_gpio", "temperature", OP_GT, 90.0, 0, 0,
-              ACTION_GPIO_1 | ACTION_GPIO_2, 0);
-
+    /* 原 r_gpio（ACTION_GPIO_1|GPIO_2）已随 GPIO 执行层移除，
+     * 改用 ALERT_MQTT|LOG_ONLY 组合保持「两规则同时触发」意图 */
+    make_rule(&cfg.rules[1], "r_log", "temperature", OP_GT, 90.0, 0, 0,
+              ACTION_ALERT_MQTT | ACTION_LOG_ONLY, 0);
     assert(rule_engine_init(&cfg) == E_OK);
 
-    /* 35 > 30 → r_mqtt 触发 ACTION_ALERT_MQTT */
+    /* 35 > 30 → 仅 r_mqtt 触发 ACTION_ALERT_MQTT */
     struct sensor_data d1 = make_data(35.0, 50.0, 1013.0);
     uint8_t act = rule_engine_evaluate(&d1, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
-    assert(!(act & ACTION_GPIO_1));
+    assert(!(act & ACTION_LOG_ONLY));
     printf("  alert_mqtt only:         PASS\n");
 
-    /* 95 > 90 → r_gpio 也触发，两个规则同时触发 */
+    /* 95 > 90 → r_log 也触发，两个规则同时触发 */
     struct sensor_data d2 = make_data(95.0, 50.0, 1013.0);
     act = rule_engine_evaluate(&d2, NULL, 0, NULL);
     assert(act & ACTION_ALERT_MQTT);
-    assert(act & ACTION_GPIO_1);
-    assert(act & ACTION_GPIO_2);
-    printf("  mqtt + gpio_1 + gpio_2:  PASS\n");
+    assert(act & ACTION_LOG_ONLY);
+    printf("  mqtt + log_only (multi-rule):  PASS\n");
 
     rule_engine_close();
 }
@@ -326,7 +326,7 @@ static void test_config_parsing(void)
     const char *content =
         "broker_host = 127.0.0.1\n"
         "broker_port = 1883\n"
-        "rule_1 = temperature,gt,80.0,alert_mqtt+gpio_1\n"
+        "rule_1 = temperature,gt,80.0,alert_mqtt+log_only\n"
         "rule_2 = humidity,lt,15.0,alert_mqtt\n"
         "rule_3 = pressure,outside,950.0_1050.0,log_only\n"
         "rule_4 = temperature,rate,5.0,alert_mqtt\n";
@@ -347,7 +347,7 @@ static void test_config_parsing(void)
     assert(strcmp(cfg.rules[0].field, "temperature") == 0);
     assert(cfg.rules[0].op == OP_GT);
     assert(cfg.rules[0].threshold == 80.0);
-    assert(cfg.rules[0].action_mask == (ACTION_ALERT_MQTT | ACTION_GPIO_1));
+    assert(cfg.rules[0].action_mask == (ACTION_ALERT_MQTT | ACTION_LOG_ONLY));
 
     /* rule_2 */
     assert(strcmp(cfg.rules[1].field, "humidity") == 0);
@@ -375,7 +375,6 @@ static void test_config_parsing(void)
     uint8_t act = rule_engine_evaluate(&d, NULL, 0, NULL);
     /* rule_1(temp=85>80) + rule_2(hum=10<15) + rule_3(pres=900 outside [950,1050]) */
     assert(act & ACTION_ALERT_MQTT);
-    assert(act & ACTION_GPIO_1);
     assert(act & ACTION_LOG_ONLY);
     printf("  multi-rule evaluation:   PASS\n");
 

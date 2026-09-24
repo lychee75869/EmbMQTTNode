@@ -5,22 +5,23 @@
  * 覆盖 MQTT / TLS / Modbus / 规则引擎 / OTA / 异常检测 六大配置段
  */
 #include "config.h"
-#include "sensor_fields.h"   /* 字段描述表：rule/anomaly 字段名校验（docs/12 §3.4） */
+#include "sensor_fields.h" /* 字段描述表：rule/anomaly 字段名校验（docs/12 §3.4） */
 
-static char *trim(char *str)
-{
+static char *trim(char *str) {
     char *end;
-    while (*str == ' ' || *str == '\t') str++;
-    if (*str == 0) return str;
+    while (*str == ' ' || *str == '\t')
+        str++;
+    if (*str == 0)
+        return str;
     end = str + strlen(str) - 1;
-    while (end > str && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
+    while (end > str &&
+           (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
         end--;
     end[1] = '\0';
     return str;
 }
 
-static void set_default_config(struct node_config *cfg)
-{
+static void set_default_config(struct node_config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
 
     strncpy(cfg->broker_host, "127.0.0.1", sizeof(cfg->broker_host) - 1);
@@ -28,9 +29,7 @@ static void set_default_config(struct node_config *cfg)
     strncpy(cfg->topic, "embmqttnode/data", sizeof(cfg->topic) - 1);
     strncpy(cfg->client_id, "emb-node-01", sizeof(cfg->client_id) - 1);
     cfg->sample_interval_ms = 5000;
-    strncpy(cfg->sensor_type, "mock", sizeof(cfg->sensor_type) - 1);
-    strncpy(cfg->sensor_i2c_dev, "/dev/i2c-1", sizeof(cfg->sensor_i2c_dev) - 1);
-    cfg -> debug_level = 0;
+    cfg->debug_level = 0;
 
     /* TLS 默认：关闭 */
     cfg->tls.enabled = 0;
@@ -40,9 +39,11 @@ static void set_default_config(struct node_config *cfg)
     /* Modbus 默认：关闭，TCP 模式 */
     cfg->modbus.enabled = 0;
     strncpy(cfg->modbus.mode, "tcp", sizeof(cfg->modbus.mode) - 1);
-    strncpy(cfg->modbus.tcp_host, "127.0.0.1", sizeof(cfg->modbus.tcp_host) - 1);
+    strncpy(cfg->modbus.tcp_host, "127.0.0.1",
+            sizeof(cfg->modbus.tcp_host) - 1);
     cfg->modbus.tcp_port = 502;
-    strncpy(cfg->modbus.serial_port, "/dev/ttyUSB0", sizeof(cfg->modbus.serial_port) - 1);
+    strncpy(cfg->modbus.serial_port, "/dev/ttyUSB0",
+            sizeof(cfg->modbus.serial_port) - 1);
     cfg->modbus.baudrate = 9600;
     cfg->modbus.parity[0] = 'N';
     cfg->modbus.parity[1] = '\0';
@@ -56,15 +57,16 @@ static void set_default_config(struct node_config *cfg)
 
     /* OTA 默认：关闭 */
     cfg->ota.enabled = 0;
-    strncpy(cfg->ota.slot_dir, OTA_SLOT_DIR_DEFAULT, sizeof(cfg->ota.slot_dir) - 1);
+    strncpy(cfg->ota.slot_dir, OTA_SLOT_DIR_DEFAULT,
+            sizeof(cfg->ota.slot_dir) - 1);
     cfg->ota.boot_attempt_max = OTA_BOOT_ATTEMPT_MAX;
     cfg->ota.boot_confirm_sec = OTA_BOOT_CONFIRM_SEC_DEFAULT;
     /* v1.2.9：签名公钥默认不配置（空串）→ fail-closed，OTA 升级指令被
      * 直接拒绝；固件签名体系必须显式部署（ota_public_key 指向公钥 PEM）。
      * HTTPS CA 默认空 → 尝试系统 CA 常见位置，找不到拒绝 https 下载。 */
     cfg->ota.public_key[0] = '\0';
-    cfg->ota.ca_file[0]    = '\0';
-    cfg->ota.ca_path[0]    = '\0';
+    cfg->ota.ca_file[0] = '\0';
+    cfg->ota.ca_path[0] = '\0';
 
     /* HTTP Dashboard 默认：启用、固定端口 8080；
      * P1-6 fail-closed：reboot token 默认空串 → /api/reboot 一律
@@ -79,22 +81,22 @@ static void set_default_config(struct node_config *cfg)
     /* ── 华为云 IoTDA 接入（v1.3.0，T01）──
      * platform 缺省 "local"：保持 v1.2.11 行为，华为字段全部忽略。 */
     strncpy(cfg->platform, "local", sizeof(cfg->platform) - 1);
-    cfg->huawei_device_id[0]     = '\0';
-    cfg->huawei_secret[0]        = '\0';
-    cfg->huawei_auth_type        = 0;
-    cfg->huawei_keepalive        = 120;   /* 华为推荐 120s */
-    cfg->huawei_props_interval   = 60;
-    cfg->subdev_offline_sec      = 30;
-    /* P1-16：默认绝对路径（与 node.conf 同目录）。原相对默认 "config/subdevices.conf"
-     * 在板上 systemd WorkingDirectory=/var/lib/embmqttnode 下解析到不存在的路径 →
-     * subdev_load 静默失败。此处逐字消费绝对路径，不做 cwd/config_dir 相对解析。 */
+    cfg->huawei_device_id[0] = '\0';
+    cfg->huawei_secret[0] = '\0';
+    cfg->huawei_auth_type = 0;
+    cfg->huawei_keepalive = 120; /* 华为推荐 120s */
+    cfg->huawei_props_interval = 60;
+    cfg->subdev_offline_sec = 30;
+    /* P1-16：默认绝对路径（与 node.conf 同目录）。原相对默认
+     * "config/subdevices.conf" 在板上 systemd
+     * WorkingDirectory=/var/lib/embmqttnode 下解析到不存在的路径 → subdev_load
+     * 静默失败。此处逐字消费绝对路径，不做 cwd/config_dir 相对解析。 */
     strncpy(cfg->subdevices_conf, "/etc/embmqttnode/subdevices.conf",
             sizeof(cfg->subdevices_conf) - 1);
-    cfg->huawei_ca_file[0]       = '\0';
+    cfg->huawei_ca_file[0] = '\0';
 }
 
-int config_load(const char *path, struct node_config *cfg)
-{
+int config_load(const char *path, struct node_config *cfg) {
     FILE *fp = fopen(path, "r");
     if (!fp) {
         LOG_ERROR("open config %s failed: %s", path, strerror(errno));
@@ -102,19 +104,21 @@ int config_load(const char *path, struct node_config *cfg)
     }
 
     set_default_config(cfg);
-
     /* v1.3.0：行/值缓冲扩容——huawei_device_id/subdevices_conf/huawei_ca_file
      * 最大 256 字符，旧的 line[256]/value[128] 会把长值静默截断。 */
     char line[512];
     while (fgets(line, sizeof(line), fp)) {
         char *p = trim(line);
-        if (*p == '\0' || *p == '#' || *p == ';') continue;
+        if (*p == '\0' || *p == '#' || *p == ';')
+            continue;
 
         /* 跳过段标记 [xxx]，不作为 key=value 解析 */
-        if (*p == '[') continue;
+        if (*p == '[')
+            continue;
 
         char key[64] = {0}, value[320] = {0};
-        if (sscanf(p, "%63[^=]=%319[^\n]", key, value) != 2) continue;
+        if (sscanf(p, "%63[^=]=%319[^\n]", key, value) != 2)
+            continue;
 
         char *k = trim(key);
         char *v = trim(value);
@@ -134,7 +138,7 @@ int config_load(const char *path, struct node_config *cfg)
             strncpy(cfg->sensor_type, v, sizeof(cfg->sensor_type) - 1);
         else if (strcmp(k, "sensor_i2c_dev") == 0)
             strncpy(cfg->sensor_i2c_dev, v, sizeof(cfg->sensor_i2c_dev) - 1);
-        else if (strcmp(k,"debug_level") == 0)
+        else if (strcmp(k, "debug_level") == 0)
             cfg->debug_level = atoi(v);
 
         /* ── TLS ── */
@@ -157,7 +161,8 @@ int config_load(const char *path, struct node_config *cfg)
         else if (strcmp(k, "modbus_mode") == 0)
             strncpy(cfg->modbus.mode, v, sizeof(cfg->modbus.mode) - 1);
         else if (strcmp(k, "modbus_serial_port") == 0)
-            strncpy(cfg->modbus.serial_port, v, sizeof(cfg->modbus.serial_port) - 1);
+            strncpy(cfg->modbus.serial_port, v,
+                    sizeof(cfg->modbus.serial_port) - 1);
         else if (strcmp(k, "modbus_baudrate") == 0)
             cfg->modbus.baudrate = atoi(v);
         else if (strcmp(k, "modbus_parity") == 0)
@@ -173,24 +178,21 @@ int config_load(const char *path, struct node_config *cfg)
         else if (strcmp(k, "modbus_poll_interval_ms") == 0)
             cfg->modbus.poll_interval_ms = atoi(v);
 
-        /* Modbus 寄存器映射: modbus_reg_N = id,addr,count,func,type,field,scale,offset */
+        /* Modbus 寄存器映射: modbus_reg_N =
+         * id,addr,count,func,type,field,scale,offset */
         else if (strncmp(k, "modbus_reg_", 11) == 0) {
             int idx = cfg->modbus.reg_count;
             if (idx >= MODBUS_REG_MAX) {
-                LOG_WARN("config: too many modbus reg maps, max=%d", MODBUS_REG_MAX);
+                LOG_WARN("config: too many modbus reg maps, max=%d",
+                         MODBUS_REG_MAX);
                 continue;
             }
             struct modbus_reg_map *reg = &cfg->modbus.regs[idx];
             memset(reg, 0, sizeof(*reg));
-            int matched = sscanf(v, "%d,%d,%d,%d,%15[^,],%31[^,],%lf,%lf",
-                                 &reg->slave_id,
-                                 &reg->reg_addr,
-                                 &reg->reg_count,
-                                 &reg->func_code,
-                                 reg->data_type,
-                                 reg->field_name,
-                                 &reg->scale,
-                                 &reg->offset);
+            int matched = sscanf(
+                v, "%d,%d,%d,%d,%15[^,],%31[^,],%lf,%lf", &reg->slave_id,
+                &reg->reg_addr, &reg->reg_count, &reg->func_code,
+                reg->data_type, reg->field_name, &reg->scale, &reg->offset);
             if (matched < 6) {
                 LOG_WARN("config: invalid modbus_reg_%d format", idx);
                 continue;
@@ -205,13 +207,14 @@ int config_load(const char *path, struct node_config *cfg)
              * 32 字 reg_buf 栈缓冲。
              * 合法域（按 Modbus 惯例）:
              *   slave_id   1..247（RTU 从站地址空间）
-             *   func_code  3（保持寄存器，基址 40001）或 4（输入寄存器，基址 30001）
-             *   reg_count  1..MODBUS_REG_MAX(32)，且 addr 起连续 count 个
+             *   func_code  3（保持寄存器，基址 40001）或 4（输入寄存器，基址
+             * 30001） reg_count  1..MODBUS_REG_MAX(32)，且 addr 起连续 count 个
              *              寄存器不越过各自地址段上限（offset < 10000）
              */
             if (reg->slave_id < 1 || reg->slave_id > 247) {
                 LOG_WARN("config: modbus_reg_%d slave_id %d out of "
-                         "range 1-247, entry dropped", idx, reg->slave_id);
+                         "range 1-247, entry dropped",
+                         idx, reg->slave_id);
                 continue;
             }
             if (reg->reg_count < 1 || reg->reg_count > MODBUS_REG_MAX) {
@@ -244,7 +247,6 @@ int config_load(const char *path, struct node_config *cfg)
                          idx, reg->func_code);
                 continue;
             }
-
             cfg->modbus.reg_count++;
             LOG_INFO("config: modbus reg[%d] slave=%d addr=%d count=%d "
                      "func=%d type=%s field=%s scale=%.3f offset=%.3f",
@@ -269,22 +271,23 @@ int config_load(const char *path, struct node_config *cfg)
             r->name[RULE_NAME_LEN - 1] = '\0';
 
             /* 解析: field,operator,threshold[,action] */
-            char field[32]    = {0};
-            char op_str[16]   = {0};
-            char th_str[32]   = {0};
-            char act_str[64]  = {0};
+            char field[32] = {0};
+            char op_str[16] = {0};
+            char th_str[32] = {0};
+            char act_str[64] = {0};
 
-            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]",
-                                 field, op_str, th_str, act_str);
+            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]", field,
+                                 op_str, th_str, act_str);
             if (matched < 3) {
-                LOG_WARN("config: invalid %s format, need at least field,op,th", k);
+                LOG_WARN("config: invalid %s format, need at least field,op,th",
+                         k);
                 continue;
             }
 
             /* 字段名：必须命中字段描述表，否则丢弃该规则（fail-closed） */
             if (sensor_find_field(field) == NULL) {
-                LOG_WARN("config: %s unknown field '%s', rule dropped",
-                         k, field);
+                LOG_WARN("config: %s unknown field '%s', rule dropped", k,
+                         field);
                 continue;
             }
             strncpy(r->field, field, sizeof(r->field));
@@ -311,13 +314,15 @@ int config_load(const char *path, struct node_config *cfg)
             /* 阈值 */
             if (r->op == OP_OUT) {
                 /* 格式: lo_hi, e.g. 950.0_1050.0 */
-                if (sscanf(th_str, "%lf_%lf",
-                           &r->threshold_lo, &r->threshold_hi) != 2) {
-                    LOG_WARN("config: %s invalid outside range '%s'", k, th_str);
+                if (sscanf(th_str, "%lf_%lf", &r->threshold_lo,
+                           &r->threshold_hi) != 2) {
+                    LOG_WARN("config: %s invalid outside range '%s'", k,
+                             th_str);
                     continue;
                 }
             } else {
-                /* 单值阈值（gt/lt/eq/ne/rate），rate 为瞬时变化率阈值（单位/秒） */
+                /* 单值阈值（gt/lt/eq/ne/rate），rate
+                 * 为瞬时变化率阈值（单位/秒） */
                 r->threshold = atof(th_str);
             }
 
@@ -328,20 +333,17 @@ int config_load(const char *path, struct node_config *cfg)
                 char *token = strtok_r(act_str, ",+", &saveptr);
                 while (token) {
                     /* trim token */
-                    while (*token == ' ' || *token == '\t') token++;
+                    while (*token == ' ' || *token == '\t')
+                        token++;
                     char *end = token + strlen(token) - 1;
-                    while (end > token && (*end == ' ' || *end == '\t')) end--;
+                    while (end > token && (*end == ' ' || *end == '\t'))
+                        end--;
                     *(end + 1) = '\0';
 
                     if (strcmp(token, "all") == 0)
-                        r->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT
-                                           | ACTION_GPIO_1 | ACTION_GPIO_2);
+                        r->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT);
                     else if (strcmp(token, "alert_mqtt") == 0)
                         r->action_mask |= ACTION_ALERT_MQTT;
-                    else if (strcmp(token, "gpio_1") == 0)
-                        r->action_mask |= ACTION_GPIO_1;
-                    else if (strcmp(token, "gpio_2") == 0)
-                        r->action_mask |= ACTION_GPIO_2;
                     else if (strcmp(token, "log_only") == 0)
                         r->action_mask |= ACTION_LOG_ONLY;
                     else
@@ -351,15 +353,14 @@ int config_load(const char *path, struct node_config *cfg)
                 }
             }
             if (r->action_mask == 0)
-                r->action_mask = ACTION_LOG_ONLY;  /* 默认 */
+                r->action_mask = ACTION_LOG_ONLY; /* 默认 */
 
             /* 默认冷却时间 60s */
             r->cooldown_ms = 60000;
 
             cfg->rule_count++;
-            LOG_INFO("config: %s field=%s op=%d th=%.2f act=0x%02x",
-                     r->name, r->field, r->op,
-                     r->threshold, r->action_mask);
+            LOG_INFO("config: %s field=%s op=%d th=%.2f act=0x%02x", r->name,
+                     r->field, r->op, r->threshold, r->action_mask);
         }
 
         /* ── OTA: ota_* 配置项 ── */
@@ -392,8 +393,7 @@ int config_load(const char *path, struct node_config *cfg)
         else if (strncmp(k, "anomaly_", 8) == 0) {
             int idx = cfg->anomaly_count;
             if (idx >= ANOMALY_MAX) {
-                LOG_WARN("config: too many anomaly rules, max=%d",
-                         ANOMALY_MAX);
+                LOG_WARN("config: too many anomaly rules, max=%d", ANOMALY_MAX);
                 continue;
             }
 
@@ -405,23 +405,24 @@ int config_load(const char *path, struct node_config *cfg)
             a->name[ANOMALY_NAME_LEN - 1] = '\0';
 
             /* 解析: field,algo,threshold,action */
-            char field[32]    = {0};
+            char field[32] = {0};
             char algo_str[16] = {0};
-            char th_str[32]   = {0};
-            char act_str[64]  = {0};
+            char th_str[32] = {0};
+            char act_str[64] = {0};
 
-            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]",
-                                 field, algo_str, th_str, act_str);
+            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]", field,
+                                 algo_str, th_str, act_str);
             if (matched < 3) {
                 LOG_WARN("config: invalid %s format, "
-                         "need field,algo,threshold", k);
+                         "need field,algo,threshold",
+                         k);
                 continue;
             }
 
             /* 字段名：必须命中字段描述表，否则丢弃该规则（fail-closed） */
             if (sensor_find_field(field) == NULL) {
-                LOG_WARN("config: %s unknown field '%s', anomaly dropped",
-                         k, field);
+                LOG_WARN("config: %s unknown field '%s', anomaly dropped", k,
+                         field);
                 continue;
             }
             strncpy(a->field, field, sizeof(a->field) - 1);
@@ -446,26 +447,21 @@ int config_load(const char *path, struct node_config *cfg)
                 char *saveptr = NULL;
                 char *token = strtok_r(act_str, ",+", &saveptr);
                 while (token) {
-                    while (*token == ' ' || *token == '\t') token++;
+                    while (*token == ' ' || *token == '\t')
+                        token++;
                     char *end = token + strlen(token) - 1;
                     while (end > token && (*end == ' ' || *end == '\t'))
                         end--;
                     *(end + 1) = '\0';
 
                     if (strcmp(token, "all") == 0)
-                        a->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT
-                                          | ACTION_GPIO_1 | ACTION_GPIO_2);
+                        a->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT);
                     else if (strcmp(token, "alert_mqtt") == 0)
                         a->action_mask |= ACTION_ALERT_MQTT;
-                    else if (strcmp(token, "gpio_1") == 0)
-                        a->action_mask |= ACTION_GPIO_1;
-                    else if (strcmp(token, "gpio_2") == 0)
-                        a->action_mask |= ACTION_GPIO_2;
                     else if (strcmp(token, "log_only") == 0)
                         a->action_mask |= ACTION_LOG_ONLY;
                     else
                         LOG_WARN("config: %s unknown action '%s'", k, token);
-
                     token = strtok_r(NULL, ",+", &saveptr);
                 }
             }
@@ -477,9 +473,8 @@ int config_load(const char *path, struct node_config *cfg)
             a->window_size = ANOMALY_WINDOW_SIZE;
 
             cfg->anomaly_count++;
-            LOG_INFO("config: %s field=%s algo=%s th=%.2f act=0x%02x",
-                     a->name, a->field,
-                     a->algo == ANOMALY_ZSCORE ? "zscore" : "iforest",
+            LOG_INFO("config: %s field=%s algo=%s th=%.2f act=0x%02x", a->name,
+                     a->field, a->algo == ANOMALY_ZSCORE ? "zscore" : "iforest",
                      a->zscore_threshold, a->action_mask);
         }
 
@@ -490,11 +485,11 @@ int config_load(const char *path, struct node_config *cfg)
                 cfg->platform[sizeof(cfg->platform) - 1] = '\0';
             } else {
                 LOG_WARN("config: platform '%s' invalid (local|huawei), "
-                         "falling back to 'local'", v);
+                         "falling back to 'local'",
+                         v);
                 strncpy(cfg->platform, "local", sizeof(cfg->platform) - 1);
             }
-        }
-        else if (strcmp(k, "huawei_device_id") == 0)
+        } else if (strcmp(k, "huawei_device_id") == 0)
             strncpy(cfg->huawei_device_id, v,
                     sizeof(cfg->huawei_device_id) - 1);
         else if (strcmp(k, "huawei_secret") == 0)
@@ -506,22 +501,22 @@ int config_load(const char *path, struct node_config *cfg)
             } else {
                 /* fail-closed：非法签名类型丢弃用缺省 + WARN */
                 LOG_WARN("config: huawei_auth_type %d invalid (need 0 or 1), "
-                         "using default 0", at);
+                         "using default 0",
+                         at);
                 cfg->huawei_auth_type = 0;
             }
-        }
-        else if (strcmp(k, "huawei_keepalive") == 0) {
+        } else if (strcmp(k, "huawei_keepalive") == 0) {
             int ka = atoi(v);
             if (ka < 30 || ka > 1200) {
                 int clamped = (ka < 30) ? 30 : 1200;
                 LOG_WARN("config: huawei_keepalive %d out of range 30-1200, "
-                         "clamped to %d", ka, clamped);
+                         "clamped to %d",
+                         ka, clamped);
                 cfg->huawei_keepalive = clamped;
             } else {
                 cfg->huawei_keepalive = ka;
             }
-        }
-        else if (strcmp(k, "huawei_props_interval") == 0)
+        } else if (strcmp(k, "huawei_props_interval") == 0)
             cfg->huawei_props_interval = atoi(v);
         else if (strcmp(k, "subdev_offline_sec") == 0) {
             /* P2-28：解析期钳制（与 huawei_keepalive 同风格）。
@@ -534,15 +529,14 @@ int config_load(const char *path, struct node_config *cfg)
             if (sec < 30 || sec > 86400) {
                 int clamped = (sec < 30) ? 30 : 86400;
                 LOG_WARN("config: subdev_offline_sec %d out of range "
-                         "30-86400, clamped to %d", sec, clamped);
+                         "30-86400, clamped to %d",
+                         sec, clamped);
                 cfg->subdev_offline_sec = clamped;
             } else {
                 cfg->subdev_offline_sec = sec;
             }
-        }
-        else if (strcmp(k, "subdevices_conf") == 0)
-            strncpy(cfg->subdevices_conf, v,
-                    sizeof(cfg->subdevices_conf) - 1);
+        } else if (strcmp(k, "subdevices_conf") == 0)
+            strncpy(cfg->subdevices_conf, v, sizeof(cfg->subdevices_conf) - 1);
         else if (strcmp(k, "huawei_ca_file") == 0)
             strncpy(cfg->huawei_ca_file, v, sizeof(cfg->huawei_ca_file) - 1);
     }
@@ -551,8 +545,7 @@ int config_load(const char *path, struct node_config *cfg)
     return E_OK;
 }
 
-void config_dump(const struct node_config *cfg)
-{
+void config_dump(const struct node_config *cfg) {
     LOG_INFO("===== Config =====");
     LOG_INFO("broker_host        = %s", cfg->broker_host);
     LOG_INFO("broker_port        = %d", cfg->broker_port);
@@ -580,20 +573,19 @@ void config_dump(const struct node_config *cfg)
         if (strcmp(cfg->modbus.mode, "rtu") == 0)
             LOG_INFO("modbus_port        = %s %d %c%d%c",
                      cfg->modbus.serial_port, cfg->modbus.baudrate,
-                     cfg->modbus.parity[0],
-                     cfg->modbus.data_bits, cfg->modbus.stop_bits);
+                     cfg->modbus.parity[0], cfg->modbus.data_bits,
+                     cfg->modbus.stop_bits);
         else
-            LOG_INFO("modbus_host        = %s:%d",
-                     cfg->modbus.tcp_host, cfg->modbus.tcp_port);
+            LOG_INFO("modbus_host        = %s:%d", cfg->modbus.tcp_host,
+                     cfg->modbus.tcp_port);
         LOG_INFO("modbus_poll_ms     = %d", cfg->modbus.poll_interval_ms);
         LOG_INFO("modbus_reg_count   = %d", cfg->modbus.reg_count);
         for (int i = 0; i < cfg->modbus.reg_count; i++) {
             const struct modbus_reg_map *r = &cfg->modbus.regs[i];
             LOG_INFO("  reg[%d]: slave=%d addr=%d count=%d "
                      "func=%d type=%s field=%s scale=%.3f offset=%.3f",
-                     i, r->slave_id, r->reg_addr, r->reg_count,
-                     r->func_code, r->data_type, r->field_name,
-                     r->scale, r->offset);
+                     i, r->slave_id, r->reg_addr, r->reg_count, r->func_code,
+                     r->data_type, r->field_name, r->scale, r->offset);
         }
     }
 
@@ -603,21 +595,30 @@ void config_dump(const struct node_config *cfg)
         const struct rule *r = &cfg->rules[i];
         const char *op_name = "?";
         switch (r->op) {
-        case OP_GT:      op_name = "gt";      break;
-        case OP_LT:      op_name = "lt";      break;
-        case OP_EQ:      op_name = "eq";      break;
-        case OP_NE:      op_name = "ne";      break;
-        case OP_OUT:     op_name = "outside"; break;
-        case OP_RATE:    op_name = "rate";    break;
+        case OP_GT:
+            op_name = "gt";
+            break;
+        case OP_LT:
+            op_name = "lt";
+            break;
+        case OP_EQ:
+            op_name = "eq";
+            break;
+        case OP_NE:
+            op_name = "ne";
+            break;
+        case OP_OUT:
+            op_name = "outside";
+            break;
+        case OP_RATE:
+            op_name = "rate";
+            break;
         }
         if (r->op == OP_OUT) {
-            LOG_INFO("  %s: %s %s [%.2f,%.2f] act=0x%02x",
-                     r->name, r->field, op_name,
-                     r->threshold_lo, r->threshold_hi,
-                     r->action_mask);
+            LOG_INFO("  %s: %s %s [%.2f,%.2f] act=0x%02x", r->name, r->field,
+                     op_name, r->threshold_lo, r->threshold_hi, r->action_mask);
         } else {
-            LOG_INFO("  %s: %s %s %.2f act=0x%02x",
-                     r->name, r->field, op_name,
+            LOG_INFO("  %s: %s %s %.2f act=0x%02x", r->name, r->field, op_name,
                      r->threshold, r->action_mask);
         }
     }
@@ -637,21 +638,20 @@ void config_dump(const struct node_config *cfg)
 
     LOG_INFO("--- HTTP Dashboard ---");
     LOG_INFO("http_enabled        = %d", cfg->http.enabled);
-    LOG_INFO("http_reboot_token   = %s",
-             cfg->http.reboot_token[0] ? "(configured)"
-                                       : "(unset, /api/reboot rejected)");
+    LOG_INFO("http_reboot_token   = %s", cfg->http.reboot_token[0]
+                                             ? "(configured)"
+                                             : "(unset, /api/reboot rejected)");
 
     LOG_INFO("--- Anomaly Engine ---");
     LOG_INFO("anomaly_enabled    = %d", cfg->anomaly_enabled);
     LOG_INFO("anomaly_count      = %d", cfg->anomaly_count);
     for (int i = 0; i < cfg->anomaly_count; i++) {
         const struct anomaly_config *a = &cfg->anoms[i];
-        const char *algo_name =
-            (a->algo == ANOMALY_ZSCORE)  ? "zscore" :
-            (a->algo == ANOMALY_IFOREST) ? "iforest" : "?";
-        LOG_INFO("  %s: %s %s th=%.2f act=0x%02x cd=%dms win=%d",
-                 a->name, a->field, algo_name,
-                 a->zscore_threshold, a->action_mask,
+        const char *algo_name = (a->algo == ANOMALY_ZSCORE)    ? "zscore"
+                                : (a->algo == ANOMALY_IFOREST) ? "iforest"
+                                                               : "?";
+        LOG_INFO("  %s: %s %s th=%.2f act=0x%02x cd=%dms win=%d", a->name,
+                 a->field, algo_name, a->zscore_threshold, a->action_mask,
                  a->cooldown_ms, a->window_size);
     }
 

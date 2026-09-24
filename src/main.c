@@ -16,7 +16,6 @@
 #include "anomaly_engine.h"
 #include "common.h"
 #include "config.h"
-#include "gpio_hal.h"
 #include "http_server.h"
 #include "mac_addr.h"        /* v1.2.5 P1-5：MAC 扫描逻辑独立为可测试模块 */
 #include "modbus_master.h"
@@ -176,12 +175,6 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
         if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
             platform_publish_alert(&g_cfg, &evt);
         }
-
-        /* GPIO 输出 */
-        if (actions & ACTION_GPIO_1)
-            gpio_hal_set(1, 1);
-        if (actions & ACTION_GPIO_2)
-            gpio_hal_set(2, 1);
     }
 
     /* ── 异常检测引擎评估  ── */
@@ -196,11 +189,6 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
         if ((a_actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
             platform_publish_alert(&g_cfg, &a_evt);
         }
-
-        if (a_actions & ACTION_GPIO_1)
-            gpio_hal_set(1, 1);
-        if (a_actions & ACTION_GPIO_2)
-            gpio_hal_set(2, 1);
     }
 
     if (mqtt_is_connected()) {
@@ -455,10 +443,7 @@ int main(int argc, char *argv[]) {
         LOG_INFO("anomaly engine disabled or no anomaly rules");
     }
 
-    /* 9. 初始化 GPIO 告警输出 */
-    gpio_hal_init();
-
-    /* 10. 初始化 OTA 远程升级（阶段四） */
+    /* 9. 初始化 OTA 远程升级（阶段四） */
     if (g_cfg.ota.enabled) {
         ota_init(&g_cfg.ota, g_cfg.client_id, EMBMQTTNODE_VERSION);
         /* 注入 MQTT 发布回调（用于 OTA 状态上报）。
@@ -537,7 +522,6 @@ int main(int argc, char *argv[]) {
     modbus_master_close();
     rule_engine_close();
     anomaly_engine_close();
-    gpio_hal_close();
     ota_close();
     storage_close();
     sensor_close();

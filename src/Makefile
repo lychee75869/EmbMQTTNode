@@ -23,9 +23,10 @@ endif
 # ops 表装配与 select 接线留 T04，故当前无调用方，随构建一并编译验证）
 # v1.3.0 T04：追加 platform_huawei_subdev.c（子设备运行期状态 + 9 成员 ops）
 # v1.3.0 T05：追加 platform_huawei_cmd.c（命令闭环 + OTA 桥接 + OTA 状态 shim）
-# v1.4.0 网关纯化：移除 gpio_hal.c（GPIO 执行层）
+# v1.4.0 网关纯化：移除 gpio_hal.c（GPIO 执行层）与 sensor.c（板载采集层，
+# 数据改由 Modbus 子设备提供）
 TARGET   = embmqttnode
-SRCS     = main.c config.c sensor.c storage.c mqtt_client.c \
+SRCS     = main.c config.c storage.c mqtt_client.c \
             modbus_master.c rule_engine.c ota.c http_server.c \
             anomaly_engine.c mac_addr.c subdev_registry.c sensor_fields.c \
             platform.c platform_local.c platform_huawei.c \

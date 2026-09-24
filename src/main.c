@@ -1,6 +1,6 @@
 /*
  * main.c
- * 程序入口：初始化、启动采集线程、启动上报线程
+ * 程序入口：初始化、启动上报线程
  * TLS 安全连接、设备身份、MQTT 遗嘱、启动状态上报
  */
 #include <pthread.h>
@@ -23,7 +23,6 @@
 #include "ota.h"
 #include "platform.h"        /* T02：平台分发器（publish/告警/下行均经此） */
 #include "rule_engine.h"
-#include "sensor.h"
 #include "storage.h"
 
 static volatile int g_running = 1;
@@ -175,6 +174,7 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
         if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
             platform_publish_alert(&g_cfg, &evt);
         }
+
     }
 
     /* ── 异常检测引擎评估  ── */
@@ -189,6 +189,7 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
         if ((a_actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
             platform_publish_alert(&g_cfg, &a_evt);
         }
+
     }
 
     if (mqtt_is_connected()) {
@@ -197,30 +198,6 @@ static void process_sensor_data(const struct sensor_data *data, sensor_source_t 
         /* MQTT 离线：按来源入队（断网续传），补发时走同一平台路径 */
         storage_save(data, source, g_cfg.client_id);
     }
-}
-
-/* ─── 采集线程 ────────────────────────────────────────── */
-
-static void *sample_thread(void *arg) {
-    (void)arg;
-    struct sensor_data data;
-
-    while (g_running) {
-        int rc = sensor_read(&data);
-        if (rc != E_OK) {
-            LOG_ERROR("sensor_read failed: %d", rc);
-            usleep(g_cfg.sample_interval_ms * 1000);
-            continue;
-        }
-
-        LOG_INFO("sample: temp=%.2f hum=%.2f pres=%.2f", data.temperature,
-                 data.humidity, data.pressure);
-
-        process_sensor_data(&data, SOURCE_LOCAL);
-
-        usleep(g_cfg.sample_interval_ms * 1000);
-    }
-    return NULL;
 }
 
 /* ─── Modbus 轮询线程 ──────────────────────────────────── */
@@ -268,7 +245,6 @@ static void *upload_thread(void *arg) {
          * ota_confirm_boot 清零 boot_attempt（内含 enabled / count==0
          * 短路，开销可忽略） */
         ota_confirm_boot();
-
         if (mqtt_is_connected()) {
             int n = storage_get_pending(pending, 16);
             int sent = 0;
@@ -362,31 +338,26 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 1. 加载配置 */
+    /* 加载配置 */
     if (config_load(cfg_path, &g_cfg) != E_OK) {
         fprintf(stderr, "FATAL: config_load failed\n");
         return 1;
     }
 
-    /* 2. 收集设备信息 + 自动生成 client_id */
+    /* 收集设备信息 + 自动生成 client_id */
     collect_device_info(&g_dev);
     auto_client_id(&g_cfg, &g_dev);
     config_dump(&g_cfg);
 
-    /* 2.5 T02：装配平台分发器（在任何线程创建之前写定 g_active）。
+    /* T02：装配平台分发器（在任何线程创建之前写定 g_active）。
      * 注入 device_info 供平台 on_connected 发 online 状态；
      * 注册"重启请求"回调（huawei reboot 命令，T05 启用）。 */
     platform_set_device_info(&g_dev);
     platform_select(&g_cfg);
     platform_set_reboot_request(platform_reboot_request_cb);
 
-    /* 3. 初始化传感器 */
-    if (sensor_init(g_cfg.sensor_type, g_cfg.sensor_i2c_dev) != E_OK) {
-        fprintf(stderr, "FATAL: sensor_init failed\n");
-        return 1;
-    }
 
-    /* 4. 初始化本地存储（使用绝对路径 /var/lib/embmqttnode/data.db） */
+    /* 初始化本地存储（使用绝对路径 /var/lib/embmqttnode/data.db） */
     /* systemd 已配置 WorkingDirectory=/var/lib/embmqttnode，目录通常已存在； */
     /* 首次部署若不存在则尝试单层 mkdir（不递归，避免越权创建父目录）。 */
     const char *db_dir = "/var/lib/embmqttnode";
@@ -394,16 +365,14 @@ int main(int argc, char *argv[]) {
     if (mkdir(db_dir, 0755) < 0 && errno != EEXIST) {
         LOG_ERROR("mkdir %s failed (%s); 请用 -c 指定其他工作目录并手工创建，或预先创建目录",
                   db_dir, strerror(errno));
-        sensor_close();
         return 1;
     }
     if (storage_init(db_path) != E_OK) {
         fprintf(stderr, "FATAL: storage_init failed\n");
-        sensor_close();
         return 1;
     }
 
-    /* 5. 初始化 MQTT（T02：连接参数与遗嘱消息由平台层组装，main 不再拼装）。
+    /* 初始化 MQTT（T02：连接参数与遗嘱消息由平台层组装，main 不再拼装）。
      *
      * P1-13/P2-19 的"连接成功要做的事"（重订 OTA + 重发 online）已迁入
      * 平台层：mqtt_handle_connack → platform_on_connected →
@@ -415,17 +384,17 @@ int main(int argc, char *argv[]) {
         LOG_WARN("mqtt_init failed, running in offline mode");
     }
 
-    /* 5b. T05 Q4：启动 auth_type=1 超窗重连监督线程。
+    /* 启动 auth_type=1 超窗重连监督线程。
      * 仅 rebuild_on_hour==1（huawei auth_type=1）才真正创建线程；
      * local 与 auth_type=0 → no-op（零影响）。 */
     mqtt_start_supervisor();
 
-    /* 6. 初始化 Modbus（可选模块） */
+    /* 初始化 Modbus（可选模块） */
     if (modbus_master_init(&g_cfg.modbus) != E_OK) {
         LOG_WARN("modbus init failed, modbus module disabled");
     }
 
-    /* 7. 初始化规则引擎（阶段三） */
+    /* 初始化规则引擎 */
     if (g_cfg.rule_count > 0) {
         if (rule_engine_init(&g_cfg) != E_OK) {
             LOG_WARN("rule_engine_init failed");
@@ -434,7 +403,7 @@ int main(int argc, char *argv[]) {
         LOG_INFO("no rules configured, rule engine skipped");
     }
 
-    /* 8. 初始化异常检测引擎（方向 B） */
+    /* 初始化异常检测引擎 */
     if (g_cfg.anomaly_enabled && g_cfg.anomaly_count > 0) {
         if (anomaly_engine_init(&g_cfg) != E_OK) {
             LOG_WARN("anomaly_engine_init failed");
@@ -443,7 +412,8 @@ int main(int argc, char *argv[]) {
         LOG_INFO("anomaly engine disabled or no anomaly rules");
     }
 
-    /* 9. 初始化 OTA 远程升级（阶段四） */
+
+    /* 初始化 OTA 远程升级*/
     if (g_cfg.ota.enabled) {
         ota_init(&g_cfg.ota, g_cfg.client_id, EMBMQTTNODE_VERSION);
         /* 注入 MQTT 发布回调（用于 OTA 状态上报）。
@@ -472,11 +442,10 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* 12. 启动工作线程 */
+    /* 12. 启动线程 */
     LOG_INFO("EmbMQTTNode v%s starting...", EMBMQTTNODE_VERSION);
 
-    pthread_t tid_sample, tid_upload, tid_modbus = 0, tid_http = 0, tid_ota = 0;
-    pthread_create(&tid_sample, NULL, sample_thread, NULL);
+    pthread_t tid_upload, tid_modbus = 0, tid_http = 0, tid_ota = 0;
     pthread_create(&tid_upload, NULL, upload_thread, NULL);
     /* Modbus 线程仅在 enabled 时启动 */
     if (g_cfg.modbus.enabled) {
@@ -498,7 +467,6 @@ int main(int argc, char *argv[]) {
         LOG_INFO("http dashboard thread started on port 8080");
     }
 
-    pthread_join(tid_sample, NULL);
     pthread_join(tid_upload, NULL);
     if (tid_modbus)
         pthread_join(tid_modbus, NULL);
@@ -524,7 +492,6 @@ int main(int argc, char *argv[]) {
     anomaly_engine_close();
     ota_close();
     storage_close();
-    sensor_close();
 
     LOG_INFO("EmbMQTTNode stopped.");
     return 0;

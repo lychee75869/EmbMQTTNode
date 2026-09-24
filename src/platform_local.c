@@ -89,7 +89,7 @@ static int local_publish_status(const struct node_config *cfg,
     return mqtt_publish_status(cfg, dev, status);
 }
 
-/* ─── 5. 数据上报（等价 v1.2.11 main.c publish_by_source）────────────── */
+/* ─── 5. 数据上报（等价 v1.2.11 main.c publish_by_source 的 modbus 路径）── */
 
 static int local_publish_data(const struct node_config *cfg,
                               const struct sensor_data *data)
@@ -97,12 +97,8 @@ static int local_publish_data(const struct node_config *cfg,
     if (!cfg || !data)
         return E_INVAL;
 
-    if (data->source == SOURCE_LOCAL) {
-        /* 本地传感器：默认主题，不 mask 哨兵（§3.5-4） */
-        return mqtt_publish(cfg, data);
-    }
-
-    /* Modbus：topic/modbus，JSON，QoS1；复用纯函数构造（截断拒绝） */
+    /* v1.4.0 网关纯化：板载采集层移除，数据一律走 modbus topic + JSON，
+     * QoS1；复用纯函数构造（截断拒绝）。 */
     char modbus_topic[256];
     snprintf(modbus_topic, sizeof(modbus_topic), "%s/modbus", cfg->topic);
 

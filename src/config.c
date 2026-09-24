@@ -28,7 +28,6 @@ static void set_default_config(struct node_config *cfg) {
     cfg->broker_port = 1883;
     strncpy(cfg->topic, "embmqttnode/data", sizeof(cfg->topic) - 1);
     strncpy(cfg->client_id, "emb-node-01", sizeof(cfg->client_id) - 1);
-    cfg->sample_interval_ms = 5000;
     cfg->debug_level = 0;
 
     /* TLS 默认：关闭 */
@@ -132,12 +131,6 @@ int config_load(const char *path, struct node_config *cfg) {
             strncpy(cfg->topic, v, sizeof(cfg->topic) - 1);
         else if (strcmp(k, "client_id") == 0)
             strncpy(cfg->client_id, v, sizeof(cfg->client_id) - 1);
-        else if (strcmp(k, "sample_interval_ms") == 0)
-            cfg->sample_interval_ms = atoi(v);
-        else if (strcmp(k, "sensor_type") == 0)
-            strncpy(cfg->sensor_type, v, sizeof(cfg->sensor_type) - 1);
-        else if (strcmp(k, "sensor_i2c_dev") == 0)
-            strncpy(cfg->sensor_i2c_dev, v, sizeof(cfg->sensor_i2c_dev) - 1);
         else if (strcmp(k, "debug_level") == 0)
             cfg->debug_level = atoi(v);
 
@@ -551,9 +544,6 @@ void config_dump(const struct node_config *cfg) {
     LOG_INFO("broker_port        = %d", cfg->broker_port);
     LOG_INFO("topic              = %s", cfg->topic);
     LOG_INFO("client_id          = %s", cfg->client_id);
-    LOG_INFO("sample_interval_ms = %d", cfg->sample_interval_ms);
-    LOG_INFO("sensor_type        = %s", cfg->sensor_type);
-    LOG_INFO("sensor_i2c_dev     = %s", cfg->sensor_i2c_dev);
     LOG_INFO("debug_level        = %d", cfg->debug_level);
 
     LOG_INFO("--- TLS ---");

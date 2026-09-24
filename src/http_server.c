@@ -317,7 +317,6 @@ static void handle_api_status(int fd)
              "\"version\":\"%s\","
              "\"uptime_seconds\":%lld,"
              "\"mqtt_connected\":%s,"
-             "\"sensor_type\":\"%s\","
              "\"modbus_enabled\":%s,"
              "\"ota_enabled\":%s,"
              "\"ota_state\":\"%s\","
@@ -329,7 +328,6 @@ static void handle_api_status(int fd)
              EMBMQTTNODE_VERSION,
              (long long)uptime_s,
              mqtt_is_connected() ? "true" : "false",
-             g_cfg ? g_cfg->sensor_type : "?",
              (g_cfg && g_cfg->modbus.enabled) ? "true" : "false",
              (g_cfg && g_cfg->ota.enabled) ? "true" : "false",
              ota_state_string(),
@@ -734,7 +732,6 @@ static const char DASHBOARD_HTML[] =
 "    <span id=\"mqtt\" class=\"badge badge-off\">MQTT</span>\n"
 "    <span id=\"modbus\" class=\"badge badge-off\">Modbus</span>\n"
 "    <span id=\"ota\" class=\"badge badge-off\">OTA</span>\n"
-"    <span id=\"sensor\" class=\"badge badge-off\">Sensor</span>\n"
 "  </div>\n"
 "</div>\n"
 "\n"
@@ -758,7 +755,6 @@ static const char DASHBOARD_HTML[] =
 "  <!-- 系统状态 -->\n"
 "  <div class=\"card\">\n"
 "    <h2>📋 系统状态</h2>\n"
-"    <div class=\"value-row\"><span class=\"label\">传感器类型</span><span class=\"val\" id=\"stype\">--</span></div>\n"
 "    <div class=\"value-row\"><span class=\"label\">规则数量</span><span class=\"val\" id=\"rcount\">--</span></div>\n"
 "    <div class=\"value-row\"><span class=\"label\">OTA 状态</span><span class=\"val\" id=\"ostate\">--</span></div>\n"
 "    <div class=\"value-row\"><span class=\"label\">最后更新</span><span class=\"val\" id=\"updated\">--</span></div>\n"
@@ -808,15 +804,12 @@ static const char DASHBOARD_HTML[] =
 "    $('ver').textContent = d.version;\n"
 "    $('devid').textContent = d.client_id;\n"
 "    $('uptime').textContent = fmtUptime(d.uptime_seconds);\n"
-"    $('stype').textContent = d.sensor_type;\n"
 "    $('rcount').textContent = d.rule_count;\n"
 "    $('ostate').textContent = d.ota_state;\n"
 "    // badges\n"
 "    setBadge('mqtt',  d.mqtt_connected);\n"
 "    setBadge('modbus',d.modbus_enabled);\n"
 "    setBadge('ota',   d.ota_enabled);\n"
-"    $('sensor').textContent = d.sensor_type;\n"
-"    $('sensor').className = 'badge badge-ok';\n"
 "  } catch(e) { console.warn('status poll:', e); }\n"
 "}\n"
 "function setBadge(id, on) {\n"

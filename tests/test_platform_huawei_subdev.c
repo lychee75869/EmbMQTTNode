@@ -59,11 +59,9 @@ static int stub_pub(const char *topic, const char *payload, int qos)
     return g_pub_rc;
 }
 
-static void make_cfg(struct node_config *cfg, const char *conf_path,
-                     const char *sensor_type)
+static void make_cfg(struct node_config *cfg, const char *conf_path)
 {
     memset(cfg, 0, sizeof(*cfg));
-    snprintf(cfg->sensor_type, sizeof(cfg->sensor_type), "%s", sensor_type);
     snprintf(cfg->subdevices_conf, sizeof(cfg->subdevices_conf), "%s", conf_path);
     /* 合法 device_id → hw_build_topic 成功（否则 publish_data 会因建主题失败
      * 提前返回 E_IO，无法验证返回码契约）。凭据非法场景由用例显式清空。 */
@@ -108,7 +106,7 @@ static void test_init_alignment(void)
 
     /* 合法 2 条 */
     write_conf(CONF_2);
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     assert(hw_subdev_init(&cfg) == 2);
     assert(hw_subdev_rt_count() == 2);
     for (int i = 0; i < 2; i++) {
@@ -128,7 +126,7 @@ static void test_init_alignment(void)
 
     /* 空文件 → 0 槽（纯网关） */
     write_conf("");
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     assert(hw_subdev_init(&cfg) == 0);
     assert(hw_subdev_rt_count() == 0);
     {
@@ -150,7 +148,7 @@ static void test_publish_data_contract(void)
 
     struct node_config cfg;
     write_conf(CONF_2);
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     assert(hw_subdev_init(&cfg) == 2);
 
     hw_subdev_set_publisher(stub_pub);
@@ -168,15 +166,23 @@ static void test_publish_data_contract(void)
     assert(g_pub_calls == 0);
     printf("  miss (unregistered) -> E_OK, no publish: PASS\n");
 
-    /* 全空（三字段哨兵）→ E_OK + empty_skip_cnt++ */
+    /* v1.4.0 网关纯化：SOURCE_LOCAL 无注册来源（路由只认 modbus slave_id）
+     * → 未命中丢弃（E_OK 且不发布），不得进入续传 */
     d.source = SOURCE_LOCAL; d.source_id = 0;
+    d.temperature = 12.34; d.humidity = 56.78; d.pressure = 1013.25;
+    assert(platform_huawei_ops.publish_data(&cfg, &d) == E_OK);
+    assert(g_pub_calls == 0);
+    printf("  SOURCE_LOCAL unmatched -> E_OK, no publish: PASS\n");
+
+    /* 全空（三字段哨兵，modbus slave 3 命中）→ E_OK + empty_skip_cnt++ */
+    d.source = SOURCE_MODBUS; d.source_id = 3;
     d.temperature = SENSOR_VALUE_INVALID;
     d.humidity    = SENSOR_VALUE_INVALID;
     d.pressure    = SENSOR_VALUE_INVALID;
     assert(platform_huawei_ops.publish_data(&cfg, &d) == E_OK);
     {
         struct hw_subdev_stat st;
-        assert(hw_subdev_stat_get(0, &st) == E_OK);
+        assert(hw_subdev_stat_get(1, &st) == E_OK);   /* rt[1]=dev-mb-3 */
         assert(st.empty_skip_cnt >= 1);
     }
     assert(g_pub_calls == 0);
@@ -193,7 +199,7 @@ static void test_publish_data_contract(void)
     assert(g_pub_calls >= 1);
     {
         struct hw_subdev_stat st;
-        assert(hw_subdev_stat_get(0, &st) == E_OK);
+        assert(hw_subdev_stat_get(1, &st) == E_OK);
         assert(st.last_seen_ms != 0);
         assert(st.online == 1);
     }
@@ -206,7 +212,7 @@ static void test_publish_data_contract(void)
 
     /* 命中 + 发布失败（瞬态）→ E_NET（非 E_OK）*/
     g_pub_rc = E_NET;
-    d.source = SOURCE_LOCAL; d.source_id = 0;
+    d.source = SOURCE_MODBUS; d.source_id = 3;
     assert(platform_huawei_ops.publish_data(&cfg, &d) == E_NET);
     printf("  hit + publish fail -> E_NET: PASS\n");
 
@@ -225,7 +231,7 @@ static void test_status_alert(void)
 
     struct node_config cfg;
     write_conf(CONF_2);
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     assert(hw_subdev_init(&cfg) == 2);
 
     hw_subdev_set_publisher(stub_pub);
@@ -258,11 +264,13 @@ static void test_status_alert(void)
     assert(strstr(g_last_payload, "\"source_id\":\"3\"") != NULL);
     printf("  publish_alert(modbus) -> events/report: PASS\n");
 
-    /* 本地传感器源 → source_id=sensor_type 串 */
+    /* v1.4.0 网关纯化：source_kind 不再影响 source_id（一律数据源实例十进制）。
+     * source_kind="sensor" 属保留死路径（alert_event.source_kind 保留）。 */
     snprintf(evt.source_kind, sizeof(evt.source_kind), "sensor");
+    evt.source_id = 7;
     assert(platform_huawei_ops.publish_alert(&cfg, &evt) == E_OK);
-    assert(strstr(g_last_payload, "\"source_id\":\"mock\"") != NULL);
-    printf("  publish_alert(sensor) -> source_type: PASS\n");
+    assert(strstr(g_last_payload, "\"source_id\":\"7\"") != NULL);
+    printf("  publish_alert(sensor kind) -> source_id=decimal: PASS\n");
 }
 
 /* ─── ⑤ tick 退避单调性 ────────────────────────────────────── */
@@ -285,7 +293,7 @@ static void test_tick_backoff(void)
     /* 运行期：register 失败（桩返回 E_NET）→ reg_fail_cnt++、next_reg_ms 前移（门控） */
     struct node_config cfg;
     write_conf(CONF_2);
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     assert(hw_subdev_init(&cfg) == 2);
 
     hw_subdev_set_publisher(stub_pub);
@@ -320,7 +328,7 @@ static void test_select_assembly(void)
     write_conf(CONF_2);
 
     /* 凭据齐 + platform=huawei → huawei 激活（指纹：force_tls=1, use_will=0） */
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     snprintf(cfg.platform, sizeof(cfg.platform), "huawei");
     snprintf(cfg.huawei_device_id, sizeof(cfg.huawei_device_id), "gw-123");
     snprintf(cfg.huawei_secret, sizeof(cfg.huawei_secret), "secret-x");
@@ -332,7 +340,7 @@ static void test_select_assembly(void)
     printf("  creds ok -> huawei active (force_tls=1): PASS\n");
 
     /* 凭据缺 → 硬回落 local（指纹：force_tls=0, username==tls.username） */
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     snprintf(cfg.platform, sizeof(cfg.platform), "huawei");
     /* make_cfg 默认给了合法凭据，这里显式清空以构造「凭据非法」场景 */
     cfg.huawei_device_id[0] = '\0';
@@ -352,7 +360,7 @@ static void test_register_response(void)
 
     static struct node_config cfg;
     write_conf(CONF_2);
-    make_cfg(&cfg, g_path, "mock");
+    make_cfg(&cfg, g_path);
     snprintf(cfg.platform, sizeof(cfg.platform), "huawei");
     snprintf(cfg.huawei_device_id, sizeof(cfg.huawei_device_id), "gw-123");
     snprintf(cfg.huawei_secret, sizeof(cfg.huawei_secret), "secret-x");

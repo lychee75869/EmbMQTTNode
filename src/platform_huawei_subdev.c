@@ -354,20 +354,18 @@ static int hw_publish_data(const struct node_config *cfg,
     if (!cfg || !data)
         return E_INVAL;
 
-    /* 路由：本地传感器按 sensor_type；modbus 按 source_id(=slave_id) */
-    const struct subdev_entry *e =
-        (data->source == SOURCE_LOCAL) ? subdev_find_sensor(cfg->sensor_type)
-                                       : subdev_find_modbus(data->source_id);
+    /* 路由：数据一律由 Modbus 子设备提供，按 source_id(=slave_id) 查表
+     *（v1.4.0 网关纯化：板载采集层移除，SOURCE_LOCAL 无注册来源恒未命中） */
+    const struct subdev_entry *e = subdev_find_modbus(data->source_id);
 
     if (!e) {
         /* 未命中注册表 → 永久不可路由 → 视为已处置（E_OK），不计入续传。
          * 节流 WARN，避免每采样点刷屏。 */
         int c = atomic_fetch_add(&g_unmatched_cnt, 1);
         if ((c % HW_THROTTLE_N) == 0)
-            LOG_WARN("huawei: no subdevice for source=%s/%d, dropping "
+            LOG_WARN("huawei: no subdevice for source_id=%d, dropping "
                      "(throttled cnt=%d)",
-                     data->source == SOURCE_LOCAL ? "sensor" : "modbus",
-                     data->source == SOURCE_LOCAL ? 0 : data->source_id, c + 1);
+                     data->source_id, c + 1);
         return E_OK;
     }
 
@@ -416,12 +414,10 @@ static int hw_publish_alert(const struct node_config *cfg,
     if (!cfg || !evt)
         return E_INVAL;
 
-    /* source_id 字符串：本地传感器用 sensor_type；modbus 用 slave_id 十进制 */
+    /* source_id 字符串：一律用数据源实例（modbus slave_id）十进制
+     *（v1.4.0 网关纯化：sensor_type 来源已随板载采集层移除） */
     char source_id[64];
-    if (strcmp(evt->source_kind, "modbus") == 0)
-        snprintf(source_id, sizeof(source_id), "%d", evt->source_id);
-    else
-        snprintf(source_id, sizeof(source_id), "%s", cfg->sensor_type);
+    snprintf(source_id, sizeof(source_id), "%d", evt->source_id);
 
     char topic[256], payload[768];
     if (hw_build_topic(cfg, HW_TOPIC_EVENTS_REPORT, topic, sizeof(topic)) != E_OK) {

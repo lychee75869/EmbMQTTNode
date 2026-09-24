@@ -290,7 +290,9 @@ static void test_publish_offline_safe(void)
 
     struct sensor_data d;
     memset(&d, 0, sizeof(d));
-    d.source = SOURCE_LOCAL;
+    /* v1.4.0 网关纯化：板载采集层移除，数据一律走 modbus topic + JSON 路径 */
+    d.source = SOURCE_MODBUS;
+    d.source_id = 1;
     d.temperature = 23.45;
     d.timestamp_ms = 1;
 

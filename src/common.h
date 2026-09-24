@@ -413,9 +413,6 @@ struct node_config {
     int     broker_port;
     char    topic[128];
     char    client_id[64];
-    int     sample_interval_ms;
-    char    sensor_type[32];
-    char    sensor_i2c_dev[64];     /* I2C 适配器路径，如 /dev/i2c-1 */
     int     debug_level;
 
     /* TLS + 安全 */

@@ -13,14 +13,12 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-TESTS   = test_sensor test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields test_platform_local test_platform_huawei test_platform_huawei_subdev test_platform_huawei_cmd
+# v1.4.0 网关纯化：移除 test_sensor（板载采集层删除，数据改由 Modbus 提供）。
+TESTS   = test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields test_platform_local test_platform_huawei test_platform_huawei_subdev test_platform_huawei_cmd
 
 .PHONY: all clean distclean
 
 all: $(TESTS)
-
-test_sensor: test_sensor.c ../src/sensor.c
-	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
 test_storage: test_storage.c ../src/storage.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)

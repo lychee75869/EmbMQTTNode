@@ -1,6 +1,5 @@
 # EmbMQTTNode 顶层 Makefile
 # 委托 src/ 和 tests/ 子目录构建
-# 阶段六：交叉编译 + CI + 安装
 
 CROSS_COMPILE     ?=
 BUILD_WITH_MODBUS ?= 1
@@ -25,8 +24,8 @@ install:
 # 与 tests/Makefile 的 TESTS 保持一致。用例数由 $(words $(TESTS)) 动态得出，
 # 杜绝「编译了 N 个、runner 只跑 N-1 个、结尾计数还写死」的假绿复发。
 # v1.4.0 网关纯化：移除 test_sensor（板载采集层删除，数据改由 Modbus 提供）。
-TESTS = test_storage test_modbus_config test_rule_engine test_ota \
-        test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry \
+TESTS = test_storage test_modbus_config test_ota \
+        test_mac_addr test_mqtt_client test_subdev_registry \
         test_sensor_fields test_platform_local test_platform_huawei \
         test_platform_huawei_subdev test_platform_huawei_cmd
 

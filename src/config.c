@@ -2,10 +2,9 @@
  * config.c
  * 配置文件解析模块实现
  * 支持 INI 风格键值对，格式：key = value
- * 覆盖 MQTT / TLS / Modbus / 规则引擎 / OTA / 异常检测 六大配置段
+ * 覆盖 MQTT / TLS / Modbus  / OTA 四大配置段
  */
 #include "config.h"
-#include "sensor_fields.h" /* 字段描述表：rule/anomaly 字段名校验（docs/12 §3.4） */
 
 static char *trim(char *str) {
     char *end;
@@ -51,9 +50,6 @@ static void set_default_config(struct node_config *cfg) {
     cfg->modbus.poll_interval_ms = 2000;
     cfg->modbus.reg_count = 0;
 
-    /* 规则引擎默认：无规则 */
-    cfg->rule_count = 0;
-
     /* OTA 默认：关闭 */
     cfg->ota.enabled = 0;
     strncpy(cfg->ota.slot_dir, OTA_SLOT_DIR_DEFAULT,
@@ -72,10 +68,6 @@ static void set_default_config(struct node_config *cfg) {
      * 403 拒绝，必须显式配置 http_reboot_token 才能远程重启 */
     cfg->http.enabled = 1;
     cfg->http.reboot_token[0] = '\0';
-
-    /* 异常检测引擎默认：关闭 */
-    cfg->anomaly_enabled = 0;
-    cfg->anomaly_count = 0;
 
     /* ── 华为云 IoTDA 接入（v1.3.0，T01）──
      * platform 缺省 "local"：保持 v1.2.11 行为，华为字段全部忽略。 */
@@ -248,114 +240,6 @@ int config_load(const char *path, struct node_config *cfg) {
                      reg->scale, reg->offset);
         }
 
-        /* ── 规则引擎: rule_N = field,operator,threshold,action ── */
-        else if (strncmp(k, "rule_", 5) == 0) {
-            int idx = cfg->rule_count;
-            if (idx >= RULE_MAX) {
-                LOG_WARN("config: too many rules, max=%d", RULE_MAX);
-                continue;
-            }
-
-            struct rule *r = &cfg->rules[idx];
-            memset(r, 0, sizeof(*r));
-
-            /* 规则名称 = key 本身 (e.g. "rule_1") */
-            strncpy(r->name, k, RULE_NAME_LEN - 1);
-            r->name[RULE_NAME_LEN - 1] = '\0';
-
-            /* 解析: field,operator,threshold[,action] */
-            char field[32] = {0};
-            char op_str[16] = {0};
-            char th_str[32] = {0};
-            char act_str[64] = {0};
-
-            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]", field,
-                                 op_str, th_str, act_str);
-            if (matched < 3) {
-                LOG_WARN("config: invalid %s format, need at least field,op,th",
-                         k);
-                continue;
-            }
-
-            /* 字段名：必须命中字段描述表，否则丢弃该规则（fail-closed） */
-            if (sensor_find_field(field) == NULL) {
-                LOG_WARN("config: %s unknown field '%s', rule dropped", k,
-                         field);
-                continue;
-            }
-            strncpy(r->field, field, sizeof(r->field));
-            r->field[sizeof(r->field) - 1] = '\0';
-
-            /* 运算符 */
-            if (strcmp(op_str, "gt") == 0)
-                r->op = OP_GT;
-            else if (strcmp(op_str, "lt") == 0)
-                r->op = OP_LT;
-            else if (strcmp(op_str, "eq") == 0)
-                r->op = OP_EQ;
-            else if (strcmp(op_str, "ne") == 0)
-                r->op = OP_NE;
-            else if (strcmp(op_str, "outside") == 0)
-                r->op = OP_OUT;
-            else if (strcmp(op_str, "rate") == 0)
-                r->op = OP_RATE;
-            else {
-                LOG_WARN("config: %s unknown operator '%s'", k, op_str);
-                continue;
-            }
-
-            /* 阈值 */
-            if (r->op == OP_OUT) {
-                /* 格式: lo_hi, e.g. 950.0_1050.0 */
-                if (sscanf(th_str, "%lf_%lf", &r->threshold_lo,
-                           &r->threshold_hi) != 2) {
-                    LOG_WARN("config: %s invalid outside range '%s'", k,
-                             th_str);
-                    continue;
-                }
-            } else {
-                /* 单值阈值（gt/lt/eq/ne/rate），rate
-                 * 为瞬时变化率阈值（单位/秒） */
-                r->threshold = atof(th_str);
-            }
-
-            /* 动作（可选，默认 log_only）*/
-            if (matched >= 4) {
-                /* 解析逗号或加号分隔的动作列表 */
-                char *saveptr = NULL;
-                char *token = strtok_r(act_str, ",+", &saveptr);
-                while (token) {
-                    /* trim token */
-                    while (*token == ' ' || *token == '\t')
-                        token++;
-                    char *end = token + strlen(token) - 1;
-                    while (end > token && (*end == ' ' || *end == '\t'))
-                        end--;
-                    *(end + 1) = '\0';
-
-                    if (strcmp(token, "all") == 0)
-                        r->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT);
-                    else if (strcmp(token, "alert_mqtt") == 0)
-                        r->action_mask |= ACTION_ALERT_MQTT;
-                    else if (strcmp(token, "log_only") == 0)
-                        r->action_mask |= ACTION_LOG_ONLY;
-                    else
-                        LOG_WARN("config: %s unknown action '%s'", k, token);
-
-                    token = strtok_r(NULL, ",+", &saveptr);
-                }
-            }
-            if (r->action_mask == 0)
-                r->action_mask = ACTION_LOG_ONLY; /* 默认 */
-
-            /* 默认冷却时间 60s */
-            r->cooldown_ms = 60000;
-
-            cfg->rule_count++;
-            LOG_INFO("config: %s field=%s op=%d th=%.2f act=0x%02x", r->name,
-                     r->field, r->op, r->threshold, r->action_mask);
-        }
-
         /* ── OTA: ota_* 配置项 ── */
         else if (strcmp(k, "ota_enabled") == 0)
             cfg->ota.enabled = atoi(v);
@@ -378,98 +262,6 @@ int config_load(const char *path, struct node_config *cfg) {
         else if (strcmp(k, "http_reboot_token") == 0)
             strncpy(cfg->http.reboot_token, v,
                     sizeof(cfg->http.reboot_token) - 1);
-
-        /* ── 异常检测引擎: anomaly_enabled / anomaly_N ── */
-        else if (strcmp(k, "anomaly_enabled") == 0)
-            cfg->anomaly_enabled = atoi(v);
-
-        else if (strncmp(k, "anomaly_", 8) == 0) {
-            int idx = cfg->anomaly_count;
-            if (idx >= ANOMALY_MAX) {
-                LOG_WARN("config: too many anomaly rules, max=%d", ANOMALY_MAX);
-                continue;
-            }
-
-            struct anomaly_config *a = &cfg->anoms[idx];
-            memset(a, 0, sizeof(*a));
-
-            /* 名称 = key 本身 (e.g. "anomaly_1") */
-            strncpy(a->name, k, ANOMALY_NAME_LEN - 1);
-            a->name[ANOMALY_NAME_LEN - 1] = '\0';
-
-            /* 解析: field,algo,threshold,action */
-            char field[32] = {0};
-            char algo_str[16] = {0};
-            char th_str[32] = {0};
-            char act_str[64] = {0};
-
-            int matched = sscanf(v, "%31[^,],%15[^,],%31[^,],%63[^\n]", field,
-                                 algo_str, th_str, act_str);
-            if (matched < 3) {
-                LOG_WARN("config: invalid %s format, "
-                         "need field,algo,threshold",
-                         k);
-                continue;
-            }
-
-            /* 字段名：必须命中字段描述表，否则丢弃该规则（fail-closed） */
-            if (sensor_find_field(field) == NULL) {
-                LOG_WARN("config: %s unknown field '%s', anomaly dropped", k,
-                         field);
-                continue;
-            }
-            strncpy(a->field, field, sizeof(a->field) - 1);
-            a->field[sizeof(a->field) - 1] = '\0';
-
-            /* 算法 */
-            if (strcmp(algo_str, "zscore") == 0)
-                a->algo = ANOMALY_ZSCORE;
-            else if (strcmp(algo_str, "iforest") == 0) {
-                a->algo = ANOMALY_IFOREST;
-                a->iforest_enabled = 1;
-            } else {
-                LOG_WARN("config: %s unknown algo '%s'", k, algo_str);
-                continue;
-            }
-
-            /* 阈值 */
-            a->zscore_threshold = atof(th_str);
-
-            /* 动作（可选，默认 log_only） */
-            if (matched >= 4) {
-                char *saveptr = NULL;
-                char *token = strtok_r(act_str, ",+", &saveptr);
-                while (token) {
-                    while (*token == ' ' || *token == '\t')
-                        token++;
-                    char *end = token + strlen(token) - 1;
-                    while (end > token && (*end == ' ' || *end == '\t'))
-                        end--;
-                    *(end + 1) = '\0';
-
-                    if (strcmp(token, "all") == 0)
-                        a->action_mask |= (ACTION_LOG_ONLY | ACTION_ALERT_MQTT);
-                    else if (strcmp(token, "alert_mqtt") == 0)
-                        a->action_mask |= ACTION_ALERT_MQTT;
-                    else if (strcmp(token, "log_only") == 0)
-                        a->action_mask |= ACTION_LOG_ONLY;
-                    else
-                        LOG_WARN("config: %s unknown action '%s'", k, token);
-                    token = strtok_r(NULL, ",+", &saveptr);
-                }
-            }
-            if (a->action_mask == 0)
-                a->action_mask = ACTION_LOG_ONLY;
-
-            /* 默认参数 */
-            a->cooldown_ms = 60000;
-            a->window_size = ANOMALY_WINDOW_SIZE;
-
-            cfg->anomaly_count++;
-            LOG_INFO("config: %s field=%s algo=%s th=%.2f act=0x%02x", a->name,
-                     a->field, a->algo == ANOMALY_ZSCORE ? "zscore" : "iforest",
-                     a->zscore_threshold, a->action_mask);
-        }
 
         /* ── 华为云 IoTDA 接入（v1.3.0，T01）── */
         else if (strcmp(k, "platform") == 0) {
@@ -579,40 +371,6 @@ void config_dump(const struct node_config *cfg) {
         }
     }
 
-    LOG_INFO("--- Rules ---");
-    LOG_INFO("rule_count         = %d", cfg->rule_count);
-    for (int i = 0; i < cfg->rule_count; i++) {
-        const struct rule *r = &cfg->rules[i];
-        const char *op_name = "?";
-        switch (r->op) {
-        case OP_GT:
-            op_name = "gt";
-            break;
-        case OP_LT:
-            op_name = "lt";
-            break;
-        case OP_EQ:
-            op_name = "eq";
-            break;
-        case OP_NE:
-            op_name = "ne";
-            break;
-        case OP_OUT:
-            op_name = "outside";
-            break;
-        case OP_RATE:
-            op_name = "rate";
-            break;
-        }
-        if (r->op == OP_OUT) {
-            LOG_INFO("  %s: %s %s [%.2f,%.2f] act=0x%02x", r->name, r->field,
-                     op_name, r->threshold_lo, r->threshold_hi, r->action_mask);
-        } else {
-            LOG_INFO("  %s: %s %s %.2f act=0x%02x", r->name, r->field, op_name,
-                     r->threshold, r->action_mask);
-        }
-    }
-
     LOG_INFO("--- OTA ---");
     LOG_INFO("ota_enabled        = %d", cfg->ota.enabled);
     LOG_INFO("ota_slot_dir       = %s", cfg->ota.slot_dir);
@@ -631,19 +389,6 @@ void config_dump(const struct node_config *cfg) {
     LOG_INFO("http_reboot_token   = %s", cfg->http.reboot_token[0]
                                              ? "(configured)"
                                              : "(unset, /api/reboot rejected)");
-
-    LOG_INFO("--- Anomaly Engine ---");
-    LOG_INFO("anomaly_enabled    = %d", cfg->anomaly_enabled);
-    LOG_INFO("anomaly_count      = %d", cfg->anomaly_count);
-    for (int i = 0; i < cfg->anomaly_count; i++) {
-        const struct anomaly_config *a = &cfg->anoms[i];
-        const char *algo_name = (a->algo == ANOMALY_ZSCORE)    ? "zscore"
-                                : (a->algo == ANOMALY_IFOREST) ? "iforest"
-                                                               : "?";
-        LOG_INFO("  %s: %s %s th=%.2f act=0x%02x cd=%dms win=%d", a->name,
-                 a->field, algo_name, a->zscore_threshold, a->action_mask,
-                 a->cooldown_ms, a->window_size);
-    }
 
     LOG_INFO("--- Huawei IoTDA ---");
     LOG_INFO("platform           = %s", cfg->platform);

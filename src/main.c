@@ -13,7 +13,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "anomaly_engine.h"
 #include "common.h"
 #include "config.h"
 #include "http_server.h"
@@ -22,7 +21,6 @@
 #include "mqtt_client.h"
 #include "ota.h"
 #include "platform.h"        /* T02：平台分发器（publish/告警/下行均经此） */
-#include "rule_engine.h"
 #include "storage.h"
 
 static volatile int g_running = 1;
@@ -156,41 +154,8 @@ static void auto_client_id(struct node_config *cfg,
  * 在线直发与断网补发（upload_thread）共用同一平台路径，topic 一致。
  */
 static void process_sensor_data(const struct sensor_data *data, sensor_source_t source) {
-    const char *src = (source == SOURCE_LOCAL) ? "local" : "modbus";
-
     /* ── Dashboard 数据更新 ── */
     http_server_update_data(data);
-
-    /* ── 规则引擎评估（out 产出结构化告警事件，msg 文本与 v1.2.11 相同）── */
-    char alert_msg[256] = {0}; // 告警消息缓冲区
-    struct alert_event evt;
-    memset(&evt, 0, sizeof(evt));
-    uint8_t actions = rule_engine_evaluate(data, alert_msg, sizeof(alert_msg),
-                                           &evt);
-    if (actions) {
-        LOG_INFO("%s: rule actions triggered: 0x%02x", src, actions);
-
-        /* MQTT 告警上报（经平台；本地平台发 %s/alert 原文本） */
-        if ((actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
-            platform_publish_alert(&g_cfg, &evt);
-        }
-
-    }
-
-    /* ── 异常检测引擎评估  ── */
-    char anomaly_msg[256] = {0};
-    struct alert_event a_evt;
-    memset(&a_evt, 0, sizeof(a_evt));
-    uint8_t a_actions =
-        anomaly_engine_evaluate(data, anomaly_msg, sizeof(anomaly_msg), &a_evt);
-    if (a_actions) {
-        LOG_INFO("%s: anomaly actions triggered: 0x%02x", src, a_actions);
-
-        if ((a_actions & ACTION_ALERT_MQTT) && mqtt_is_connected()) {
-            platform_publish_alert(&g_cfg, &a_evt);
-        }
-
-    }
 
     if (mqtt_is_connected()) {
         platform_publish_data(&g_cfg, data);
@@ -394,25 +359,6 @@ int main(int argc, char *argv[]) {
         LOG_WARN("modbus init failed, modbus module disabled");
     }
 
-    /* 初始化规则引擎 */
-    if (g_cfg.rule_count > 0) {
-        if (rule_engine_init(&g_cfg) != E_OK) {
-            LOG_WARN("rule_engine_init failed");
-        }
-    } else {
-        LOG_INFO("no rules configured, rule engine skipped");
-    }
-
-    /* 初始化异常检测引擎 */
-    if (g_cfg.anomaly_enabled && g_cfg.anomaly_count > 0) {
-        if (anomaly_engine_init(&g_cfg) != E_OK) {
-            LOG_WARN("anomaly_engine_init failed");
-        }
-    } else {
-        LOG_INFO("anomaly engine disabled or no anomaly rules");
-    }
-
-
     /* 初始化 OTA 远程升级*/
     if (g_cfg.ota.enabled) {
         ota_init(&g_cfg.ota, g_cfg.client_id, EMBMQTTNODE_VERSION);
@@ -438,11 +384,11 @@ int main(int argc, char *argv[]) {
         LOG_INFO("ota disabled by config");
     }
 
-    /* 11. 注册信号 */
+    /* 注册信号 */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* 12. 启动线程 */
+    /*启动线程 */
     LOG_INFO("EmbMQTTNode v%s starting...", EMBMQTTNODE_VERSION);
 
     pthread_t tid_upload, tid_modbus = 0, tid_http = 0, tid_ota = 0;
@@ -452,7 +398,7 @@ int main(int argc, char *argv[]) {
         pthread_create(&tid_modbus, NULL, modbus_thread, NULL);
         LOG_INFO("modbus polling thread started");
     }
-    /* P1-10: OTA 状态机独立线程（仅 enabled 时启动） */
+    /* OTA 状态机独立线程（仅 enabled 时启动） */
     if (g_cfg.ota.enabled) {
         pthread_create(&tid_ota, NULL, ota_thread, NULL);
         LOG_INFO("ota worker thread started (500ms poll)");
@@ -477,7 +423,7 @@ int main(int argc, char *argv[]) {
         pthread_join(tid_http, NULL);
     }
 
-    /* 13. 优雅退出 */
+    /* 优雅退出 */
     LOG_INFO("shutting down...");
 
     /* 发布离线状态（经平台层；best-effort，遗嘱消息兜底） */
@@ -488,8 +434,6 @@ int main(int argc, char *argv[]) {
     mqtt_stop_supervisor();
     mqtt_close();
     modbus_master_close();
-    rule_engine_close();
-    anomaly_engine_close();
     ota_close();
     storage_close();
 

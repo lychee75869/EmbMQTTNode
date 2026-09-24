@@ -155,7 +155,7 @@ int modbus_master_init(const struct modbus_config *cfg)
     memcpy(&g_modbus_cfg, cfg, sizeof(*cfg));
 
     if (!cfg->enabled) {
-        LOG_INFO("modbus: disabled by config, using mock mode");
+        LOG_INFO("modbus: disabled by config, please enable modbus in node.conf");
         g_modbus_connected = 0;
         return E_OK;
     }
@@ -203,8 +203,9 @@ int modbus_master_init(const struct modbus_config *cfg)
     return E_OK;
 
 #else
-    /* libmodbus 未编译进项目，自动 mock */
-    LOG_INFO("modbus: BUILD_WITH_MODBUS not set, using mock mode");
+    /* libmodbus 未编译进项目，在modbus使能的情况下自动进入 mock */
+    LOG_INFO("modbus: BUILD_WITH_MODBUS not set, mock provider available "
+         "(requires modbus_enabled=1)");
     g_modbus_connected = 0;
     return E_OK;
 #endif

@@ -17,8 +17,6 @@
 #include "http_server.h"
 #include "storage.h"
 #include "mqtt_client.h"
-#include "rule_engine.h"
-#include "anomaly_engine.h"
 #include "ota.h"
 #include "sensor_fields.h"   /* 字段描述表（单一事实源，docs/12 §3.4） */
 
@@ -319,10 +317,7 @@ static void handle_api_status(int fd)
              "\"mqtt_connected\":%s,"
              "\"modbus_enabled\":%s,"
              "\"ota_enabled\":%s,"
-             "\"ota_state\":\"%s\","
-             "\"rule_count\":%d,"
-             "\"anomaly_enabled\":%s,"
-             "\"anomaly_count\":%d"
+             "\"ota_state\":\"%s\""
              "}",
              g_cfg ? g_cfg->client_id : "unknown",
              EMBMQTTNODE_VERSION,
@@ -330,10 +325,7 @@ static void handle_api_status(int fd)
              mqtt_is_connected() ? "true" : "false",
              (g_cfg && g_cfg->modbus.enabled) ? "true" : "false",
              (g_cfg && g_cfg->ota.enabled) ? "true" : "false",
-             ota_state_string(),
-             g_cfg ? g_cfg->rule_count : 0,
-             (g_cfg && g_cfg->anomaly_enabled) ? "true" : "false",
-             g_cfg ? g_cfg->anomaly_count : 0);
+             ota_state_string());
 
     http_send_json(fd, 200, buf);
 }
@@ -451,109 +443,6 @@ static void handle_api_data_history(int fd, const char *path)
         }
     }
     /* 循环内守卫已保证 pos < cap；用真实剩余空间写 "]"（同越界类收敛） */
-    pos += snprintf(buf + pos, (size_t)(cap - pos), "]");
-
-    http_send_json(fd, 200, buf);
-    free(buf);
-}
-
-/* GET /api/rules */
-static void handle_api_rules(int fd)
-{
-    struct rule_stats stats[RULE_MAX];
-    int n = rule_engine_get_stats(stats, RULE_MAX);
-
-    if (n <= 0) {
-        http_send_json(fd, 200, "[]");
-        return;
-    }
-
-    /* 手动构造 JSON 数组 */
-    int cap = n * 256 + 32;
-    char *buf = malloc((size_t)cap);
-    if (!buf) {
-        http_send_error(fd, 500, "malloc failed");
-        return;
-    }
-
-    /* P2-31：收敛到 T06 守卫写法——旧式固定 256 上限的 snprintf 不感知
-     * malloc 剩余空间（长 name 截断后 pos 仍前进 → 越界写）。
-     * 行为等价：正常数据输出逐字节不变（现有 golden 保等价）。 */
-    int pos = 0;
-    pos += snprintf(buf + pos, 4, "[\n");
-    for (int i = 0; i < n; i++) {
-        if (json_buf_overflow(pos, (size_t)cap)) {
-            free(buf);
-            http_send_error(fd, 500, "payload overflow");
-            return;
-        }
-        pos += snprintf(buf + pos, (size_t)(cap - pos),
-                        "  {\"name\":\"%s\","
-                        "\"trigger_count\":%d,"
-                        "\"last_triggered_ms\":%lld}%s\n",
-                        stats[i].name,
-                        stats[i].trigger_count,
-                        (long long)stats[i].last_triggered,
-                        (i < n - 1) ? "," : "");
-    }
-    if (json_buf_overflow(pos, (size_t)cap)) {
-        free(buf);
-        http_send_error(fd, 500, "payload overflow");
-        return;
-    }
-    pos += snprintf(buf + pos, (size_t)(cap - pos), "]");
-
-    http_send_json(fd, 200, buf);
-    free(buf);
-}
-
-/* GET /api/anomaly */
-static void handle_api_anomaly(int fd)
-{
-    struct anomaly_stats stats[ANOMALY_MAX];
-    int n = anomaly_engine_get_stats(stats, ANOMALY_MAX);
-
-    if (n <= 0) {
-        http_send_json(fd, 200, "[]");
-        return;
-    }
-
-    int cap = n * 320 + 32;
-    char *buf = malloc((size_t)cap);
-    if (!buf) {
-        http_send_error(fd, 500, "malloc failed");
-        return;
-    }
-
-    /* P2-31：同 handle_api_rules，收敛到 T06 json_buf_overflow 守卫写法
-     * （旧式固定 320 上限的 snprintf 不感知剩余空间）。行为等价：
-     * 正常数据输出逐字节不变（现有 golden 保等价）。 */
-    int pos = 0;
-    pos += snprintf(buf + pos, 4, "[\n");
-    for (int i = 0; i < n; i++) {
-        if (json_buf_overflow(pos, (size_t)cap)) {
-            free(buf);
-            http_send_error(fd, 500, "payload overflow");
-            return;
-        }
-        pos += snprintf(buf + pos, (size_t)(cap - pos),
-                        "  {\"name\":\"%s\","
-                        "\"trigger_count\":%d,"
-                        "\"last_triggered_ms\":%lld,"
-                        "\"zscore\":%.4f,"
-                        "\"score\":%.4f}%s\n",
-                        stats[i].name,
-                        stats[i].trigger_count,
-                        (long long)stats[i].last_triggered,
-                        stats[i].current_zscore,
-                        stats[i].current_score,
-                        (i < n - 1) ? "," : "");
-    }
-    if (json_buf_overflow(pos, (size_t)cap)) {
-        free(buf);
-        http_send_error(fd, 500, "payload overflow");
-        return;
-    }
     pos += snprintf(buf + pos, (size_t)(cap - pos), "]");
 
     http_send_json(fd, 200, buf);
@@ -760,18 +649,6 @@ static const char DASHBOARD_HTML[] =
 "    <div class=\"value-row\"><span class=\"label\">最后更新</span><span class=\"val\" id=\"updated\">--</span></div>\n"
 "  </div>\n"
 "\n"
-"  <!-- 异常检测引擎 -->\n"
-"  <div class=\"card\">\n"
-"    <h2>⚠ 异常检测</h2>\n"
-"    <div id=\"anomalies\"><span style=\"color:#778ca3\">未启用或未配置</span></div>\n"
-"  </div>\n"
-"\n"
-"  <!-- 规则引擎 -->\n"
-"  <div class=\"card\">\n"
-"    <h2>🔔 规则引擎</h2>\n"
-"    <div id=\"rules\"><span style=\"color:#778ca3\">无规则配置</span></div>\n"
-"  </div>\n"
-"\n"
 "  <!-- 最近数据趋势 -->\n"
 "  <div class=\"card full-width\">\n"
 "    <h2>📈 温度趋势（最近 60 条）<span class=\"refresh\" id=\"trend_label\"></span></h2>\n"
@@ -804,7 +681,6 @@ static const char DASHBOARD_HTML[] =
 "    $('ver').textContent = d.version;\n"
 "    $('devid').textContent = d.client_id;\n"
 "    $('uptime').textContent = fmtUptime(d.uptime_seconds);\n"
-"    $('rcount').textContent = d.rule_count;\n"
 "    $('ostate').textContent = d.ota_state;\n"
 "    // badges\n"
 "    setBadge('mqtt',  d.mqtt_connected);\n"
@@ -830,30 +706,6 @@ static const char DASHBOARD_HTML[] =
 "    $('updated').textContent = fmtTime(d.timestamp_ms);\n"
 "  } catch(e) { /* silent */ }\n"
 "}\n"
-"\n"
-"// ── 轮询 /api/rules ─────────────────────────────────\n"
-"async function pollRules() {\n"
-"  try {\n"
-"    var r = await fetch('/api/rules');\n"
-"    var arr = await r.json();\n"
-"    if (!arr || arr.length === 0) {\n"
-"      $('rules').innerHTML = '<span style=\"color:#778ca3\">无规则或未配置</span>';\n"
-"      return;\n"
-"    }\n"
-"    var html = '<table><tr><th>规则</th><th>触发次数</th><th>最后触发</th><th>状态</th></tr>';\n"
-"    arr.forEach(function(rule) {\n"
-"      var active = rule.trigger_count > 0 ? 'active':'idle';\n"
-"      var label  = rule.trigger_count > 0 ? '活跃':'空闲';\n"
-"      html += '<tr><td>'+escHtml(rule.name)+'</td><td>'+rule.trigger_count+'</td><td>'\n"
-"           + fmtTime(rule.last_triggered_ms)+'</td>'\n"
-"           + '<td><span class=\"alert-tag '+active+'\">'+label+'</span></td></tr>';\n"
-"    });\n"
-"    html += '</table>';\n"
-"    $('rules').innerHTML = html;\n"
-"  } catch(e) { /* silent */ }\n"
-"}\n"
-"function escHtml(s) { var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }\n"
-"\n"
 "// ── 轮询 /api/data/history ── 温度趋势图 ────────────\n"
 "async function pollTrend() {\n"
 "  try {\n"
@@ -872,28 +724,6 @@ static const char DASHBOARD_HTML[] =
 "    $('chart').innerHTML = html;\n"
 "    $('trend_label').textContent = '范围: '+tmin.toFixed(1)+' ~ '+tmax.toFixed(1)+' °C';\n"
 "  } catch(e) { /* silent */ }\n"
-"}\n"
-"\n"
-"// ── 轮询 /api/anomaly ───────────────────────────────\n"
-"async function pollAnomalies() {\n"
-"  try {\n"
-"    var r = await fetch('/api/anomaly');\n"
-"    var arr = await r.json();\n"
-"    if (!arr || arr.length === 0) {\n"
-"      $('anomalies').innerHTML = '<span style=\"color:#778ca3\">无异常规则或未触发</span>';\n"
-"      return;\n"
-"    }\n"
-"    var html = '<table><tr><th>规则</th><th>触发</th><th>Z-Score</th><th>分数</th><th>状态</th></tr>';\n"
-"    arr.forEach(function(a) {\n"
-"      var active = a.trigger_count > 0 ? 'active':'idle';\n"
-"      var label  = a.trigger_count > 0 ? '⚠ 异常':'✓ 正常';\n"
-"      html += '<tr><td>'+escHtml(a.name)+'</td><td>'+a.trigger_count+'</td>'\n"
-"           + '<td>'+a.zscore.toFixed(2)+'</td><td>'+a.score.toFixed(3)+'</td>'\n"
-"           + '<td><span class=\"alert-tag '+active+'\">'+label+'</span></td></tr>';\n"
-"    });\n"
-"    html += '</table>';\n"
-"    $('anomalies').innerHTML = html;\n"
-"  } catch(e) {}\n"
 "}\n"
 "\n"
 "// ── 定时轮询 ─────────────────────────────────────────\n"
@@ -938,19 +768,6 @@ static void http_dispatch(int fd, const char *method, const char *path,
     if (strcmp(method, "GET") == 0 &&
         strncmp(path, "/api/data/history", 17) == 0) {
         handle_api_data_history(fd, path);
-        return;
-    }
-
-    /* GET /api/rules */
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/rules") == 0) {
-        handle_api_rules(fd);
-        return;
-    }
-
-    /* GET /api/anomaly */
-    if (strcmp(method, "GET") == 0 &&
-        strcmp(path, "/api/anomaly") == 0) {
-        handle_api_anomaly(fd);
         return;
     }
 

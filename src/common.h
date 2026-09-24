@@ -26,8 +26,7 @@
  *        → T02 平台抽象 + local 等价回归 → T03 华为鉴权/属性/事件纯函数
  *        → T04 子设备管理 → T05 命令闭环与集成联调。
  * 不变式：platform=local 路径行为与 v1.2.11 **逐字节等价**（各测试即回归基线）。
- * 历史：v1.2.11 = P1-2 规则/异常引擎共享状态数据竞争修复（两引擎各加静态互斥锁，
- *       evaluate/get_stats 全程持锁，锁内不做 I/O；见 rule_engine.c / anomaly_engine.c）。 */
+ */
 #define EMBMQTTNODE_VERSION "1.4.0"
 
 /* 返回码 */
@@ -129,96 +128,6 @@ struct device_info {
     char    kernel_ver[64];       /* 内核版本 */
     char    cpu_model[128];       /* CPU 型号 */
     int64_t total_mem_kb;         /* 总内存 KB */
-};
-
-/* ─── 规则引擎配置（阶段三）───────────────────────────────── */
-
-#define RULE_MAX            32
-#define RULE_NAME_LEN       32
-#define RULE_FIELD_LEN      32
-#define RULE_ACTION_LEN     64
-
-/* 规则运算符 */
-enum rule_op {
-    OP_GT,       /* >  大于 */
-    OP_LT,       /* <  小于 */
-    OP_EQ,       /* == 等于 */
-    OP_NE,       /* != 不等于 */
-    OP_OUT,  /* 区间外 (值 < lo 或 值 > hi) */
-    OP_RATE,     /* 瞬时变化率超过阈值（单位/秒） */
-};
-
-/* 告警动作位掩码 */
-#define ACTION_LOG_ONLY   0x01
-#define ACTION_ALERT_MQTT 0x02
-
-/* 单条规则定义 */
-struct rule {
-    char        name[RULE_NAME_LEN];
-    char        field[RULE_FIELD_LEN];    /* temperature/humidity/pressure */
-    enum rule_op op;
-    double      threshold;                /* gt/lt/eq/ne/rate 的阈值 */
-    double      threshold_lo;             /* outside 下界 */
-    double      threshold_hi;             /* outside 上界 */
-    uint8_t     action_mask;              /* 触发时执行的动作 */
-    int         cooldown_ms;              /* 冷却时间（防重复告警） */
-    /* ── 运行时状态（内部使用）── */
-    int64_t     last_triggered;           /* 上次触发时间戳 (ms) */
-    /* rate 操作环形缓冲区 */
-    double      rate_history[16];
-    int64_t     rate_timestamps[16];
-    int         rate_head;
-    int         rate_count;
-};
-
-/* 规则引擎统计（供 dashboard 查询） */
-struct rule_stats {
-    char        name[RULE_NAME_LEN]; /*规则名称*/
-    int         trigger_count;      /*触发次数*/
-    int64_t     last_triggered;     /*上次触发时间戳(ms)*/
-};
-
-
-/* ─── 异常检测引擎配置─────────────────────────── */
-
-#define ANOMALY_MAX            16
-#define ANOMALY_WINDOW_SIZE    128
-#define ANOMALY_NAME_LEN       32
-#define ANOMALY_FIELD_LEN      32
-
-/* 异常检测算法 */
-enum anomaly_algo {
-    ANOMALY_ZSCORE  = 0,   /* Z-score 统计方法 */
-    ANOMALY_IFOREST = 1,   /* Isolation Forest 机器学习 */
-};
-
-/* 单条异常检测规则定义 */
-struct anomaly_config {
-    char    name[ANOMALY_NAME_LEN];
-    char    field[ANOMALY_FIELD_LEN];     /* temperature/humidity/pressure */
-    enum anomaly_algo algo;
-    double  zscore_threshold;             /* Z-score 阈值（默认 3.0） */
-    int     window_size;                  /* 滑动窗口大小（最大 128） */
-    uint8_t action_mask;                  /* 触发时执行的动作 */
-    int     cooldown_ms;                  /* 冷却时间 */
-    int     iforest_enabled;              /* Isolation Forest 是否启用 */
-    /* ── 运行时状态（内部使用）── */
-    double  window[ANOMALY_WINDOW_SIZE];
-    int     window_head;
-    int     window_count;
-    double  baseline_mean;
-    double  baseline_std;
-    int64_t last_triggered;
-    int     trigger_count;
-};
-
-/* 异常检测统计（供 dashboard 查询） */
-struct anomaly_stats {
-    char    name[ANOMALY_NAME_LEN];
-    int     trigger_count;
-    int64_t last_triggered;
-    double  current_zscore;               /* 最近一次计算的 z-score */
-    double  current_score;                /* iForest 异常分数 (0-1) */
 };
 
 /* ─── 结构化告警事件（P1-1；docs/12 §3.2）──────────────────
@@ -421,20 +330,11 @@ struct node_config {
     /* Modbus 工业协议 */
     struct modbus_config modbus;
 
-    /* 规则引擎 */
-    int         rule_count;
-    struct rule rules[RULE_MAX];
-
     /* OTA 远程升级 */
     struct ota_config ota;
 
     /* HTTP Dashboard（P1-6）*/
     struct http_config http;
-
-    /* 异常检测引擎 */
-    int         anomaly_enabled;
-    int         anomaly_count;
-    struct      anomaly_config anoms[ANOMALY_MAX];
 
     /* ─── 华为云 IoTDA 平台接入（v1.3.0 适配层，T01）──────────
      * platform=local（缺省）时以下字段全部忽略，行为与 v1.2.11 完全一致。

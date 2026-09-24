@@ -27,8 +27,8 @@ endif
 # 数据改由 Modbus 子设备提供）
 TARGET   = embmqttnode
 SRCS     = main.c config.c storage.c mqtt_client.c \
-            modbus_master.c rule_engine.c ota.c http_server.c \
-            anomaly_engine.c mac_addr.c subdev_registry.c sensor_fields.c \
+            modbus_master.c  ota.c http_server.c \
+            mac_addr.c subdev_registry.c sensor_fields.c \
             platform.c platform_local.c platform_huawei.c \
             platform_huawei_subdev.c platform_huawei_cmd.c
 OBJS     = $(SRCS:.c=.o)

@@ -50,7 +50,6 @@ extern const struct sensor_field SENSOR_FIELDS[SENSOR_FIELD_COUNT];
 
 /*
  * 查表：命中返回条目指针；未命中（含 NULL）返回 NULL。
- * 供 config 加载时校验 rule_N / anomaly_N 的 field 名（fail-closed）。
  */
 const struct sensor_field *sensor_find_field(const char *name);
 

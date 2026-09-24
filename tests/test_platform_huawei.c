@@ -356,10 +356,10 @@ static void test_extract_request_id(void)
 
 static void make_entry(struct subdev_entry *e)
 {
+    /* v1.4.0 网关纯化：SUBDEV_SENSOR 通道移除 → 一律 MODBUS（slave 1） */
     memset(e, 0, sizeof(*e));
-    e->src = SUBDEV_SENSOR;
-    e->slave_id = 0;
-    snprintf(e->sensor_type, sizeof(e->sensor_type), "mock");
+    e->src = SUBDEV_MODBUS;
+    e->slave_id = 1;
     snprintf(e->device_id, sizeof(e->device_id), "sub-0001");
     snprintf(e->name, sizeof(e->name), "Mock-Sensor");
     snprintf(e->service_id, sizeof(e->service_id), "SensorData");

@@ -4,15 +4,16 @@
  *
  * 文件格式（INI 风格，与 config.c 一致：key = value，#/; 注释，[段] 跳过）：
  *   subdevice_N = <data_source>,<source_key>,<device_id>,<name>[,<service_id>]
- *     data_source: sensor | modbus（预留 ble）
- *     source_key : sensor→sensor_type(sht30/ads1115/mock)；modbus→slave_id(1-247)
+ *     data_source: modbus（预留 ble；v1.4.0 网关纯化后 sensor 不再受支持，
+ *                  sensor 条目按 unknown data_source 走 WARN+丢弃兜底）
+ *     source_key : modbus→slave_id(1-247)
  *     device_id  : 平台分配的子设备 deviceID（≤256）
  *     service_id : 可选，缺省 SensorData
  *
  * 校验规则（fail-closed，非法整条丢弃 + WARN）：
  *   - 条数 > SUBDEVICE_MAX(16) → 超出丢弃 + WARN
- *   - data_source ∉ {sensor, modbus} → 丢弃 + WARN
- *   - sensor: source_key 必须是合法 sensor_type；modbus: 1..247 整数 → 否则丢弃
+ *   - data_source ∉ {modbus} → 丢弃 + WARN
+ *   - modbus: source_key 须为 1..247 整数 → 否则丢弃
  *   - device_id 非空、≤256、不含空格与 $ # +（MQTT 通配符）以及
  *     JSON 逸出字符 `"` `\` 与裸控制字符（T05 审计补）→ 否则丢弃
  *   - device_id 全表唯一；(data_source, source_key) 全表唯一 → 重复丢弃
@@ -39,14 +40,6 @@ static char *trim(char *str)
         end--;
     end[1] = '\0';
     return str;
-}
-
-/* 合法 sensor_type（大小写按现有命名：小写） */
-static int valid_sensor_type(const char *t)
-{
-    return strcmp(t, "sht30") == 0 ||
-           strcmp(t, "ads1115") == 0 ||
-           strcmp(t, "mock") == 0;
 }
 
 /* device_id / service_id 的非法字符集：
@@ -126,37 +119,24 @@ int subdev_load(const char *path, struct subdev_entry *out, int max)
         struct subdev_entry e;
         memset(&e, 0, sizeof(e));
 
-        /* ── data_source ── */
-        if (strcmp(ds, "sensor") == 0) {
-            e.src = SUBDEV_SENSOR;
-        } else if (strcmp(ds, "modbus") == 0) {
-            e.src = SUBDEV_MODBUS;
-        } else {
+        /* ── data_source + source_key ──
+         * v1.4.0 网关纯化：sensor 通道移除，sensor 条目落入
+         * unknown data_source 的 WARN+丢弃兜底。 */
+        if (strcmp(ds, "modbus") != 0) {
             LOG_WARN("subdev: '%s' unknown data_source '%s' "
-                     "(sensor|modbus), entry dropped", k, ds);
+                     "(modbus), entry dropped", k, ds);
             continue;
         }
+        e.src = SUBDEV_MODBUS;
 
-        /* ── source_key ── */
-        if (e.src == SUBDEV_SENSOR) {
-            if (!valid_sensor_type(skey)) {
-                LOG_WARN("subdev: '%s' unknown sensor_type '%s' "
-                         "(sht30|ads1115|mock), entry dropped", k, skey);
-                continue;
-            }
-            e.slave_id = 0;
-            strncpy(e.sensor_type, skey, sizeof(e.sensor_type) - 1);
-        } else {
-            char *endp = NULL;
-            long sid_v = strtol(skey, &endp, 10);
-            if (!endp || *endp != '\0' || sid_v < 1 || sid_v > 247) {
-                LOG_WARN("subdev: '%s' modbus slave_id '%s' invalid "
-                         "(need 1-247), entry dropped", k, skey);
-                continue;
-            }
-            e.slave_id = (int)sid_v;
-            e.sensor_type[0] = '\0';
+        char *endp = NULL;
+        long sid_v = strtol(skey, &endp, 10);
+        if (!endp || *endp != '\0' || sid_v < 1 || sid_v > 247) {
+            LOG_WARN("subdev: '%s' modbus slave_id '%s' invalid "
+                     "(need 1-247), entry dropped", k, skey);
+            continue;
         }
+        e.slave_id = (int)sid_v;
 
         /* ── device_id ── */
         size_t dlen = strlen(did);
@@ -190,16 +170,9 @@ int subdev_load(const char *path, struct subdev_entry *out, int max)
         dup = 0;
         for (int i = 0; i < g_count; i++) {
             if (g_entries[i].src != e.src) continue;
-            if (e.src == SUBDEV_SENSOR) {
-                if (strcmp(g_entries[i].sensor_type, e.sensor_type) == 0) {
-                    dup = 1;
-                    break;
-                }
-            } else {
-                if (g_entries[i].slave_id == e.slave_id) {
-                    dup = 1;
-                    break;
-                }
+            if (g_entries[i].slave_id == e.slave_id) {
+                dup = 1;
+                break;
             }
         }
         if (dup) {
@@ -249,13 +222,9 @@ int subdev_load(const char *path, struct subdev_entry *out, int max)
         LOG_INFO("subdev: loaded %d subdevice(s) from %s", g_count, path);
         for (int i = 0; i < g_count; i++) {
             const struct subdev_entry *e = &g_entries[i];
-            if (e->src == SUBDEV_SENSOR)
-                LOG_INFO("  subdev[%d]: sensor/%s -> %s (%s, svc=%s)",
-                         i, e->sensor_type, e->device_id,
-                         e->name, e->service_id);
-            else
-                LOG_INFO("  subdev[%d]: modbus/%d -> %s (%s, svc=%s)",
-                         i, e->slave_id, e->device_id, e->name, e->service_id);
+            LOG_INFO("  subdev[%d]: modbus/%d -> %s (%s, svc=%s)",
+                     i, e->slave_id, e->device_id,
+                     e->name, e->service_id);
         }
     }
 
@@ -281,17 +250,6 @@ const struct subdev_entry *subdev_at(int idx)
 }
 
 /* ─── 查询 ─────────────────────────────────────────────── */
-
-const struct subdev_entry *subdev_find_sensor(const char *sensor_type)
-{
-    if (!sensor_type) return NULL;
-    for (int i = 0; i < g_count; i++) {
-        if (g_entries[i].src == SUBDEV_SENSOR &&
-            strcmp(g_entries[i].sensor_type, sensor_type) == 0)
-            return &g_entries[i];
-    }
-    return NULL;
-}
 
 const struct subdev_entry *subdev_find_modbus(int slave_id)
 {

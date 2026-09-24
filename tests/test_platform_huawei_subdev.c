@@ -39,8 +39,9 @@ static void write_conf(const char *content)
     fclose(f);
 }
 
+/* v1.4.0 网关纯化：SUBDEV_SENSOR 通道移除 → 注册表一律 modbus 条目 */
 #define CONF_2 \
-    "subdevice_1 = sensor,mock,dev-mock-1,MockA\n" \
+    "subdevice_1 = modbus,1,dev-mb-1,MB1\n" \
     "subdevice_2 = modbus,3,dev-mb-3,MB3\n"
 
 /* ─── 发布桩 ───────────────────────────────────────────────── */
@@ -82,7 +83,7 @@ static void test_count_at(void)
     assert(subdev_count() == 2);
     assert(subdev_at(0) != NULL);
     assert(subdev_at(1) != NULL);
-    assert(strcmp(subdev_at(0)->device_id, "dev-mock-1") == 0);
+    assert(strcmp(subdev_at(0)->device_id, "dev-mb-1") == 0);
     assert(strcmp(subdev_at(1)->device_id, "dev-mb-3") == 0);
     assert(subdev_at(-1) == NULL);
     assert(subdev_at(2) == NULL);
@@ -375,7 +376,7 @@ static void test_register_response(void)
 
     const char *topic =
         "$oc/devices/gw-123/sys/gateway/sub_devices/register/response/request_id=abc";
-    const char *resp = "{\"devices\":[{\"device_id\":\"dev-mock-1\",\"status\":\"SUCCESS\"}]}";
+    const char *resp = "{\"devices\":[{\"device_id\":\"dev-mb-1\",\"status\":\"SUCCESS\"}]}";
     platform_huawei_ops.on_message(topic, resp, (int)strlen(resp));
 
     assert(hw_subdev_stat_get(0, &st) == E_OK);

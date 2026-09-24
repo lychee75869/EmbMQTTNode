@@ -3,14 +3,16 @@
  * 子设备注册表解析 + 校验单元测试（v1.3.0 T01，docs/12 §5）
  *
  * 覆盖（fail-closed 校验，非法整条丢弃 + WARN）:
- *   - 合法多条目（sensor/modbus、service_id 缺省/显式、注释/段跳过）
+ *   - 合法多条目（modbus、service_id 缺省/显式、注释/段跳过）
  *   - 条数 > SUBDEVICE_MAX(16) → 超出丢弃
- *   - 非法 data_source / sensor 未知类型 / modbus slave_id 越界(0/248/非数字)
+ *   - 非法 data_source（ble / sensor——v1.4.0 网关纯化后 sensor 通道
+ *     移除，sensor 条目落入 unknown data_source 的 WARN+丢弃兜底）
+ *   - modbus slave_id 越界(0/248/非数字)
  *   - device_id 超长(257) / 含通配符($ # + 空格) / 重复
  *   - (data_source, source_key) 重复
  *   - service_id 非法字符回落缺省 SensorData
  *   - 空文件 / 文件不存在 → 0 条不崩
- *   - 查询接口 subdev_find_sensor / subdev_find_modbus（含未命中 NULL）
+ *   - 查询接口 subdev_find_modbus（含未命中 NULL）
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,43 +41,39 @@ static void test_valid_entries(void)
         "# comment line\n"
         "; another comment\n"
         "[subdevices]\n"
-        "subdevice_1 = sensor,sht30,dev-sht30,SHT30-TempHum\n"
-        "subdevice_2 = sensor,ads1115,dev-adc,ADS1115-ADC,SensorData\n"
-        "subdevice_3 = modbus,1,dev-plc1,PLC-Line1\n"
-        "subdevice_4 = modbus,5,dev-plc5,PLC-Line5,CustomSvc\n");
+        "subdevice_1 = modbus,1,dev-plc1,PLC-Line1\n"
+        "subdevice_2 = modbus,2,dev-plc2,PLC-Line2,SensorData\n"
+        "subdevice_3 = modbus,5,dev-plc5,PLC-Line5,CustomSvc\n"
+        "subdevice_4 = modbus,9,dev-plc9,PLC-Line9\n");
 
     struct subdev_entry out[SUBDEVICE_MAX];
     int n = subdev_load(TMP_CONF, out, SUBDEVICE_MAX);
     assert(n == 4);
 
     /* out 数组回填顺序 = 出现顺序 */
-    assert(out[0].src == SUBDEV_SENSOR);
-    assert(strcmp(out[0].sensor_type, "sht30") == 0);
-    assert(strcmp(out[0].device_id, "dev-sht30") == 0);
-    assert(strcmp(out[0].name, "SHT30-TempHum") == 0);
+    assert(out[0].src == SUBDEV_MODBUS);
+    assert(out[0].slave_id == 1);
+    assert(strcmp(out[0].device_id, "dev-plc1") == 0);
+    assert(strcmp(out[0].name, "PLC-Line1") == 0);
     assert(strcmp(out[0].service_id, "SensorData") == 0);  /* 缺省 */
-    assert(out[0].slave_id == 0);
 
     assert(out[3].src == SUBDEV_MODBUS);
-    assert(out[3].slave_id == 5);
-    assert(strcmp(out[3].device_id, "dev-plc5") == 0);
-    assert(strcmp(out[3].service_id, "CustomSvc") == 0);
-    assert(out[3].sensor_type[0] == '\0');
+    assert(out[3].slave_id == 9);
+    assert(strcmp(out[3].device_id, "dev-plc9") == 0);
+    assert(strcmp(out[3].service_id, "SensorData") == 0);
 
     /* 查询接口 */
-    const struct subdev_entry *e = subdev_find_sensor("sht30");
-    assert(e != NULL && strcmp(e->device_id, "dev-sht30") == 0);
-    e = subdev_find_sensor("ads1115");
-    assert(e != NULL && strcmp(e->device_id, "dev-adc") == 0);
-    e = subdev_find_modbus(1);
+    const struct subdev_entry *e = subdev_find_modbus(1);
     assert(e != NULL && strcmp(e->device_id, "dev-plc1") == 0);
-    assert(strcmp(e->service_id, "SensorData") == 0);
+    e = subdev_find_modbus(2);
+    assert(e != NULL && strcmp(e->device_id, "dev-plc2") == 0);
+    assert(strcmp(e->service_id, "SensorData") == 0);      /* 显式缺省值 */
     e = subdev_find_modbus(5);
     assert(e != NULL && strcmp(e->device_id, "dev-plc5") == 0);
+    assert(strcmp(e->service_id, "CustomSvc") == 0);       /* 显式自定义 */
     /* 未命中 */
-    assert(subdev_find_sensor("co2") == NULL);
     assert(subdev_find_modbus(99) == NULL);
-    assert(subdev_find_sensor(NULL) == NULL);
+    assert(subdev_find_modbus(0) == NULL);
 
     printf("  valid 4 entries + queries: PASS\n");
 }
@@ -103,7 +101,7 @@ static void test_too_many(void)
 }
 
 /* ═══════════════════════════════════════════════════════════
- * 3. 非法 data_source / sensor 未知类型
+ * 3. 非法 data_source（ble / sensorx / sensor）
  * ═══════════════════════════════════════════════════════════ */
 static void test_invalid_source(void)
 {
@@ -116,14 +114,14 @@ static void test_invalid_source(void)
     assert(subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX) == 0);
     printf("  invalid data_source dropped: PASS\n");
 
-    /* sensor 未知类型 */
+    /* v1.4.0 网关纯化：sensor 通道移除——原 sensor 条目一律落入
+     * unknown data_source 的 WARN+丢弃兜底（含原合法 sensor_type） */
     write_conf(
         "subdevice_1 = sensor,sht30,dev-ok,OK\n"
         "subdevice_2 = sensor,co2,dev-co2,CO2\n");
-    assert(subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX) == 1);
-    assert(subdev_find_sensor("sht30") != NULL);
-    assert(subdev_find_sensor("co2") == NULL);
-    printf("  unknown sensor type dropped: PASS\n");
+    assert(subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX) == 0);
+    assert(subdev_count() == 0);
+    printf("  sensor channel removed -> entries dropped: PASS\n");
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -162,15 +160,15 @@ static void test_device_id_length(void)
 
     char buf[1024];
     snprintf(buf, sizeof(buf),
-             "subdevice_1 = sensor,sht30,%s,L256\n"
-             "subdevice_2 = sensor,mock,%s,L257\n",
+             "subdevice_1 = modbus,1,%s,L256\n"
+             "subdevice_2 = modbus,2,%s,L257\n",
              big256, big257);
     write_conf(buf);
 
     int n = subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX);
     assert(n == 1);                          /* 256 保留，257 丢弃 */
-    assert(subdev_find_sensor("sht30") != NULL);
-    assert(subdev_find_sensor("mock") == NULL);
+    assert(subdev_find_modbus(1) != NULL);
+    assert(subdev_find_modbus(2) == NULL);
     printf("  device_id len 256 ok / 257 dropped: PASS\n");
 }
 
@@ -181,16 +179,17 @@ static void test_device_id_illegal_chars(void)
 {
     printf("--- test_device_id_illegal_chars ---\n");
 
+    /* 非法字符条目在 dup 检查前即被丢弃，唯一合法条目不受影响 */
     write_conf(
-        "subdevice_1 = sensor,sht30,dev$bad,S\n"
-        "subdevice_2 = sensor,sht30,dev#bad,S\n"
-        "subdevice_3 = sensor,sht30,dev+bad,S\n"
-        "subdevice_4 = sensor,sht30,dev bad,S\n"
-        "subdevice_5 = sensor,sht30,dev-ok,S\n");
+        "subdevice_1 = modbus,1,dev$bad,S\n"
+        "subdevice_2 = modbus,1,dev#bad,S\n"
+        "subdevice_3 = modbus,1,dev+bad,S\n"
+        "subdevice_4 = modbus,1,dev bad,S\n"
+        "subdevice_5 = modbus,1,dev-ok,S\n");
     int n = subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX);
     assert(n == 1);
-    assert(subdev_find_sensor("sht30") != NULL);
-    assert(strcmp(subdev_find_sensor("sht30")->device_id, "dev-ok") == 0);
+    assert(subdev_find_modbus(1) != NULL);
+    assert(strcmp(subdev_find_modbus(1)->device_id, "dev-ok") == 0);
     printf("  device_id wildcard/space rejected: PASS\n");
 }
 
@@ -203,19 +202,12 @@ static void test_duplicates(void)
 
     /* device_id 全表唯一 */
     write_conf(
-        "subdevice_1 = sensor,sht30,dup-id,First\n"
-        "subdevice_2 = sensor,mock,dup-id,Second\n");
+        "subdevice_1 = modbus,1,dup-id,First\n"
+        "subdevice_2 = modbus,2,dup-id,Second\n");
     assert(subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX) == 1);
     printf("  duplicate device_id dropped: PASS\n");
 
-    /* (data_source, source_key) 全表唯一：两条 sensor,sht30 */
-    write_conf(
-        "subdevice_1 = sensor,sht30,id-a,A\n"
-        "subdevice_2 = sensor,sht30,id-b,B\n");
-    assert(subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX) == 1);
-    printf("  duplicate (sensor,sht30) dropped: PASS\n");
-
-    /* 两条 modbus,1 */
+    /* (data_source, source_key) 全表唯一：两条 modbus,1 */
     write_conf(
         "subdevice_1 = modbus,1,id-a,A\n"
         "subdevice_2 = modbus,1,id-b,B\n");
@@ -230,10 +222,10 @@ static void test_service_id_fallback(void)
 {
     printf("--- test_service_id_fallback ---\n");
 
-    write_conf("subdevice_1 = sensor,sht30,dev-ok,Svc,Bad$Svc\n");
+    write_conf("subdevice_1 = modbus,1,dev-ok,Svc,Bad$Svc\n");
     int n = subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX);
     assert(n == 1);
-    const struct subdev_entry *e = subdev_find_sensor("sht30");
+    const struct subdev_entry *e = subdev_find_modbus(1);
     assert(e != NULL);
     assert(strcmp(e->service_id, "SensorData") == 0);
     printf("  illegal service_id -> SensorData: PASS\n");
@@ -250,7 +242,7 @@ static void test_empty_and_missing(void)
     assert(subdev_load(TMP_CONF, NULL, SUBDEVICE_MAX) == 0);
 
     assert(subdev_load("no_such_file_xyz.conf", NULL, SUBDEVICE_MAX) == 0);
-    assert(subdev_find_sensor("sht30") == NULL);   /* 空表 */
+    assert(subdev_find_modbus(1) == NULL);   /* 空表 */
     printf("  empty/missing file -> 0 (no crash): PASS\n");
 }
 

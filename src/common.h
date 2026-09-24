@@ -28,7 +28,7 @@
  * 不变式：platform=local 路径行为与 v1.2.11 **逐字节等价**（各测试即回归基线）。
  * 历史：v1.2.11 = P1-2 规则/异常引擎共享状态数据竞争修复（两引擎各加静态互斥锁，
  *       evaluate/get_stats 全程持锁，锁内不做 I/O；见 rule_engine.c / anomaly_engine.c）。 */
-#define EMBMQTTNODE_VERSION "1.3.0"
+#define EMBMQTTNODE_VERSION "1.4.0"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败

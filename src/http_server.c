@@ -4,7 +4,7 @@
  *
  * 功能：
  *   - 内嵌 HTML 仪表盘（单页应用，CSS Grid + 原生 JS）
- *   - REST JSON API（status / data / rules / ota）
+ *   - REST JSON API（status / data / ota）
  *   - 传感器数据环形缓冲区（128 条，供 dashboard 历史查询）
  *   - POST /api/reboot 设备重启
  *
@@ -356,8 +356,10 @@ static void handle_api_data_latest(int fd)
         return;
     }
 
-    /* 字段按 SENSOR_FIELDS 表序输出，与 v1.2.11 逐字节一致：
-     * {"temperature":..,"humidity":..,"pressure":..,"timestamp_ms":..} */
+    /* 字段按 SENSOR_FIELDS 表序输出（v1.6.0 起共 6 字段）：
+     * {"temperature":..,"humidity":..,"pressure":..,"soil_moisture":..,
+     *  "water_level":..,"battery_voltage":..,"timestamp_ms":..}
+     * 字段集合/序与本地存储、华为上报同源（单一事实源 SENSOR_FIELDS）。 */
     char buf[320];
     int n = snprintf(buf, sizeof(buf), "{");
     for_each_field(f) {
@@ -413,8 +415,9 @@ static void handle_api_data_history(int fd, const char *path)
             http_send_error(fd, 500, "payload overflow");
             return;
         }
-        /* 字段按 SENSOR_FIELDS 表序输出，逐字节等价于 v1.2.11：
-         *   {"temperature":..,"humidity":..,"pressure":..,"timestamp_ms":..} */
+        /* 字段按 SENSOR_FIELDS 表序输出（v1.6.0 起共 6 字段）：
+         *   {"temperature":..,"humidity":..,"pressure":..,"soil_moisture":..,
+         *    "water_level":..,"battery_voltage":..,"timestamp_ms":..} */
         pos += snprintf(buf + pos, (size_t)(cap - pos), "  {");
         for_each_field(f) {
             if (json_buf_overflow(pos, (size_t)cap)) {
@@ -641,10 +644,17 @@ static const char DASHBOARD_HTML[] =
 "    <div class=\"value-big\" id=\"pres\">--<span class=\"value-unit\">hPa</span></div>\n"
 "  </div>\n"
 "\n"
+"  <!-- 子设备测点（v1.6.2：soil_moisture / water_level / battery_voltage） -->\n"
+"  <div class=\"card\">\n"
+"    <h2>🌱 子设备测点</h2>\n"
+"    <div class=\"value-row\"><span class=\"label\">土壤湿度</span><span class=\"val\" id=\"soil\">--</span></div>\n"
+"    <div class=\"value-row\"><span class=\"label\">水槽水位</span><span class=\"val\" id=\"water\">--</span></div>\n"
+"    <div class=\"value-row\"><span class=\"label\">电池电压</span><span class=\"val\" id=\"batt\">--</span></div>\n"
+"  </div>\n"
+"\n"
 "  <!-- 系统状态 -->\n"
 "  <div class=\"card\">\n"
 "    <h2>📋 系统状态</h2>\n"
-"    <div class=\"value-row\"><span class=\"label\">规则数量</span><span class=\"val\" id=\"rcount\">--</span></div>\n"
 "    <div class=\"value-row\"><span class=\"label\">OTA 状态</span><span class=\"val\" id=\"ostate\">--</span></div>\n"
 "    <div class=\"value-row\"><span class=\"label\">最后更新</span><span class=\"val\" id=\"updated\">--</span></div>\n"
 "  </div>\n"
@@ -671,6 +681,17 @@ static const char DASHBOARD_HTML[] =
 "  s = parseInt(s);\n"
 "  var h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;\n"
 "  return h+'h '+m+'m '+sec+'s';\n"
+"}\n"
+"// 哨兵 SENSOR_VALUE_INVALID(-999.0) / 缺失 / NaN → 视为无效，显示 '--'\n"
+"function validNum(v) {\n"
+"  return v !== null && v !== undefined && !isNaN(v) && v > -900;\n"
+"}\n"
+"function fmtBig(v, digits, unit) {\n"
+"  var s = validNum(v) ? v.toFixed(digits) : '--';\n"
+"  return s + '<span class=\"value-unit\">' + unit + '</span>';\n"
+"}\n"
+"function fmtRow(v, digits, unit) {\n"
+"  return validNum(v) ? (v.toFixed(digits) + ' ' + unit) : '--';\n"
 "}\n"
 "\n"
 "// ── 轮询 /api/status ────────────────────────────────\n"
@@ -700,9 +721,12 @@ static const char DASHBOARD_HTML[] =
 "    var r = await fetch('/api/data/latest');\n"
 "    if (!r.ok) return;\n"
 "    var d = await r.json();\n"
-"    $('temp').innerHTML = d.temperature.toFixed(1) + '<span class=\"value-unit\">°C</span>';\n"
-"    $('hum').innerHTML  = d.humidity.toFixed(1) + '<span class=\"value-unit\">%RH</span>';\n"
-"    $('pres').innerHTML = d.pressure.toFixed(1) + '<span class=\"value-unit\">hPa</span>';\n"
+"    $('temp').innerHTML = fmtBig(d.temperature, 1, '°C');\n"
+"    $('hum').innerHTML  = fmtBig(d.humidity, 1, '%RH');\n"
+"    $('pres').innerHTML = fmtBig(d.pressure, 1, 'hPa');\n"
+"    $('soil').innerHTML = fmtRow(d.soil_moisture, 1, '%');\n"
+"    $('water').innerHTML= fmtRow(d.water_level, 1, '%');\n"
+"    $('batt').innerHTML = fmtRow(d.battery_voltage, 2, 'V');\n"
 "    $('updated').textContent = fmtTime(d.timestamp_ms);\n"
 "  } catch(e) { /* silent */ }\n"
 "}\n"
@@ -727,11 +751,9 @@ static const char DASHBOARD_HTML[] =
 "}\n"
 "\n"
 "// ── 定时轮询 ─────────────────────────────────────────\n"
-"pollStatus(); pollLatest(); pollAnomalies(); pollRules(); pollTrend();\n"
+"pollStatus(); pollLatest(); pollTrend();\n"
 "setInterval(pollStatus, 5000);\n"
 "setInterval(pollLatest, 2000);\n"
-"setInterval(pollAnomalies, 5000);\n"
-"setInterval(pollRules, 5000);\n"
 "setInterval(pollTrend, 10000);\n"
 "</script>\n"
 "</body>\n"

@@ -106,27 +106,67 @@ static double convert_register(const uint16_t *regs, int reg_count,
 
 #endif /* BUILD_WITH_MODBUS */
 
+/* ─── 按从站聚合 ────────────────────────────────────────── */
+
+/*
+ * v1.6.3：把「每寄存器映射一条记录」改为「每从站每轮一条记录」。
+ *
+ * 返回 slave_id 在 data[] 中对应的记录下标：
+ *   - 已存在该从站记录 → 直接返回其下标（同轮多映射填同一记录）；
+ *   - 不存在 → 在尾部新建一条：整条先用 for_each_field 置哨兵
+ *     （与 v1.6.0 纪律一致，新增字段自动纳入），再打 source/source_id/
+ *     timestamp 标记；返回新下标；
+ *   - 已达容量上限（min(max_count, MODBUS_DEVICE_MAX)）→ 返回 -1，
+ *     调用方 WARN + 截断该从站。
+ * 设计要点：新建即标记 source_id，故后续映射可用 source_id 命中同槽；
+ * 实测/真实两路径共用，保证聚合语义一致。
+ */
+static int slave_slot(struct sensor_data *data, int *n, int limit,
+                      int slave_id, int64_t ts_ms)
+{
+    for (int j = 0; j < *n; j++) {
+        if (data[j].source_id == slave_id)
+            return j;
+    }
+    if (*n >= limit)
+        return -1;
+
+    int j = (*n)++;
+    memset(&data[j], 0, sizeof(data[j]));
+    for_each_field(f)
+        sensor_set_field(&data[j], f->name, SENSOR_VALUE_INVALID);
+    data[j].source       = SOURCE_MODBUS;   /* 数据来源 = 从站 */
+    data[j].source_id    = slave_id;        /* 数据源实例 = 从站地址 */
+    data[j].timestamp_ms = ts_ms;           /* 整轮共享同一时间戳 */
+    return j;
+}
+
 /* ─── Mock 模式 ─────────────────────────────────────────── */
 
 /*
  * 模拟模式：生成随机传感器数据（开发阶段无需硬件）
+ * v1.6.3：按从站聚合——同一 slave_id 的多条映射归并为一条记录。
  */
 static int mock_poll(struct sensor_data *data, int max_count)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t ts_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
-    int n = 0;
-    for (int i = 0; i < g_modbus_cfg.reg_count && n < max_count; i++) {
+    int limit = max_count;
+    if (limit > MODBUS_DEVICE_MAX)
+        limit = MODBUS_DEVICE_MAX;   /* acc/data 上限 = 从站数上限 */
+
+    int n = 0;   /* 已聚合的从站记录数 */
+    for (int i = 0; i < g_modbus_cfg.reg_count; i++) {
         struct modbus_reg_map *reg = &g_modbus_cfg.regs[i];
 
-        data[n].timestamp_ms = (int64_t)ts.tv_sec * 1000
-                               + ts.tv_nsec / 1000000;
-        /* v1.6.0：遍历字段表统一置哨兵——新增字段自动纳入，杜绝
-         * 「漏初始化 = 0.0 被上游当有效值上报假数据」。 */
-        for_each_field(f)
-            sensor_set_field(&data[n], f->name, SENSOR_VALUE_INVALID);
-        data[n].source_id   = reg->slave_id;   /* 数据源实例 = 从站地址 */
+        int j = slave_slot(data, &n, limit, reg->slave_id, ts_ms);
+        if (j < 0) {
+            LOG_WARN("modbus: slave %d exceeds max_count(%d), truncated",
+                     reg->slave_id, limit);
+            continue;
+        }
 
         /* 根据 field_name 填入模拟值 */
         double raw;
@@ -139,9 +179,8 @@ static int mock_poll(struct sensor_data *data, int max_count)
         else
             raw = (rand() % 10000) / 100.0;  /* 通用随机值 */
 
-        if (sensor_set_field(&data[n], reg->field_name, raw) != E_OK)
+        if (sensor_set_field(&data[j], reg->field_name, raw) != E_OK)
             LOG_WARN("modbus: unknown field '%s'", reg->field_name);
-        n++;
     }
     return n;
 }
@@ -224,9 +263,14 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
 #ifdef BUILD_WITH_MODBUS
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t ts_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
-    int n = 0;
-    for (int i = 0; i < g_modbus_cfg.reg_count && n < max_count; i++) {
+    int limit = max_count;
+    if (limit > MODBUS_DEVICE_MAX)
+        limit = MODBUS_DEVICE_MAX;   /* data 记录上限 = 从站数上限 */
+
+    int n = 0;   /* 已聚合的从站记录数 */
+    for (int i = 0; i < g_modbus_cfg.reg_count; i++) {
         struct modbus_reg_map *reg = &g_modbus_cfg.regs[i];
 
         /* P1-4: 读取前防御性复查。config 层已对 modbus_reg_N 做过
@@ -260,11 +304,20 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
             continue;
         }
 
+        /* v1.6.3：先建/命中该从站的聚合记录——同一 slave_id 的多条
+         * 映射在本轮共用一条 sensor_data（字段累加），整条先置哨兵。 */
+        int j = slave_slot(data, &n, limit, reg->slave_id, ts_ms);
+        if (j < 0) {
+            LOG_WARN("modbus: slave %d exceeds max_count(%d), truncated",
+                     reg->slave_id, limit);
+            continue;
+        }
+
         /* 设置从站地址 */
         if (modbus_set_slave(g_mb_ctx, reg->slave_id) < 0) {
             LOG_ERROR("modbus: set_slave %d failed: %s",
                       reg->slave_id, modbus_strerror(errno));
-            continue;
+            continue;   /* 该字段保持哨兵，不因此丢弃整个从站记录 */
         }
 
         /* 根据功能码读取 */
@@ -288,7 +341,7 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
             LOG_ERROR("modbus: read slave=%d addr=%d count=%d failed: %s",
                       reg->slave_id, reg->reg_addr,
                       reg->reg_count, modbus_strerror(errno));
-            continue;
+            continue;   /* 该字段保持哨兵，不因此丢弃整个从站记录 */
         }
 
         /* 数据类型转换 */
@@ -298,19 +351,9 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
         /* 物理量转换 */
         double physical = raw * reg->scale + reg->offset;
 
-        /* 填充 sensor_data */
-        memset(&data[n], 0, sizeof(data[n]));
-        data[n].timestamp_ms = (int64_t)ts.tv_sec * 1000
-                               + ts.tv_nsec / 1000000;
-        /* v1.6.0：遍历字段表统一置哨兵（与 mock_poll 同一策略）——
-         * 新字段若不同步初始化会是 0.0，被上游当成有效值上报假数据。 */
-        for_each_field(f)
-            sensor_set_field(&data[n], f->name, SENSOR_VALUE_INVALID);
-        data[n].source_id   = reg->slave_id;   /* 数据源实例 = 从站地址 */
-        if (sensor_set_field(&data[n], reg->field_name, physical) != E_OK)
+        /* 累加进该从站的聚合记录（同轮多映射填同一条） */
+        if (sensor_set_field(&data[j], reg->field_name, physical) != E_OK)
             LOG_WARN("modbus: unknown field '%s'", reg->field_name);
-
-        n++;
     }
     return n;
 #else

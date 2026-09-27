@@ -185,6 +185,63 @@ int main(void)
     }
 
     /* ═════════════════════════════════════════════════════════ */
+    /* v1.6.3：按从站聚合——同一 slave_id 的多条映射归并为一条记录。
+     * 6 条映射共 2 个从站（slave 1 有 5 条、slave 7 有 1 条）
+     * → poll 返回 2（去重后从站数），而非 6（映射数）。 */
+    {
+        struct modbus_config acfg;
+        memset(&acfg, 0, sizeof(acfg));
+        acfg.enabled   = 0;          /* 强制 mock 路径 */
+        acfg.reg_count = 6;
+        static const char *flds[6] = {
+            "soil_moisture", "temperature", "humidity",
+            "water_level",   "battery_voltage", "pressure"
+        };
+        static const int slv[6] = { 1, 1, 1, 1, 1, 7 };
+        for (int i = 0; i < 6; i++) {
+            acfg.regs[i].slave_id = slv[i];
+            strncpy(acfg.regs[i].field_name, flds[i],
+                    sizeof(acfg.regs[i].field_name) - 1);
+        }
+
+        assert(modbus_master_init(&acfg) == E_OK);
+        assert(!modbus_master_is_connected());
+
+        struct sensor_data ad[MODBUS_REG_MAX];
+        memset(ad, 0, sizeof(ad));
+        int acnt = modbus_master_poll(ad, MODBUS_REG_MAX);
+        assert(acnt == 2);                         /* 聚合后 = 从站数 */
+        assert(ad[0].source_id == 1);              /* 首条 = slave 1 */
+        assert(ad[1].source_id == 7);
+        assert(ad[0].source == SOURCE_MODBUS);
+        /* slave 1 的五字段落在同一记录、全部有效 */
+        assert(ad[0].soil_moisture   != SENSOR_VALUE_INVALID);
+        assert(ad[0].temperature     != SENSOR_VALUE_INVALID);
+        assert(ad[0].humidity        != SENSOR_VALUE_INVALID);
+        assert(ad[0].water_level     != SENSOR_VALUE_INVALID);
+        assert(ad[0].battery_voltage != SENSOR_VALUE_INVALID);
+        assert(ad[0].pressure        == SENSOR_VALUE_INVALID); /* slave1 未映射 */
+        /* 同轮所有从站记录共享同一时间戳 */
+        assert(ad[0].timestamp_ms == ad[1].timestamp_ms);
+        /* slave 7 仅 pressure 一条 */
+        assert(ad[1].pressure    != SENSOR_VALUE_INVALID);
+        assert(ad[1].temperature == SENSOR_VALUE_INVALID);
+
+        /* max_count 语义 = 最多容纳的从站数：limit=1 → 只保留首从站 */
+        struct sensor_data one[1];
+        memset(one, 0, sizeof(one));
+        int onecnt = modbus_master_poll(one, 1);
+        assert(onecnt == 1);
+        assert(one[0].source_id == 1);
+        assert(one[0].soil_moisture != SENSOR_VALUE_INVALID);
+
+        modbus_master_close();
+        printf("  per-slave aggregation: 6 maps -> 2 records: PASS\n");
+        printf("  aggregated fields share one record + one ts: PASS\n");
+        printf("  max_count = slave count (truncate on overflow): PASS\n");
+    }
+
+    /* ═════════════════════════════════════════════════════════ */
     /* v1.3.0 P2-28：subdev_offline_sec 解析期钳制。
      * 0 / 负数 / typo（atoi 得 0）→ 回退缺省 30；超上限 86400 → 钳回；
      * 正常区间（含两侧边界 30 / 86400）原样通过。 */

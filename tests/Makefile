@@ -13,8 +13,10 @@ ifeq ($(BUILD_WITH_MODBUS),1)
     LDFLAGS += -lmodbus
 endif
 
-# v1.4.0 网关纯化：移除 test_sensor（板载采集层删除，数据改由 Modbus 提供）。
-TESTS   = test_storage test_modbus_config test_rule_engine test_ota test_anomaly_engine test_mac_addr test_mqtt_client test_subdev_registry test_sensor_fields test_platform_local test_platform_huawei test_platform_huawei_subdev test_platform_huawei_cmd
+TESTS   = test_storage test_modbus_config test_ota test_mac_addr \
+         test_mqtt_client test_subdev_registry test_sensor_fields \
+         test_platform_local test_platform_huawei test_platform_huawei_subdev \
+         test_platform_huawei_cmd
 
 .PHONY: all clean distclean
 
@@ -33,29 +35,17 @@ test_modbus_config: test_modbus_config.c ../src/config.c ../src/modbus_master.c 
 test_subdev_registry: test_subdev_registry.c ../src/subdev_registry.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
-# v1.3.0 T06：rule_engine.c / config.c 依赖字段描述表 → 链接 sensor_fields.c
-test_rule_engine: test_rule_engine.c ../src/rule_engine.c ../src/config.c \
-                  ../src/sensor_fields.c
-	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
-
 # v1.3.0 T06：config.c 依赖字段描述表 → 链接 sensor_fields.c
 test_ota: test_ota.c ../src/ota.c ../src/config.c ../src/sensor_fields.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS) -lcrypto -lssl
 
-# v1.3.0 T06：anomaly_engine.c / config.c 依赖字段描述表 → 链接 sensor_fields.c
-test_anomaly_engine: test_anomaly_engine.c ../src/anomaly_engine.c \
-                     ../src/config.c ../src/sensor_fields.c
-	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
-
 test_mac_addr: test_mac_addr.c ../src/mac_addr.c
 	$(CC) $(CFLAGS) -MMD -MP $^ -o $@ $(LDFLAGS)
 
-# P1-13/P2-19: mqtt_client 回调调度 + 主题构造单测。
 # v1.2.9 P1-9/P1-6: 追加 payload 构造器（mqtt_build_*_payload）与
 # 常量时间 token 比较（http_consttime_token_equal，位于 http_server.c）
-# 的用例——链接 http_server.c 及其依赖（storage/rule_engine/
-# anomaly_engine/ota），不触碰真实网络；-lmosquitto 仅为解析
-# mqtt_client.c 其余符号。
+# 的用例——链接 http_server.c 及其依赖（storage/ota），不触碰真实网络；
+# -lmosquitto 仅为解析 mqtt_client.c 其余符号。
 # v1.3.0 T02：mqtt_client.c 的 on_message/on_connect 改走平台分发器
 # （platform_dispatch_message / platform_on_connected / platform_on_disconnected
 # / platform_connect_params），故追加链接 platform.c + platform_local.c
@@ -67,8 +57,7 @@ test_mac_addr: test_mac_addr.c ../src/mac_addr.c
 # sensor_fields.c（builders 字段表）、-lcrypto（HMAC）已在链上。
 # v1.3.0 T05：platform_huawei_subdev.c 现引用 hw_cmd_handle → 追加
 # platform_huawei_cmd.c（其依赖 ota.c/platform_huawei.c 均已在链上）。
-test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c ../src/http_server.c \
-                  ../src/storage.c ../src/rule_engine.c ../src/anomaly_engine.c \
+test_mqtt_client: test_mqtt_client.c ../src/mqtt_client.c ../src/http_server.c ../src/storage.c  \
                   ../src/ota.c ../src/sensor_fields.c ../src/platform.c \
                   ../src/platform_local.c ../src/platform_huawei.c \
                   ../src/platform_huawei_subdev.c ../src/platform_huawei_cmd.c \

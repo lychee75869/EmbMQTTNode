@@ -168,8 +168,20 @@ int main(void)
         assert(md[0].pressure == SENSOR_VALUE_INVALID);
         assert(md[1].temperature == SENSOR_VALUE_INVALID);
         assert(md[1].humidity == SENSOR_VALUE_INVALID);
+
+        /* v1.6.0「未映射字段恒为哨兵」：partial 映射（reg[0]=temperature /
+         * reg[1]=pressure）下，表尾新增的 soil_moisture / water_level /
+         * battery_voltage 三项必须为哨兵——mock_poll 现走 for_each_field
+         * 统一置哨兵，杜绝新增字段漏初始化成 0.0 被上游当有效值上报假数据。 */
+        assert(md[0].soil_moisture   == SENSOR_VALUE_INVALID);
+        assert(md[0].water_level     == SENSOR_VALUE_INVALID);
+        assert(md[0].battery_voltage == SENSOR_VALUE_INVALID);
+        assert(md[1].soil_moisture   == SENSOR_VALUE_INVALID);
+        assert(md[1].water_level     == SENSOR_VALUE_INVALID);
+        assert(md[1].battery_voltage == SENSOR_VALUE_INVALID);
         modbus_master_close();
         printf("  modbus mock sentinel + source_id: PASS\n");
+        printf("  unmapped new fields always sentinel (v1.6.0): PASS\n");
     }
 
     /* ═════════════════════════════════════════════════════════ */

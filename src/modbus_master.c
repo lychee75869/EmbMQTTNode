@@ -122,9 +122,10 @@ static int mock_poll(struct sensor_data *data, int max_count)
 
         data[n].timestamp_ms = (int64_t)ts.tv_sec * 1000
                                + ts.tv_nsec / 1000000;
-        data[n].temperature = SENSOR_VALUE_INVALID;   /* 未映射字段 = 无效值 */
-        data[n].humidity    = SENSOR_VALUE_INVALID;
-        data[n].pressure    = SENSOR_VALUE_INVALID;
+        /* v1.6.0：遍历字段表统一置哨兵——新增字段自动纳入，杜绝
+         * 「漏初始化 = 0.0 被上游当有效值上报假数据」。 */
+        for_each_field(f)
+            sensor_set_field(&data[n], f->name, SENSOR_VALUE_INVALID);
         data[n].source_id   = reg->slave_id;   /* 数据源实例 = 从站地址 */
 
         /* 根据 field_name 填入模拟值 */
@@ -301,9 +302,10 @@ int modbus_master_poll(struct sensor_data *data, int max_count)
         memset(&data[n], 0, sizeof(data[n]));
         data[n].timestamp_ms = (int64_t)ts.tv_sec * 1000
                                + ts.tv_nsec / 1000000;
-        data[n].temperature = SENSOR_VALUE_INVALID;
-        data[n].humidity    = SENSOR_VALUE_INVALID;
-        data[n].pressure    = SENSOR_VALUE_INVALID;
+        /* v1.6.0：遍历字段表统一置哨兵（与 mock_poll 同一策略）——
+         * 新字段若不同步初始化会是 0.0，被上游当成有效值上报假数据。 */
+        for_each_field(f)
+            sensor_set_field(&data[n], f->name, SENSOR_VALUE_INVALID);
         data[n].source_id   = reg->slave_id;   /* 数据源实例 = 从站地址 */
         if (sensor_set_field(&data[n], reg->field_name, physical) != E_OK)
             LOG_WARN("modbus: unknown field '%s'", reg->field_name);

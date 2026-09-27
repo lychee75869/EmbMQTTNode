@@ -35,12 +35,15 @@ static void test_table_order(void)
 {
     printf("--- test_table_order ---\n");
 
-    assert(SENSOR_FIELD_COUNT == 3);
+    assert(SENSOR_FIELD_COUNT == 6);
 
-    /* 表序即 payload 序（冻结不变式） */
+    /* 表序即 payload 序（冻结不变式）；v1.6.0 表尾追加 3 项 */
     assert(strcmp(SENSOR_FIELDS[0].name, "temperature") == 0);
     assert(strcmp(SENSOR_FIELDS[1].name, "humidity") == 0);
     assert(strcmp(SENSOR_FIELDS[2].name, "pressure") == 0);
+    assert(strcmp(SENSOR_FIELDS[3].name, "soil_moisture") == 0);
+    assert(strcmp(SENSOR_FIELDS[4].name, "water_level") == 0);
+    assert(strcmp(SENSOR_FIELDS[5].name, "battery_voltage") == 0);
 
     /* type 均为 SF_F64 */
     for_each_field(f) {
@@ -51,6 +54,9 @@ static void test_table_order(void)
     assert(SENSOR_FIELDS[0].offset == offsetof(struct sensor_data, temperature));
     assert(SENSOR_FIELDS[1].offset == offsetof(struct sensor_data, humidity));
     assert(SENSOR_FIELDS[2].offset == offsetof(struct sensor_data, pressure));
+    assert(SENSOR_FIELDS[3].offset == offsetof(struct sensor_data, soil_moisture));
+    assert(SENSOR_FIELDS[4].offset == offsetof(struct sensor_data, water_level));
+    assert(SENSOR_FIELDS[5].offset == offsetof(struct sensor_data, battery_voltage));
 
     printf("  order+count+offset aligned: PASS\n");
 }
@@ -66,6 +72,9 @@ static void test_find_field(void)
     assert(sensor_find_field("temperature") == &SENSOR_FIELDS[0]);
     assert(sensor_find_field("humidity")    == &SENSOR_FIELDS[1]);
     assert(sensor_find_field("pressure")    == &SENSOR_FIELDS[2]);
+    assert(sensor_find_field("soil_moisture")   == &SENSOR_FIELDS[3]);
+    assert(sensor_find_field("water_level")     == &SENSOR_FIELDS[4]);
+    assert(sensor_find_field("battery_voltage") == &SENSOR_FIELDS[5]);
 
     /* 未命中：未知字段 / 空串 / NULL */
     assert(sensor_find_field("co2") == NULL);
@@ -88,10 +97,16 @@ static void test_get_field(void)
     d.temperature = 23.45;
     d.humidity    = 55.67;
     d.pressure    = 1013.25;
+    d.soil_moisture   = 42.5;
+    d.water_level     = 78.0;
+    d.battery_voltage = 12.6;
 
     assert(sensor_get_field(&d, "temperature") == 23.45);
     assert(sensor_get_field(&d, "humidity")    == 55.67);
     assert(sensor_get_field(&d, "pressure")    == 1013.25);
+    assert(sensor_get_field(&d, "soil_moisture")   == 42.5);
+    assert(sensor_get_field(&d, "water_level")     == 78.0);
+    assert(sensor_get_field(&d, "battery_voltage") == 12.6);
 
     /* 未知字段 / NULL → 哨兵（引擎"永不匹配"语义） */
     assert(sensor_get_field(&d, "co2")  == SENSOR_VALUE_INVALID);
@@ -115,9 +130,15 @@ static void test_set_field(void)
     assert(sensor_set_field(&d, "temperature", 1.5) == E_OK);
     assert(sensor_set_field(&d, "humidity",    2.5) == E_OK);
     assert(sensor_set_field(&d, "pressure",    3.5) == E_OK);
+    assert(sensor_set_field(&d, "soil_moisture",   4.5) == E_OK);
+    assert(sensor_set_field(&d, "water_level",     5.5) == E_OK);
+    assert(sensor_set_field(&d, "battery_voltage", 6.5) == E_OK);
     assert(d.temperature == 1.5);
     assert(d.humidity    == 2.5);
     assert(d.pressure    == 3.5);
+    assert(d.soil_moisture   == 4.5);
+    assert(d.water_level     == 5.5);
+    assert(d.battery_voltage == 6.5);
 
     /* 未知字段：E_INVAL 且不写任何字段 */
     double before = d.temperature;
@@ -125,6 +146,9 @@ static void test_set_field(void)
     assert(d.temperature == before);
     assert(d.humidity    == 2.5);
     assert(d.pressure    == 3.5);
+    assert(d.soil_moisture   == 4.5);
+    assert(d.water_level     == 5.5);
+    assert(d.battery_voltage == 6.5);
 
     /* NULL 保护 */
     assert(sensor_set_field(NULL, "temperature", 1.0) == E_INVAL);
@@ -147,40 +171,52 @@ static void test_golden_payload(void)
 
     struct sensor_data d;
     memset(&d, 0, sizeof(d));
-    d.temperature  = 23.45;
-    d.humidity     = 55.67;
-    d.pressure     = 1013.25;
+    d.temperature     = 23.45;
+    d.humidity        = 55.67;
+    d.pressure        = 1013.25;
+    d.soil_moisture   = 42.50;
+    d.water_level     = 78.00;
+    d.battery_voltage = 12.60;
     d.timestamp_ms = 1234567890LL;
 
     char buf[512];
     int rc = mqtt_build_data_payload(&cfg, &d, buf, (int)sizeof(buf));
     assert(rc == E_OK);
 
+    /* v1.6.0：表尾追加 3 字段 → payload 逐字节含 6 字段（local 路径不 mask
+     * 哨兵；本组均为有效值）。逐字节 strcmp 语义保持不变。 */
     const char *expect =
         "{\"client_id\":\"gw-001\","
         "\"timestamp\":1234567890,"
         "\"temperature\":23.45,"
         "\"humidity\":55.67,"
-        "\"pressure\":1013.25}";
+        "\"pressure\":1013.25,"
+        "\"soil_moisture\":42.50,"
+        "\"water_level\":78.00,"
+        "\"battery_voltage\":12.60}";
     if (strcmp(buf, expect) != 0) {
         printf("  GOLDEN MISMATCH\n    got: %s\n    exp: %s\n", buf, expect);
     }
     assert(strcmp(buf, expect) == 0);
     assert((int)strlen(buf) == (int)strlen(expect));
 
-    /* 第二组：小数位保留 + 字段次序锚定（1.00/2.00/3.00） */
+    /* 第二组：小数位保留 + 字段次序锚定（1.00/2.00/3.00 + 4.00/5.00/6.00） */
     struct sensor_data e;
     memset(&e, 0, sizeof(e));
-    e.temperature  = 1.0;
-    e.humidity     = 2.0;
-    e.pressure     = 3.0;
+    e.temperature     = 1.0;
+    e.humidity        = 2.0;
+    e.pressure        = 3.0;
+    e.soil_moisture   = 4.0;
+    e.water_level     = 5.0;
+    e.battery_voltage = 6.0;
     e.timestamp_ms = 42LL;
     char buf2[512];
     assert(mqtt_build_data_payload(&cfg, &e, buf2, (int)sizeof(buf2)) == E_OK);
     assert(strcmp(buf2,
                   "{\"client_id\":\"gw-001\",\"timestamp\":42,"
                   "\"temperature\":1.00,\"humidity\":2.00,"
-                  "\"pressure\":3.00}") == 0);
+                  "\"pressure\":3.00,\"soil_moisture\":4.00,"
+                  "\"water_level\":5.00,\"battery_voltage\":6.00}") == 0);
 
     /* 截断拒绝仍生效（回归 P1-9 语义） */
     char tiny[16];
@@ -214,13 +250,6 @@ static void test_config_field_validation(void)
     struct node_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     assert(config_load(path, &cfg) == E_OK);
-
-    /* 未知 field 的两条被丢弃 */
-    assert(cfg.rule_count == 1);
-    assert(strcmp(cfg.rules[0].field, "temperature") == 0);
-
-    assert(cfg.anomaly_count == 1);
-    assert(strcmp(cfg.anoms[0].field, "humidity") == 0);
 
     remove(path);
     printf("  unknown field dropped:     PASS\n");

@@ -20,23 +20,27 @@
 /*
  * 字段表条目数（编译期常量）。
  *
- * 【表序不变式】SENSOR_FIELDS 的数组序 == v1.2.11 payload 序列化序
- * （temperature, humidity, pressure）。变更表序即破坏 local 路径逐字节
- * 基线——新增字段只许【追加表尾】，严禁插入/重排。
+ * 【表序不变式】SENSOR_FIELDS 的数组序 == payload 序列化序
+ * （temperature, humidity, pressure, soil_moisture, water_level,
+ *   battery_voltage）。变更表序即破坏 local 路径逐字节基线——新增字段只许
+ * 【追加表尾】，严禁插入/重排。
  *
  * 说明：消费侧 TU 只可见 `extern` 不完全数组类型，无法对之求
  * sizeof(SENSOR_FIELDS)（C 语言 sizeof 需完整类型），故此处显式给出
  * 常量，并在 sensor_fields.c 内以 _Static_assert 守卫其与表实际尺寸一致
  * （与设计 §3.4.1 的 sizeof 宏语义等价）。
  */
-#define SENSOR_FIELD_COUNT 3
+/* 新增字段只许追加表尾（append-only）：不得插入/重排既有条目。 */
+#define SENSOR_FIELD_COUNT 6
 
 enum sensor_field_type {
     SF_F64 = 0,   /* double 字段；预留 SF_I64 / SF_STR */
 };
 
 struct sensor_field {
-    const char             *name;   /* "temperature" / "humidity" / "pressure" */
+    const char             *name;   /* "temperature" / "humidity" / "pressure" /
+                                     * "soil_moisture" / "water_level" /
+                                     * "battery_voltage"（新增字段只许追加表尾） */
     size_t                  offset; /* offsetof(struct sensor_data, x) */
     enum sensor_field_type  type;
 };

@@ -175,11 +175,14 @@ static void test_publish_data_contract(void)
     assert(g_pub_calls == 0);
     printf("  SOURCE_LOCAL unmatched -> E_OK, no publish: PASS\n");
 
-    /* 全空（三字段哨兵，modbus slave 3 命中）→ E_OK + empty_skip_cnt++ */
+    /* 全空（六字段哨兵，modbus slave 3 命中）→ E_OK + empty_skip_cnt++ */
     d.source = SOURCE_MODBUS; d.source_id = 3;
     d.temperature = SENSOR_VALUE_INVALID;
     d.humidity    = SENSOR_VALUE_INVALID;
     d.pressure    = SENSOR_VALUE_INVALID;
+    d.soil_moisture   = SENSOR_VALUE_INVALID;
+    d.water_level     = SENSOR_VALUE_INVALID;
+    d.battery_voltage = SENSOR_VALUE_INVALID;
     assert(platform_huawei_ops.publish_data(&cfg, &d) == E_OK);
     {
         struct hw_subdev_stat st;

@@ -454,6 +454,8 @@ static void test_build_batch_report(void)
     struct sensor_data d;
     memset(&d, 0, sizeof(d));
     d.temperature = 12.34; d.humidity = 56.78; d.pressure = 1013.25;
+    /* v1.6.0：表尾新增三字段——全部有效，参与 batch 上报 */
+    d.soil_moisture = 45.60; d.water_level = 78.90; d.battery_voltage = 12.34;
     d.timestamp_ms = 1694793600000LL;   /* 2023-09-15T16:00:00Z */
 
     char buf[512];
@@ -463,24 +465,37 @@ static void test_build_batch_report(void)
     assert(strstr(buf, "\"temperature\":12.34") != NULL);
     assert(strstr(buf, "\"humidity\":56.79") != NULL || strstr(buf, "\"humidity\":56.78") != NULL);
     assert(strstr(buf, "\"pressure\":1013.25") != NULL);
+    assert(strstr(buf, "\"soil_moisture\":45.60") != NULL);
+    assert(strstr(buf, "\"water_level\":78.90") != NULL);
+    assert(strstr(buf, "\"battery_voltage\":12.34") != NULL);
     assert(strstr(buf, "\"event_time\":\"20230915T160000Z\"") != NULL);
     printf("  all-valid batch + event_time: PASS\n");
 
-    /* mask：pressure 无效 → 整体省略 */
+    /* mask：pressure 无效 → 整体省略（新增字段不受影响） */
     d.pressure = SENSOR_VALUE_INVALID;
     assert(hw_build_batch_report(&e, &d, buf, sizeof(buf)) == E_OK);
     assert(strstr(buf, "pressure") == NULL);
     assert(strstr(buf, "\"temperature\":12.34") != NULL);
     printf("  sentinel field omitted (mask): PASS\n");
 
-    /* 三字段全空 → E_NOT_FOUND */
+    /* v1.6.0：新增字段同样受 mask 语义约束（soil_moisture 无效 → 省略） */
+    d.soil_moisture = SENSOR_VALUE_INVALID;
+    assert(hw_build_batch_report(&e, &d, buf, sizeof(buf)) == E_OK);
+    assert(strstr(buf, "soil_moisture") == NULL);
+    assert(strstr(buf, "\"water_level\":78.90") != NULL);
+    printf("  v1.6.0 field mask (soil_moisture omitted): PASS\n");
+
+    /* 六字段全空 → E_NOT_FOUND */
     d.temperature = SENSOR_VALUE_INVALID;
     d.humidity = SENSOR_VALUE_INVALID;
+    d.water_level = SENSOR_VALUE_INVALID;
+    d.battery_voltage = SENSOR_VALUE_INVALID;
     assert(hw_build_batch_report(&e, &d, buf, sizeof(buf)) == E_NOT_FOUND);
     printf("  all-invalid -> E_NOT_FOUND: PASS\n");
 
     /* 截断 → E_IO；防御 */
     d.temperature = 1.0; d.humidity = 2.0; d.pressure = 3.0;
+    d.soil_moisture = 4.0; d.water_level = 5.0; d.battery_voltage = 6.0;
     assert(hw_build_batch_report(&e, &d, buf, 16) == E_IO);
     assert(hw_build_batch_report(NULL, &d, buf, sizeof(buf)) == E_INVAL);
     assert(hw_build_batch_report(&e, NULL, buf, sizeof(buf)) == E_INVAL);

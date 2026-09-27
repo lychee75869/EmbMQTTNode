@@ -34,6 +34,9 @@ int main(void)
         data[i].temperature = 20.0 + i;
         data[i].humidity = 50.0 + i;
         data[i].pressure = 1010.0 + i;
+        data[i].soil_moisture = 40.0 + i;
+        data[i].water_level = 80.0 + i;
+        data[i].battery_voltage = 12.0 + i;
         data[i].timestamp_ms = 1000 + i;
         data[i].source = SOURCE_LOCAL;
         assert(storage_save(&data[i], SOURCE_LOCAL, "test-client") == E_OK);
@@ -51,6 +54,10 @@ int main(void)
         assert(out[i].temperature == 20.0 + i);
         assert(out[i].humidity == 50.0 + i);
         assert(out[i].pressure == 1010.0 + i);
+        /* v1.6.0：新增列 pending 往返 */
+        assert(out[i].soil_moisture == 40.0 + i);
+        assert(out[i].water_level == 80.0 + i);
+        assert(out[i].battery_voltage == 12.0 + i);
     }
 
     /* ── 3. 逐条按 id 删除 → 0 条 ── */
@@ -68,6 +75,9 @@ int main(void)
     d_local.temperature = 25.0;
     d_local.humidity = 60.0;
     d_local.pressure = 1000.0;
+    d_local.soil_moisture = 41.0;
+    d_local.water_level = 81.0;
+    d_local.battery_voltage = 13.0;
     d_local.timestamp_ms = 2000;
     d_local.source = SOURCE_LOCAL;
     d_local.source_id = 0;              /* 本地传感器恒 0 */
@@ -77,6 +87,9 @@ int main(void)
     d_modbus.temperature = 30.0;
     d_modbus.humidity = 70.0;
     d_modbus.pressure = 1020.0;
+    d_modbus.soil_moisture = 42.0;
+    d_modbus.water_level = 82.0;
+    d_modbus.battery_voltage = 14.0;
     d_modbus.timestamp_ms = 2001;
     d_modbus.source = SOURCE_MODBUS;
     d_modbus.source_id = 5;             /* Modbus slave_id */
@@ -88,6 +101,13 @@ int main(void)
     assert(mixed_out[1].source == SOURCE_MODBUS);
     assert(mixed_out[0].temperature == 25.0);
     assert(mixed_out[1].temperature == 30.0);
+    /* 新增列混源往返（v1.6.0） */
+    assert(mixed_out[0].soil_moisture == 41.0);
+    assert(mixed_out[0].water_level == 81.0);
+    assert(mixed_out[0].battery_voltage == 13.0);
+    assert(mixed_out[1].soil_moisture == 42.0);
+    assert(mixed_out[1].water_level == 82.0);
+    assert(mixed_out[1].battery_voltage == 14.0);
     /* source_id 读写回环（v1.3.0 T01） */
     assert(mixed_out[0].source_id == 0);
     assert(mixed_out[1].source_id == 5);
@@ -131,9 +151,23 @@ int main(void)
         assert(legacy_out[0].timestamp_ms == 42);
         assert(legacy_out[0].source == SOURCE_LOCAL);
         assert(legacy_out[0].source_id == 0);   /* 迁移列 DEFAULT 0 */
+        /* 旧行原有三列不丢数据 */
+        assert(legacy_out[0].temperature == 1.0);
+        assert(legacy_out[0].humidity == 2.0);
+        assert(legacy_out[0].pressure == 3.0);
+        /* v1.6.0：新增三列迁移 DEFAULT = 哨兵（旧库历史行无该项读数，
+         * 迁移后按"无效值"处理，不被当有效值上报假数据） */
+        assert(legacy_out[0].soil_moisture   == SENSOR_VALUE_INVALID);
+        assert(legacy_out[0].water_level     == SENSOR_VALUE_INVALID);
+        assert(legacy_out[0].battery_voltage == SENSOR_VALUE_INVALID);
         printf("  legacy DB ALTER add source_id: PASS\n");
+        printf("  legacy DB ALTER add measurement cols (default sentinel): PASS\n");
     }
+    /* 迁移幂等：已迁移库再次 init 不得报错 */
     storage_close();
+    assert(storage_init("test_legacy.db") == E_OK);
+    storage_close();
+    printf("  migration idempotent (re-init ok): PASS\n");
     remove("test_legacy.db");
 
     printf("storage test passed\n");

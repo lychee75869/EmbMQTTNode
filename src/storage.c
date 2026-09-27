@@ -10,6 +10,10 @@
  *   - storage_get_pending 返回 id + source，供补发线程精确删除与选择 topic
  *   - 新增 storage_delete_by_id：按主键精确删单条（发布成功才删，失败保留重试）
  *   - storage_delete_sent 保留为 legacy 接口，main.c 不再调用
+ *
+ * v1.6.0（字段扩展）：sensor_data 表增加 soil_moisture / water_level /
+ *   battery_voltage 三列（REAL，默认哨兵 -999.0），含旧库 ALTER TABLE 迁移；
+ *   INSERT / SELECT（含 storage_get_pending 回填）同步。
  */
 #include "storage.h"
 #include <sqlite3.h>
@@ -26,6 +30,9 @@ static pthread_mutex_t g_db_mutex = PTHREAD_MUTEX_INITIALIZER;
     "    temperature REAL NOT NULL," \
     "    humidity REAL NOT NULL," \
     "    pressure REAL NOT NULL," \
+    "    soil_moisture REAL NOT NULL DEFAULT -999.0," \
+    "    water_level REAL NOT NULL DEFAULT -999.0," \
+    "    battery_voltage REAL NOT NULL DEFAULT -999.0," \
     "    source TEXT NOT NULL DEFAULT 'local'," \
     "    source_id INTEGER NOT NULL DEFAULT 0" \
     ");"
@@ -39,6 +46,47 @@ static pthread_mutex_t g_db_mutex = PTHREAD_MUTEX_INITIALIZER;
  * 不引入通用迁移框架（PRAGMA user_version + 幂等 ALTER 清单，列 P2）。 */
 #define SQL_MIGRATE_ADD_SOURCE_ID \
     "ALTER TABLE sensor_data ADD COLUMN source_id INTEGER NOT NULL DEFAULT 0"
+
+/* v1.6.0：旧库的表没有土壤湿度/水位/电池电压三列，需要 ALTER TABLE 逐列补列。
+ * 复用 source / source_id 的 try-ALTER 容错模板（探列失败才 ALTER，幂等）。
+ * 默认值取哨兵 -999.0（== common.h 的 SENSOR_VALUE_INVALID）：旧库历史行从未
+ * 采集过这三项，迁移后按"无效值"语义处理（huawei builder 整体省略，不被当成
+ * 有效值上报假数据）。注意：若 SENSOR_VALUE_INVALID 常量变更，此处三处 DEFAULT
+ * 必须同步。 */
+#define SQL_MIGRATE_ADD_SOIL_MOISTURE \
+    "ALTER TABLE sensor_data ADD COLUMN soil_moisture REAL NOT NULL DEFAULT -999.0"
+#define SQL_MIGRATE_ADD_WATER_LEVEL \
+    "ALTER TABLE sensor_data ADD COLUMN water_level REAL NOT NULL DEFAULT -999.0"
+#define SQL_MIGRATE_ADD_BATTERY_VOLTAGE \
+    "ALTER TABLE sensor_data ADD COLUMN battery_voltage REAL NOT NULL DEFAULT -999.0"
+
+/*
+ * 探列 + 按需 ALTER：prepare 一句引用该列的 SELECT（LIMIT 0 不产生 IO）
+ * 探测列是否存在，不存在则执行 alter_sql 补列。
+ * 返回：E_OK = 成功（含列已存在，幂等）；E_IO = ALTER 失败。
+ */
+static int migrate_add_column_if_missing(sqlite3 *db, const char *column,
+                                         const char *alter_sql)
+{
+    char probe[128];
+    snprintf(probe, sizeof(probe), "SELECT %s FROM sensor_data LIMIT 0", column);
+
+    sqlite3_stmt *ck = NULL;
+    if (sqlite3_prepare_v2(db, probe, -1, &ck, NULL) == SQLITE_OK) {
+        sqlite3_finalize(ck);   /* 列已存在 → 无需迁移 */
+        return E_OK;
+    }
+
+    char *err = NULL;
+    if (sqlite3_exec(db, alter_sql, NULL, NULL, &err) != SQLITE_OK) {
+        LOG_ERROR("migrate add %s column failed: %s", column,
+                  err ? err : "(unknown)");
+        sqlite3_free(err);
+        return E_IO;
+    }
+    LOG_INFO("storage migrated: added %s column to sensor_data", column);
+    return E_OK;
+}
 
 int storage_init(const char *db_path)
 {
@@ -101,6 +149,19 @@ int storage_init(const char *db_path)
         LOG_INFO("storage migrated: added source_id column to sensor_data");
     }
 
+    /* ── migration：v1.6.0 逐列补 soil_moisture / water_level /
+     * battery_voltage（REAL，默认哨兵）。旧库自动迁移、幂等、不丢数据。 */
+    if (migrate_add_column_if_missing(g_db, "soil_moisture",
+                                      SQL_MIGRATE_ADD_SOIL_MOISTURE) != E_OK ||
+        migrate_add_column_if_missing(g_db, "water_level",
+                                      SQL_MIGRATE_ADD_WATER_LEVEL) != E_OK ||
+        migrate_add_column_if_missing(g_db, "battery_voltage",
+                                      SQL_MIGRATE_ADD_BATTERY_VOLTAGE) != E_OK) {
+        sqlite3_close(g_db);
+        g_db = NULL;
+        return E_IO;
+    }
+
     LOG_INFO("storage init ok: %s", db_path);
     return E_OK;
 }
@@ -111,8 +172,9 @@ int storage_save(const struct sensor_data *data, sensor_source_t source,
     if (!g_db || !data || !client_id) return E_INVAL;
 
     const char *sql = "INSERT INTO sensor_data "
-                      "(client_id, timestamp_ms, temperature, humidity, pressure, source, source_id) "
-                      "VALUES (?, ?, ?, ?, ?, ?, ?);";
+                      "(client_id, timestamp_ms, temperature, humidity, pressure, "
+                      " soil_moisture, water_level, battery_voltage, source, source_id) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
     sqlite3_stmt *stmt = NULL;
 
     pthread_mutex_lock(&g_db_mutex);
@@ -124,10 +186,13 @@ int storage_save(const struct sensor_data *data, sensor_source_t source,
     sqlite3_bind_double(stmt, 3, data->temperature);
     sqlite3_bind_double(stmt, 4, data->humidity);
     sqlite3_bind_double(stmt, 5, data->pressure);
-    sqlite3_bind_text(stmt, 6,
+    sqlite3_bind_double(stmt, 6, data->soil_moisture);
+    sqlite3_bind_double(stmt, 7, data->water_level);
+    sqlite3_bind_double(stmt, 8, data->battery_voltage);
+    sqlite3_bind_text(stmt, 9,
                       (source == SOURCE_MODBUS) ? "modbus" : "local",
                       -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 7, data->source_id);
+    sqlite3_bind_int(stmt, 10, data->source_id);
 
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_DONE) {
@@ -155,7 +220,8 @@ int storage_get_pending(struct sensor_data *out, int count)
 {
     if (!g_db || !out || count <= 0) return E_INVAL;
 
-    const char *sql = "SELECT id, timestamp_ms, temperature, humidity, pressure, source, source_id "
+    const char *sql = "SELECT id, timestamp_ms, temperature, humidity, pressure, "
+                      "soil_moisture, water_level, battery_voltage, source, source_id "
                       "FROM sensor_data ORDER BY timestamp_ms ASC, id ASC LIMIT ?;";
     sqlite3_stmt *stmt = NULL;
 
@@ -172,10 +238,13 @@ int storage_get_pending(struct sensor_data *out, int count)
         out[n].temperature   = sqlite3_column_double(stmt, 2);
         out[n].humidity      = sqlite3_column_double(stmt, 3);
         out[n].pressure      = sqlite3_column_double(stmt, 4);
-        const unsigned char *src = sqlite3_column_text(stmt, 5);
+        out[n].soil_moisture   = sqlite3_column_double(stmt, 5);
+        out[n].water_level     = sqlite3_column_double(stmt, 6);
+        out[n].battery_voltage = sqlite3_column_double(stmt, 7);
+        const unsigned char *src = sqlite3_column_text(stmt, 8);
         out[n].source = (src && strcmp((const char *)src, "modbus") == 0)
                             ? SOURCE_MODBUS : SOURCE_LOCAL;
-        out[n].source_id     = sqlite3_column_int(stmt, 6);
+        out[n].source_id     = sqlite3_column_int(stmt, 9);
         n++;
     }
     sqlite3_finalize(stmt);

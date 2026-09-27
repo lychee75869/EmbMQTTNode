@@ -3,18 +3,24 @@
  * 传感器字段描述表定义与查表存取（docs/12 §3.4）。
  *
  * 【表序不变式（严禁破坏）】
- *   SENSOR_FIELDS[] 顺序 == v1.2.11 local payload 序列化序
- *   （temperature, humidity, pressure）。序列化侧（mqtt_client / http_server）
- *   按本表顺序遍历输出，因此表序即 payload 序：变更表序会破坏 local 路径
- *   逐字节基线。新增字段只许追加表尾。
+ *   SENSOR_FIELDS[] 顺序 == payload 序列化序
+ *   （temperature, humidity, pressure, soil_moisture, water_level,
+ *     battery_voltage）。序列化侧（mqtt_client / http_server）按本表顺序
+ *   遍历输出，因此表序即 payload 序：变更表序会破坏 local 路径逐字节基线。
+ *   新增字段只许追加表尾（append-only），严禁插入/重排。
  */
 #include "sensor_fields.h"
 
-/* 表内容：顺序即 payload 序（冻结不变式）。 */
+/* 表内容：顺序即 payload 序（冻结不变式）。
+ * v1.6.0：表尾追加 soil_moisture / water_level / battery_voltage，
+ * 对齐 8 寄存器子设备契约（docs/EmbMQTTNode_项目文档.md 模块一）。 */
 const struct sensor_field SENSOR_FIELDS[SENSOR_FIELD_COUNT] = {
-    { "temperature", offsetof(struct sensor_data, temperature), SF_F64 },
-    { "humidity",    offsetof(struct sensor_data, humidity),    SF_F64 },
-    { "pressure",    offsetof(struct sensor_data, pressure),    SF_F64 },
+    { "temperature",     offsetof(struct sensor_data, temperature),     SF_F64 },
+    { "humidity",        offsetof(struct sensor_data, humidity),        SF_F64 },
+    { "pressure",        offsetof(struct sensor_data, pressure),        SF_F64 },
+    { "soil_moisture",   offsetof(struct sensor_data, soil_moisture),   SF_F64 },
+    { "water_level",     offsetof(struct sensor_data, water_level),     SF_F64 },
+    { "battery_voltage", offsetof(struct sensor_data, battery_voltage), SF_F64 },
 };
 
 /* 守卫：SENSOR_FIELD_COUNT 必须与表实际尺寸一致（防止改表漏改常量，

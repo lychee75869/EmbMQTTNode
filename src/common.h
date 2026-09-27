@@ -27,7 +27,7 @@
  *        → T04 子设备管理 → T05 命令闭环与集成联调。
  * 不变式：platform=local 路径行为与 v1.2.11 **逐字节等价**（各测试即回归基线）。
  */
-#define EMBMQTTNODE_VERSION "1.4.0"
+#define EMBMQTTNODE_VERSION "1.6.0"
 
 /* 返回码 */
 #define E_OK            0 // 成功  unix惯例 0为成功，非0为失败
@@ -55,11 +55,19 @@ typedef enum sensor_source {
  * 并被当作有效值上报云端。统一引用本宏后，哨兵赋值点与判定点一致。 */
 #define SENSOR_VALUE_INVALID (-999.0)
 
-/* 传感器数据结构 */
+/* 传感器数据结构。
+ *
+ * v1.6.0：为对齐 8 寄存器子设备契约（docs/EmbMQTTNode_项目文档.md 模块一），
+ * 在 pressure 之后追加 soil_moisture / water_level / battery_voltage 三个
+ * 测量字段。无有效读数的字段一律 = SENSOR_VALUE_INVALID（哨兵），
+ * 生产侧（modbus_master）遍历字段表统一置哨兵（见 sensor_fields.h 表序不变式）。 */
 struct sensor_data {
     double    temperature;   /* 摄氏度 */
     double    humidity;      /* %RH，无有效读数时 = SENSOR_VALUE_INVALID */
     double    pressure;      /* hPa，无有效读数时 = SENSOR_VALUE_INVALID */
+    double    soil_moisture; /* 土壤湿度 %，无有效读数时 = SENSOR_VALUE_INVALID（v1.6.0） */
+    double    water_level;   /* 水槽水位 %，无有效读数时 = SENSOR_VALUE_INVALID（v1.6.0） */
+    double    battery_voltage; /* 电池电压 V，无有效读数时 = SENSOR_VALUE_INVALID（v1.6.0） */
     int64_t   timestamp_ms;  /* 毫秒时间戳（采样时刻，事件 event_time 源） */
     int64_t   id;            /* SQLite 自增主键，0 表示未持久化（storage_save 成功后回填） */
     sensor_source_t source;  /* 数据来源（storage_get_pending 读出，供补发时选择 topic） */

@@ -36,42 +36,37 @@ jobs:
 
       - name: "Build with Modbus (native: full, cross: obj only)"
         if: matrix.cross_compile == ''
-        run: make -C src BUILD_WITH_MODBUS=1
+        run: make -C gateway/src BUILD_WITH_MODBUS=1
 
       - name: "Build with Modbus (cross: obj only)"
         if: matrix.cross_compile != ''
-        run: make -C src CROSS_COMPILE=${{ matrix.cross_compile }} BUILD_WITH_MODBUS=1 obj
+        run: make -C gateway/src CROSS_COMPILE=${{ matrix.cross_compile }} BUILD_WITH_MODBUS=1 obj
 
       - name: Clean
-        run: make -C src clean
+        run: make -C gateway/src clean
 
       - name: "Build without Modbus (native: full)"
         if: matrix.cross_compile == ''
-        run: make -C src BUILD_WITH_MODBUS=0
+        run: make -C gateway/src BUILD_WITH_MODBUS=0
 
       - name: "Build without Modbus (cross: obj only)"
         if: matrix.cross_compile != ''
-        run: make -C src CROSS_COMPILE=${{ matrix.cross_compile }} BUILD_WITH_MODBUS=0 obj
+        run: make -C gateway/src CROSS_COMPILE=${{ matrix.cross_compile }} BUILD_WITH_MODBUS=0 obj
 
+      # 用例清单以 gateway/Makefile 的 TESTS 为单一事实源，避免此处写死的
+      # 列表与用例增删脱节（曾经的 test_sensor / test_rule_engine /
+      # test_anomaly_engine 已随网关纯化移除，写死列表会产生假绿）。
       - name: Build and run tests (native only)
         if: matrix.cross_compile == ''
-        run: |
-          make -C tests
-          cd tests
-          ./test_sensor
-          ./test_storage
-          ./test_modbus_config
-          ./test_rule_engine
-          ./test_ota
-          ./test_anomaly_engine
+        run: make -C gateway test
 
       - name: Strip binary
         if: matrix.cross_compile == ''
-        run: make -C src strip
+        run: make -C gateway/src strip
 
       - name: Upload artifact
         if: matrix.cross_compile == ''
         uses: actions/upload-artifact@v4
         with:
           name: embmqttnode-${{ matrix.arch }}
-          path: src/embmqttnode
+          path: gateway/src/embmqttnode

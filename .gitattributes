@@ -1,0 +1,2 @@
+# 统一行尾：仓库存 LF，工作区检出 LF（本项目为 Linux/WSL 工程）
+* text=auto eol=lf

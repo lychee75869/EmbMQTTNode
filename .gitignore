@@ -9,11 +9,11 @@
 *.dll
 
 # 可执行文件
-src/embmqttnode
+gateway/src/embmqttnode
 # 测试可执行文件（无扩展名二进制；源码 .c/.h 通过下方否定规则保留）
-tests/test_*
-!tests/test_*.c
-!tests/test_*.h
+gateway/tests/test_*
+!gateway/tests/test_*.c
+!gateway/tests/test_*.h
 
 # 数据库文件
 *.db
@@ -46,8 +46,10 @@ dist/
 *.log
 学习计划/
 练习/
-docs/
+
+# 本地资料（不提交）
 .workbuddy/
-Agent.md
 BUG_AUDIT.md
-.githubcm
+
+# 子设备固件（STM32 Keil 工程，本次未纳入版本库）
+subdevice/

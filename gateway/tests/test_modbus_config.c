@@ -1,0 +1,281 @@
+/*
+ * tests/test_modbus_config.c
+ * Modbus 配置解析单元测试
+ *
+ * 覆盖:
+ *   - modbus_enabled / modbus_mode / modbus_tcp_host 解析
+ *   - 寄存器映射 modbus_reg_N 解析（slave_id/addr/type/field/scale/offset）
+ *   - int16 / float32 数据类型
+ *   - 基础配置（broker_host/port）保留
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include "../src/common.h"
+#include "../src/config.h"
+#include "../src/modbus_master.h"
+
+/* ═══════════════════════════════════════════════════════════ */
+
+static const char *test_config_content =
+    "broker_host = 192.168.1.100\n"
+    "broker_port = 1883\n"
+    "modbus_enabled = 1\n"
+    "modbus_mode = tcp\n"
+    "modbus_tcp_host = 10.0.0.50\n"
+    "modbus_tcp_port = 1502\n"
+    "modbus_poll_interval_ms = 3000\n"
+    "modbus_reg_1 = 1,40001,1,3,int16,temperature,0.1,0\n"
+    "modbus_reg_2 = 2,40002,1,3,int16,humidity,0.05,0\n"
+    "modbus_reg_3 = 1,40003,2,3,float32,pressure,1.0,-1000.0\n";
+
+int main(void)
+{
+    /* 写临时配置文件 */
+    const char *tmp_path = "test_modbus_tmp.conf";
+    FILE *fp = fopen(tmp_path, "w");
+    assert(fp != NULL);
+    fprintf(fp, "%s", test_config_content);
+    fclose(fp);
+
+    /* 加载配置 */
+    struct node_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int rc = config_load(tmp_path, &cfg);
+    assert(rc == E_OK);
+
+    /* 验证基础配置保留 */
+    assert(strcmp(cfg.broker_host, "192.168.1.100") == 0);
+    assert(cfg.broker_port == 1883);
+
+    /* 验证 Modbus 配置 */
+    assert(cfg.modbus.enabled == 1);
+    assert(strcmp(cfg.modbus.mode, "tcp") == 0);
+    assert(strcmp(cfg.modbus.tcp_host, "10.0.0.50") == 0);
+    assert(cfg.modbus.tcp_port == 1502);
+    assert(cfg.modbus.poll_interval_ms == 3000);
+
+    /* 验证寄存器映射数量 */
+    assert(cfg.modbus.reg_count == 3);
+
+    /* 验证 reg[0] */
+    assert(cfg.modbus.regs[0].slave_id == 1);
+    assert(cfg.modbus.regs[0].reg_addr == 40001);
+    assert(cfg.modbus.regs[0].reg_count == 1);
+    assert(cfg.modbus.regs[0].func_code == 3);
+    assert(strcmp(cfg.modbus.regs[0].data_type, "int16") == 0);
+    assert(strcmp(cfg.modbus.regs[0].field_name, "temperature") == 0);
+    assert(cfg.modbus.regs[0].scale == 0.1);
+    assert(cfg.modbus.regs[0].offset == 0.0);
+
+    /* 验证 reg[1] */
+    assert(cfg.modbus.regs[1].slave_id == 2);
+    assert(cfg.modbus.regs[1].reg_addr == 40002);
+    assert(strcmp(cfg.modbus.regs[1].field_name, "humidity") == 0);
+    assert(cfg.modbus.regs[1].scale == 0.05);
+
+    /* 验证 reg[2] (float32) */
+    assert(cfg.modbus.regs[2].slave_id == 1);
+    assert(cfg.modbus.regs[2].reg_addr == 40003);
+    assert(cfg.modbus.regs[2].reg_count == 2);
+    assert(strcmp(cfg.modbus.regs[2].data_type, "float32") == 0);
+    assert(strcmp(cfg.modbus.regs[2].field_name, "pressure") == 0);
+    assert(cfg.modbus.regs[2].scale == 1.0);
+    assert(cfg.modbus.regs[2].offset == -1000.0);
+
+    /* 打印配置 */
+    config_dump(&cfg);
+
+    /* ═════════════════════════════════════════════════════════ */
+    /* 非法寄存器映射必须在 config_load 阶段被拒绝
+     * （LOG_WARN + 丢弃条目，不计入 reg_count）。
+     * 合法域：slave_id 1-247；reg_count 1-MODBUS_REG_MAX(32)；
+     * func 3 → addr ∈ [40001, 50001-count]；func 4 → addr ∈ [30001, 40001-count]。
+     */
+    const char *bad_config_content =
+        "modbus_enabled = 1\n"
+        "modbus_reg_1 = 1,40001,1,3,int16,temperature,0.1,0\n"    /* 合法基线 func3 */
+        "modbus_reg_2 = 0,40002,1,3,int16,temperature,0.1,0\n"    /* slave_id=0 */
+        "modbus_reg_3 = 248,40003,1,3,int16,temperature,0.1,0\n"  /* slave_id=248 */
+        "modbus_reg_4 = 1,39999,1,3,int16,temperature,0.1,0\n"    /* func3 addr<40001 */
+        "modbus_reg_5 = 1,50001,1,3,int16,temperature,0.1,0\n"    /* func3 addr>50000 */
+        "modbus_reg_6 = 1,29999,1,4,int16,temperature,0.1,0\n"    /* func4 addr<30001 */
+        "modbus_reg_7 = 1,40001,1,4,int16,temperature,0.1,0\n"    /* func4 用 40001 */
+        "modbus_reg_8 = 1,40001,0,3,int16,temperature,0.1,0\n"    /* count=0 */
+        "modbus_reg_9 = 1,40001,33,3,int16,temperature,0.1,0\n"   /* count>32 */
+        "modbus_reg_10 = 1,40001,1,5,int16,temperature,0.1,0\n"   /* func 5 不支持 */
+        "modbus_reg_11 = 1,49995,10,3,int16,temperature,0.1,0\n"  /* 49995-40001+10>10000 */
+        "modbus_reg_12 = 1,30001,1,4,int16,temperature,0.1,0\n";  /* 合法边界 func4 */
+
+    const char *bad_path = "test_modbus_bad_tmp.conf";
+    fp = fopen(bad_path, "w");
+    assert(fp != NULL);
+    fprintf(fp, "%s", bad_config_content);
+    fclose(fp);
+
+    struct node_config bad_cfg;
+    memset(&bad_cfg, 0, sizeof(bad_cfg));
+    rc = config_load(bad_path, &bad_cfg);
+    assert(rc == E_OK);
+
+    /* 12 条映射只有 2 条合法（reg_1 func3 基线 + reg_12 func4 边界） */
+    assert(bad_cfg.modbus.reg_count == 2);
+    printf("\ninvalid mappings rejected (reg_count=%d):\n",
+           bad_cfg.modbus.reg_count);
+
+    assert(bad_cfg.modbus.regs[0].reg_addr == 40001);
+    assert(bad_cfg.modbus.regs[0].func_code == 3);
+    printf("  legal func3 40001 kept:      PASS\n");
+
+    assert(bad_cfg.modbus.regs[1].reg_addr == 30001);
+    assert(bad_cfg.modbus.regs[1].func_code == 4);
+    printf("  legal func4 30001 kept:      PASS\n");
+
+    /* 被拒条目不得残留（reg_count 之后的内容未定义，只验证数量语义） */
+    remove(bad_path);
+    printf("modbus validation test PASSED\n");
+
+    /* ═════════════════════════════════════════════════════════ */
+    /* modbus mock 路径哨兵统一 + source_id 打标。
+     * modbus_enabled=0 → 未连接 → mock_poll。未映射字段必须为
+     * SENSOR_VALUE_INVALID；source_id 必须 = reg->slave_id（mock 场景
+     * 若不打标，数据会被误路由成本地传感器）。 */
+    {
+        struct modbus_config mcfg;
+        memset(&mcfg, 0, sizeof(mcfg));
+        mcfg.enabled   = 0;          /* 强制 mock 路径 */
+        mcfg.reg_count = 2;
+        mcfg.regs[0].slave_id = 2;
+        strncpy(mcfg.regs[0].field_name, "temperature",
+                sizeof(mcfg.regs[0].field_name) - 1);
+        mcfg.regs[1].slave_id = 9;
+        strncpy(mcfg.regs[1].field_name, "pressure",
+                sizeof(mcfg.regs[1].field_name) - 1);
+
+        assert(modbus_master_init(&mcfg) == E_OK);
+        assert(!modbus_master_is_connected());
+
+        struct sensor_data md[4];
+        memset(md, 0, sizeof(md));
+        int cnt = modbus_master_poll(md, 4);
+        assert(cnt == 2);
+        /* source_id = slave_id（reg[0]=2, reg[1]=9） */
+        assert(md[0].source_id == 2);
+        assert(md[1].source_id == 9);
+        /* 未映射字段 = 哨兵 */
+        assert(md[0].humidity == SENSOR_VALUE_INVALID);
+        assert(md[0].pressure == SENSOR_VALUE_INVALID);
+        assert(md[1].temperature == SENSOR_VALUE_INVALID);
+        assert(md[1].humidity == SENSOR_VALUE_INVALID);
+
+        /* 「未映射字段恒为哨兵」：partial 映射（reg[0]=temperature /
+         * reg[1]=pressure）下，表尾新增的 soil_moisture / water_level /
+         * battery_voltage 三项必须为哨兵——mock_poll 现走 for_each_field
+         * 统一置哨兵，杜绝新增字段漏初始化成 0.0 被上游当有效值上报假数据。 */
+        assert(md[0].soil_moisture   == SENSOR_VALUE_INVALID);
+        assert(md[0].water_level     == SENSOR_VALUE_INVALID);
+        assert(md[0].battery_voltage == SENSOR_VALUE_INVALID);
+        assert(md[1].soil_moisture   == SENSOR_VALUE_INVALID);
+        assert(md[1].water_level     == SENSOR_VALUE_INVALID);
+        assert(md[1].battery_voltage == SENSOR_VALUE_INVALID);
+        modbus_master_close();
+        printf("  modbus mock sentinel + source_id: PASS\n");
+        printf("  unmapped new fields always sentinel: PASS\n");
+    }
+
+    /* ═════════════════════════════════════════════════════════ */
+    /* 按从站聚合——同一 slave_id 的多条映射归并为一条记录。
+     * 6 条映射共 2 个从站（slave 1 有 5 条、slave 7 有 1 条）
+     * → poll 返回 2（去重后从站数），而非 6（映射数）。 */
+    {
+        struct modbus_config acfg;
+        memset(&acfg, 0, sizeof(acfg));
+        acfg.enabled   = 0;          /* 强制 mock 路径 */
+        acfg.reg_count = 6;
+        static const char *flds[6] = {
+            "soil_moisture", "temperature", "humidity",
+            "water_level",   "battery_voltage", "pressure"
+        };
+        static const int slv[6] = { 1, 1, 1, 1, 1, 7 };
+        for (int i = 0; i < 6; i++) {
+            acfg.regs[i].slave_id = slv[i];
+            strncpy(acfg.regs[i].field_name, flds[i],
+                    sizeof(acfg.regs[i].field_name) - 1);
+        }
+
+        assert(modbus_master_init(&acfg) == E_OK);
+        assert(!modbus_master_is_connected());
+
+        struct sensor_data ad[MODBUS_REG_MAX];
+        memset(ad, 0, sizeof(ad));
+        int acnt = modbus_master_poll(ad, MODBUS_REG_MAX);
+        assert(acnt == 2);                         /* 聚合后 = 从站数 */
+        assert(ad[0].source_id == 1);              /* 首条 = slave 1 */
+        assert(ad[1].source_id == 7);
+        assert(ad[0].source == SOURCE_MODBUS);
+        /* slave 1 的五字段落在同一记录、全部有效 */
+        assert(ad[0].soil_moisture   != SENSOR_VALUE_INVALID);
+        assert(ad[0].temperature     != SENSOR_VALUE_INVALID);
+        assert(ad[0].humidity        != SENSOR_VALUE_INVALID);
+        assert(ad[0].water_level     != SENSOR_VALUE_INVALID);
+        assert(ad[0].battery_voltage != SENSOR_VALUE_INVALID);
+        assert(ad[0].pressure        == SENSOR_VALUE_INVALID); /* slave1 未映射 */
+        /* 同轮所有从站记录共享同一时间戳 */
+        assert(ad[0].timestamp_ms == ad[1].timestamp_ms);
+        /* slave 7 仅 pressure 一条 */
+        assert(ad[1].pressure    != SENSOR_VALUE_INVALID);
+        assert(ad[1].temperature == SENSOR_VALUE_INVALID);
+
+        /* max_count 语义 = 最多容纳的从站数：limit=1 → 只保留首从站 */
+        struct sensor_data one[1];
+        memset(one, 0, sizeof(one));
+        int onecnt = modbus_master_poll(one, 1);
+        assert(onecnt == 1);
+        assert(one[0].source_id == 1);
+        assert(one[0].soil_moisture != SENSOR_VALUE_INVALID);
+
+        modbus_master_close();
+        printf("  per-slave aggregation: 6 maps -> 2 records: PASS\n");
+        printf("  aggregated fields share one record + one ts: PASS\n");
+        printf("  max_count = slave count (truncate on overflow): PASS\n");
+    }
+
+    /* ═════════════════════════════════════════════════════════ */
+    /* subdev_offline_sec 解析期钳制。
+     * 0 / 负数 / typo（atoi 得 0）→ 回退缺省 30；超上限 86400 → 钳回；
+     * 正常区间（含两侧边界 30 / 86400）原样通过。 */
+    {
+        const char *vals[]   = { "0",     "-5",    "abc",   "30",
+                                 "45",    "86400", "86401", "999999" };
+        const int   expect[] = {  30,      30,      30,      30,
+                                  45,      86400,   86400,   86400 };
+        const int ncase = (int)(sizeof(vals) / sizeof(vals[0]));
+
+        for (int i = 0; i < ncase; i++) {
+            const char *p228_path = "test_p228_tmp.conf";
+            FILE *f = fopen(p228_path, "w");
+            assert(f != NULL);
+            fprintf(f, "subdev_offline_sec = %s\n", vals[i]);
+            fclose(f);
+
+            struct node_config c;
+            memset(&c, 0, sizeof(c));
+            assert(config_load(p228_path, &c) == E_OK);
+            if (c.subdev_offline_sec != expect[i]) {
+                fprintf(stderr, "FAIL: '%s' -> %d (expect %d)\n",
+                        vals[i], c.subdev_offline_sec, expect[i]);
+                assert(0);
+            }
+            remove(p228_path);
+        }
+        printf("subdev_offline_sec clamp "
+               "(0/neg/typo -> 30, oversize -> 86400, valid passthrough): "
+               "PASS\n");
+    }
+
+    /* 清理 */
+    remove(tmp_path);
+    printf("\nmodbus config test PASSED\n");
+    return 0;
+}

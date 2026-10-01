@@ -1,5 +1,13 @@
-# EmbMQTTNode 顶层 Makefile
-# 委托 src/ 和 tests/ 子目录构建
+# 物种感知智能灌溉系统 —— 仓库根 Makefile
+#
+# 本仓库为四模块结构（子设备 / 网关 / 云端 / 小程序），其中只有网关是
+# make 工程。根 Makefile 只做一件事：把构建、测试、打包转发给 gateway/，
+# 让仓库顶层保留「一条命令即可构建并验证网关」的入口。
+#
+# 子设备固件在 subdevice/，是 Keil MDK 工程，不走 make：
+#   Keil uVision5 打开 subdevice/Projects/MDK-ARM/auto_dwater(2).uvprojx
+
+GATEWAY_DIR ?= gateway
 
 CROSS_COMPILE     ?=
 BUILD_WITH_MODBUS ?= 1
@@ -9,48 +17,40 @@ export CROSS_COMPILE
 export BUILD_WITH_MODBUS
 export DESTDIR
 
-.PHONY: all clean test strip install dist distclean
+.PHONY: all test strip install dist clean distclean help
 
 all:
-	$(MAKE) -C src
-
-strip:
-	$(MAKE) -C src strip
-
-install:
-	$(MAKE) -C src install
-
-# ── 测试用例清单（runner 单一事实源）──
-# 与 tests/Makefile 的 TESTS 保持一致。用例数由 $(words $(TESTS)) 动态得出，
-# 杜绝「编译了 N 个、runner 只跑 N-1 个、结尾计数还写死」的假绿复发。
-# v1.4.0 网关纯化：移除 test_sensor（板载采集层删除，数据改由 Modbus 提供）。
-TESTS = test_storage test_modbus_config test_ota \
-        test_mac_addr test_mqtt_client test_subdev_registry \
-        test_sensor_fields test_platform_local test_platform_huawei \
-        test_platform_huawei_subdev test_platform_huawei_cmd
+	$(MAKE) -C $(GATEWAY_DIR)
 
 test:
-	$(MAKE) -C tests
-	@echo "=== Running all tests ==="
-	@cd tests && for t in $(TESTS); do \
-		echo "--- $$t"; \
-		./$$t || exit 1; \
-	done
-	@echo "=== All $(words $(TESTS)) tests passed ==="
+	$(MAKE) -C $(GATEWAY_DIR) test
+
+strip:
+	$(MAKE) -C $(GATEWAY_DIR) strip
+
+install:
+	$(MAKE) -C $(GATEWAY_DIR) install
+
+dist:
+	$(MAKE) -C $(GATEWAY_DIR) dist
 
 clean:
-	$(MAKE) -C src clean
-	$(MAKE) -C tests clean
+	$(MAKE) -C $(GATEWAY_DIR) clean
 
 distclean:
-	$(MAKE) -C src distclean
-	$(MAKE) -C tests distclean
+	$(MAKE) -C $(GATEWAY_DIR) distclean
 
-dist: all strip
-	@VER=$$(grep -oP 'EMBMQTTNODE_VERSION\s+"\K[^"]*' src/common.h); \
-	ARCH=$$(uname -m); \
-	mkdir -p dist; \
-	tar czf dist/embmqttnode_$${VER}_$${ARCH}.tar.gz \
-		src/embmqttnode config/node.conf config/embmqttnode.service \
-		config/embmqttnode-launcher config/subdevices.conf; \
-	echo "=== Release: dist/embmqttnode_$${VER}_$${ARCH}.tar.gz ==="
+help:
+	@echo "物种感知智能灌溉系统 —— 根 Makefile（转发到 $(GATEWAY_DIR)/）"
+	@echo ""
+	@echo "  make                               构建网关（含 Modbus，默认 BUILD_WITH_MODBUS=1）"
+	@echo "  make BUILD_WITH_MODBUS=0           构建网关（不含 Modbus）"
+	@echo "  make CROSS_COMPILE=aarch64-linux-gnu-   交叉编译 ARM64"
+	@echo "  make test                          编译并运行全部单元测试"
+	@echo "  make strip                         剥离调试符号"
+	@echo "  make install DESTDIR=/path/rootfs  安装到目标根文件系统"
+	@echo "  make dist                          打包 dist/embmqttnode_<ver>_<arch>.tar.gz"
+	@echo "  make clean                         清理编译产物"
+	@echo "  make distclean                     连 .d 依赖文件一起清理"
+	@echo ""
+	@echo "子设备固件（subdevice/）为 Keil MDK 工程，请在 Keil uVision 中构建。"
